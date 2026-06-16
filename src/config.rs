@@ -29,15 +29,17 @@ struct ServersFile {
 
 pub fn load_config() -> Result<AppConfig> {
     let path = config_dir().join("config.toml");
-    if !path.exists() {
-        return Ok(AppConfig::default());
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(toml::from_str(&s)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
+        Err(e) => Err(e.into()),
     }
-    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
 }
 
 pub fn save_config(cfg: &AppConfig) -> Result<()> {
-    std::fs::create_dir_all(config_dir())?;
-    std::fs::write(config_dir().join("config.toml"), toml::to_string_pretty(cfg)?)?;
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("config.toml"), toml::to_string_pretty(cfg)?)?;
     Ok(())
 }
 
@@ -51,15 +53,19 @@ pub fn parse_credentials(s: &str) -> Result<Vec<Credential>> {
 
 pub fn load_credentials() -> Result<Vec<Credential>> {
     let path = config_dir().join("credentials.toml");
-    if !path.exists() {
-        return Ok(vec![]);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => parse_credentials(&s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.into()),
     }
-    parse_credentials(&std::fs::read_to_string(path)?)
 }
 
 pub fn save_credentials(creds: &[Credential]) -> Result<()> {
-    std::fs::create_dir_all(config_dir())?;
-    std::fs::write(config_dir().join("credentials.toml"), serialize_credentials(creds)?)?;
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join("credentials.toml.tmp");
+    std::fs::write(&tmp, serialize_credentials(creds)?)?;
+    std::fs::rename(&tmp, dir.join("credentials.toml"))?;
     Ok(())
 }
 
@@ -73,14 +79,18 @@ pub fn parse_server_records(s: &str) -> Result<Vec<ServerRecord>> {
 
 pub fn load_server_records() -> Result<Vec<ServerRecord>> {
     let path = config_dir().join("servers.toml");
-    if !path.exists() {
-        return Ok(vec![]);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => parse_server_records(&s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.into()),
     }
-    parse_server_records(&std::fs::read_to_string(path)?)
 }
 
 pub fn save_server_records(records: &[ServerRecord]) -> Result<()> {
-    std::fs::create_dir_all(config_dir())?;
-    std::fs::write(config_dir().join("servers.toml"), serialize_server_records(records)?)?;
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join("servers.toml.tmp");
+    std::fs::write(&tmp, serialize_server_records(records)?)?;
+    std::fs::rename(&tmp, dir.join("servers.toml"))?;
     Ok(())
 }
