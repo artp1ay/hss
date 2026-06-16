@@ -5,10 +5,6 @@ use crate::types::{Credential, CredentialKind};
 
 const KEYCHAIN_SERVICE: &str = "hss";
 
-fn keychain_key(id: &str) -> &str {
-    id
-}
-
 pub fn add_credential(
     name: &str,
     username: &str,
@@ -62,14 +58,4 @@ pub fn delete_credential(id: &str) -> Result<()> {
 
 pub fn get_password(id: &str) -> Result<String> {
     Ok(keyring::Entry::new(KEYCHAIN_SERVICE, id)?.get_password()?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_keychain_key_is_id() {
-        assert_eq!(keychain_key("some-uuid"), "some-uuid");
-    }
 }
