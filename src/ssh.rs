@@ -60,13 +60,11 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential) -> Result<std::proces
         None
     };
 
-    let status = cmd.spawn()?.wait()?;
-
-    if let Some(path) = askpass_path {
+    let result = cmd.spawn().and_then(|mut child| child.wait());
+    if let Some(ref path) = askpass_path {
         let _ = std::fs::remove_file(path);
     }
-
-    Ok(status)
+    Ok(result?)
 }
 
 fn write_askpass_helper(_password: &str) -> Result<std::path::PathBuf> {
