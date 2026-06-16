@@ -45,19 +45,20 @@ pub fn run() -> Result<()> {
         bail!("No credentials configured. Run `hss` to set up credentials.");
     } else {
         // Need to pick credential
-        let cred_lines: Vec<String> = creds.iter()
+        let cred_pairs: Vec<(&crate::types::Credential, String)> = creds.iter()
             .map(|c| {
                 let kind = if c.kind == CredentialKind::Key { "key" } else { "password" };
-                format!("{:<20} {:<10} {}", c.name, kind, c.username)
+                (c, format!("{:<20} {:<10} {}", c.name, kind, c.username))
             })
             .collect();
+        let cred_lines: Vec<String> = cred_pairs.iter().map(|(_, s)| s.clone()).collect();
 
         let selected_cred = pick_one(&cred_lines, "credential> ")?;
         let Some(cred_line) = selected_cred else { return Ok(()) };
-        let cred_name = cred_line.split_whitespace().next().unwrap_or("").to_string();
-        creds.iter().find(|c| c.name == cred_name)
+        cred_pairs.iter()
+            .find(|(_, s)| s == &cred_line)
+            .map(|(c, _)| (*c).clone())
             .ok_or_else(|| anyhow::anyhow!("Credential not found"))?
-            .clone()
     };
 
     let status = ssh::spawn_ssh(&host.ip, host.port, &cred)?;
