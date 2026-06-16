@@ -1,0 +1,24 @@
+[package]
+name = "hss"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "hss"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hss"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+dirs = "5"
+keyring = "3"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+skim = "0.10"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
