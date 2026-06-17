@@ -3,7 +3,7 @@ use anyhow::Result;
 use crossterm::{execute, terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::config::AppConfig;
-use crate::types::{Credential, CredentialForm, DeleteKind, DeletePopup, Host, HostForm, ServerRecord};
+use crate::types::{Credential, CredentialForm, DeletePopup, Host, HostForm, ServerRecord};
 
 pub mod credentials_screen;
 pub mod delete_popup;
