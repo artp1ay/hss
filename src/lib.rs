@@ -5,3 +5,4 @@ pub mod inventory;
 pub mod ssh;
 pub mod tui;
 pub mod types;
+pub mod update;

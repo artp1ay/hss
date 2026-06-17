@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 libc = "0.2"
+ureq = { version = "2", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "5"
