@@ -20,20 +20,28 @@ esac
 
 ASSET="${BIN}-${OS}-${ARCH}"
 
-# ── Fetch latest release info ─────────────────────────────────────────────────
+# ── Fetch latest release ──────────────────────────────────────────────────────
 echo "Fetching latest release..."
 RELEASE=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")
 
-TAG=$(printf '%s' "$RELEASE" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-URL=$(printf '%s' "$RELEASE" | grep "browser_download_url" | grep "\"${ASSET}\"" | head -1 | cut -d'"' -f4)
+# grep exits 1 on no match, which would abort under set -e — use || true
+# URL format: "…/download/vX.Y.Z/hss-linux-x86_64"  (slash before name, quote after)
+TAG=$(printf '%s' "$RELEASE" | grep '"tag_name"'          | head -1 | cut -d'"' -f4 || true)
+URL=$(printf '%s' "$RELEASE" | grep "/${ASSET}\""         | head -1 | cut -d'"' -f4 || true)
 
-if [ -z "$URL" ]; then
-  echo "error: no binary for '${ASSET}' in release ${TAG}" >&2
-  echo "       download manually: https://github.com/${REPO}/releases" >&2
+if [ -z "$TAG" ]; then
+  echo "error: could not parse GitHub API response" >&2
+  printf '%s\n' "$RELEASE" | head -5 >&2
   exit 1
 fi
 
-# ── Download to temp, then move atomically ────────────────────────────────────
+if [ -z "$URL" ]; then
+  echo "error: no binary for '${ASSET}' in release ${TAG}" >&2
+  echo "       https://github.com/${REPO}/releases" >&2
+  exit 1
+fi
+
+# ── Download → temp → atomic move ────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
@@ -44,14 +52,12 @@ chmod +x "$TMP"
 mv "$TMP" "${INSTALL_DIR}/${BIN}"
 trap - EXIT
 
-echo "Done. Run: hss --version"
+echo "Done.  Run: hss --version"
 
-# ── PATH hint (only shown when hss is not yet reachable) ─────────────────────
+# ── PATH hint (only if hss not yet reachable) ─────────────────────────────────
 if ! command -v "$BIN" &>/dev/null 2>&1; then
   echo ""
   echo "~/.local/bin is not in your PATH. Add it:"
-  echo "  # bash"
-  echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
-  echo "  # zsh"
-  echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc  && source ~/.zshrc"
+  echo "  # bash:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+  echo "  # zsh:   echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc  && source ~/.zshrc"
 fi
