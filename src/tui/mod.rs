@@ -3,7 +3,7 @@ use anyhow::Result;
 use crossterm::{execute, terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::config::AppConfig;
-use crate::types::{Credential, CredentialForm, Host, ServerRecord};
+use crate::types::{Credential, CredentialForm, Host, HostForm, ServerRecord};
 
 pub mod credentials_screen;
 pub mod host_form;
@@ -19,6 +19,8 @@ pub enum Screen {
     Credentials,
     Settings,
     CredentialPicker { host_idx: usize, after_failure: bool },
+    HostForm,      // overlay for add/edit host
+    ImportHosts,   // overlay for importing from INI file path
 }
 
 pub struct App {
@@ -39,6 +41,10 @@ pub struct App {
     pub settings_focused_field: usize,
     // Popup state
     pub popup_selected: usize,
+    // Host form / import state
+    pub host_form: Option<HostForm>,
+    pub import_path_input: String,
+    pub delete_confirm: Option<usize>,  // Some(host_idx) = waiting for 2nd D press
     // Global
     pub should_quit: bool,
     pub status_message: Option<String>,
@@ -60,6 +66,9 @@ impl App {
             settings_inventory_input: String::new(),
             settings_focused_field: 0,
             popup_selected: 0,
+            host_form: None,
+            import_path_input: String::new(),
+            delete_confirm: None,
             should_quit: false,
             status_message: None,
         }
@@ -74,6 +83,8 @@ impl App {
             h.name.to_lowercase().contains(&q)
                 || h.group.to_lowercase().contains(&q)
                 || h.ip.to_lowercase().contains(&q)
+                || h.tags.iter().any(|t| t.to_lowercase().contains(&q))
+                || h.description.as_deref().unwrap_or("").to_lowercase().contains(&q)
         }).collect()
     }
 
@@ -93,6 +104,10 @@ impl App {
             });
         }
         crate::config::save_server_records(&self.server_records)
+    }
+
+    pub fn save_hosts(&self) -> Result<()> {
+        crate::config::save_hosts(&self.hosts)
     }
 
     pub fn reload_credentials(&mut self) -> Result<()> {
@@ -174,6 +189,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             main_screen::draw(f, app);
             popup::draw(f, app);
         }
+        Screen::HostForm => {
+            main_screen::draw(f, app);
+            host_form::draw(f, app);
+        }
+        Screen::ImportHosts => {
+            main_screen::draw(f, app);
+            host_form::draw_import(f, app);
+        }
     }
 }
 
@@ -186,5 +209,7 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
         Screen::CredentialPicker { host_idx, after_failure } => {
             popup::handle_key(terminal, app, key, host_idx, after_failure)
         }
+        Screen::HostForm => host_form::handle_key(terminal, app, key),
+        Screen::ImportHosts => host_form::handle_import_key(terminal, app, key),
     }
 }

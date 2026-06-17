@@ -66,10 +66,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Hotkeys
     let hotkeys = Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Blue)),
-        Span::styled("=connect  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::Blue)),
-        Span::styled("=cancel", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Enter]", Style::default().fg(Color::Blue)),
+        Span::styled(" connect  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Esc]", Style::default().fg(Color::Blue)),
+        Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(hotkeys), chunks[1]);
 }
