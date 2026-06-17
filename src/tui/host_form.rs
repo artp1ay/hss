@@ -91,8 +91,10 @@ pub fn draw_import(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 50, f.area());
     f.render_widget(Clear, area);
 
+    let is_export = app.import_export_mode;
+    let title = if is_export { " Export Ansible INI " } else { " Import Ansible INI " };
     let block = Block::default()
-        .title(" Import Ansible INI ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
     let inner = block.inner(area);
@@ -100,32 +102,59 @@ pub fn draw_import(f: &mut Frame, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1), // mode toggle
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // label
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // input
+            Constraint::Min(0),
+            Constraint::Length(1), // hotkeys
+        ])
         .margin(1)
         .split(inner);
 
+    // Mode toggle
+    let (imp_style, exp_style) = if is_export {
+        (Style::default().fg(Color::DarkGray), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+    } else {
+        (Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD), Style::default().fg(Color::DarkGray))
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "Path to inventory file:",
-            Style::default().fg(Color::DarkGray),
-        ))),
+        Paragraph::new(Line::from(vec![
+            Span::styled("[Import]", imp_style),
+            Span::raw("  "),
+            Span::styled("[Export]", exp_style),
+            Span::styled("   Tab to switch", Style::default().fg(Color::DarkGray)),
+        ])),
         chunks[0],
     );
+
+    let label = if is_export { "Save to path:" } else { "Path to inventory file:" };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, Style::default().fg(Color::DarkGray)))),
+        chunks[2],
+    );
+
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(&app.import_path_input, Style::default().fg(Color::White)),
             Span::styled("█", Style::default().fg(Color::Blue)),
         ])),
-        chunks[1],
+        chunks[4],
     );
+
+    let action = if is_export { "export" } else { "import" };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("[Enter]", Style::default().fg(Color::Blue)),
-            Span::styled(" import  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {action}  "), Style::default().fg(Color::DarkGray)),
+            Span::styled("[Tab]", Style::default().fg(Color::Blue)),
+            Span::styled(" switch  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[Esc]", Style::default().fg(Color::Blue)),
             Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
         ])),
-        chunks[2],
+        chunks[6],
     );
 }
 
@@ -235,6 +264,9 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
         KeyCode::Esc => {
             app.screen = Screen::Main;
         }
+        KeyCode::Tab => {
+            app.import_export_mode = !app.import_export_mode;
+        }
         KeyCode::Backspace => {
             app.import_path_input.pop();
         }
@@ -248,19 +280,31 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
                 return Ok(());
             }
             let path = expand_tilde(&raw);
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    let count = crate::inventory::import_from_ini(&content, &mut app.hosts);
-                    let updated = app.hosts.len();
-                    app.save_hosts()?;
-                    app.status_message = Some(format!(
-                        "Import complete: {count} new hosts added ({updated} total)."
-                    ));
-                    app.screen = Screen::Main;
+            if app.import_export_mode {
+                let content = crate::inventory::export_to_ini(&app.hosts);
+                match std::fs::write(&path, &content) {
+                    Ok(()) => {
+                        app.status_message = Some(format!("Exported {} hosts to {path}.", app.hosts.len()));
+                        app.screen = Screen::Main;
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Export error: {e}"));
+                    }
                 }
-                Err(e) => {
-                    app.status_message = Some(format!("Error reading file: {e}"));
-                    // Stay on ImportHosts screen so user can correct the path
+            } else {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let count = crate::inventory::import_from_ini(&content, &mut app.hosts);
+                        let updated = app.hosts.len();
+                        app.save_hosts()?;
+                        app.status_message = Some(format!(
+                            "Import complete: {count} new hosts added ({updated} total)."
+                        ));
+                        app.screen = Screen::Main;
+                    }
+                    Err(e) => {
+                        app.status_message = Some(format!("Error reading file: {e}"));
+                    }
                 }
             }
         }

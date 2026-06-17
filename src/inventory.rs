@@ -30,11 +30,11 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
 
         if let Some(vars) = parts.next() {
             for token in vars.split_whitespace() {
-                if let Some(v) = token.strip_prefix("ansible_host=") {
+                if let Some(v) = token.strip_prefix("ansible_host=").or_else(|| token.strip_prefix("ansible_ssh_host=")) {
                     ip = v.to_string();
-                } else if let Some(v) = token.strip_prefix("ansible_port=") {
+                } else if let Some(v) = token.strip_prefix("ansible_port=").or_else(|| token.strip_prefix("ansible_ssh_port=")) {
                     port = v.parse().unwrap_or(22);
-                } else if let Some(v) = token.strip_prefix("ansible_user=") {
+                } else if let Some(v) = token.strip_prefix("ansible_user=").or_else(|| token.strip_prefix("ansible_ssh_user=")) {
                     user = Some(v.to_string());
                 }
             }
@@ -96,11 +96,11 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
 
         if let Some(vars) = parts.next() {
             for token in vars.split_whitespace() {
-                if let Some(v) = token.strip_prefix("ansible_host=") {
+                if let Some(v) = token.strip_prefix("ansible_host=").or_else(|| token.strip_prefix("ansible_ssh_host=")) {
                     ip = v.to_string();
-                } else if let Some(v) = token.strip_prefix("ansible_port=") {
+                } else if let Some(v) = token.strip_prefix("ansible_port=").or_else(|| token.strip_prefix("ansible_ssh_port=")) {
                     port = v.parse().unwrap_or(22);
-                } else if let Some(v) = token.strip_prefix("ansible_user=") {
+                } else if let Some(v) = token.strip_prefix("ansible_user=").or_else(|| token.strip_prefix("ansible_ssh_user=")) {
                     user = Some(v.to_string());
                 }
             }

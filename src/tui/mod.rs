@@ -45,6 +45,7 @@ pub struct App {
     // Host form / import state
     pub host_form: Option<HostForm>,
     pub import_path_input: String,
+    pub import_export_mode: bool, // false = import, true = export
     // Delete confirmation popup
     pub delete_popup: Option<DeletePopup>,
     pub skip_delete_confirm: bool,
@@ -71,6 +72,7 @@ impl App {
             popup_selected: 0,
             host_form: None,
             import_path_input: String::new(),
+            import_export_mode: false,
             delete_popup: None,
             skip_delete_confirm: false,
             should_quit: false,

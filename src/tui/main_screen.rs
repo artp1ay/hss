@@ -242,6 +242,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Char('i') | KeyCode::Char('I') if !app.search_focused => {
             app.import_path_input.clear();
+            app.import_export_mode = false;
             app.screen = Screen::ImportHosts;
         }
         _ => {}
