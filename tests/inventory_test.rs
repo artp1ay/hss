@@ -82,3 +82,73 @@ fn test_sync_preserves_last_credential() {
     let synced = hss::inventory::sync_server_records(records, &active);
     assert_eq!(synced[0].last_credential_id, Some("cred-42".into()));
 }
+
+#[test]
+fn test_import_adds_new_hosts() {
+    let ini = "[webservers]\nweb1 ansible_host=10.0.0.1 ansible_user=deploy\n";
+    let mut hosts = vec![];
+    let count = hss::inventory::import_from_ini(ini, &mut hosts);
+    assert_eq!(count, 1);
+    assert_eq!(hosts[0].name, "web1");
+    assert_eq!(hosts[0].ip, "10.0.0.1");
+    assert_eq!(hosts[0].user, Some("deploy".into()));
+    assert_eq!(hosts[0].group, "webservers");
+}
+
+#[test]
+fn test_import_updates_existing_host() {
+    let existing = hss::types::Host {
+        id: "existing-id".into(),
+        name: "web1".into(),
+        ip: "old-ip".into(),
+        group: "old-group".into(),
+        port: 22,
+        user: None,
+        tags: vec!["custom-tag".into()],
+        description: Some("My server".into()),
+    };
+    let mut hosts = vec![existing];
+    let ini = "[webservers]\nweb1 ansible_host=10.0.0.1 ansible_user=deploy\n";
+    let count = hss::inventory::import_from_ini(ini, &mut hosts);
+    assert_eq!(count, 0);
+    assert_eq!(hosts[0].id, "existing-id");
+    assert_eq!(hosts[0].ip, "10.0.0.1");
+    assert_eq!(hosts[0].user, Some("deploy".into()));
+    assert_eq!(hosts[0].description, Some("My server".into()));
+    assert!(hosts[0].tags.contains(&"custom-tag".to_string()));
+}
+
+#[test]
+fn test_import_merges_tags() {
+    let existing = hss::types::Host {
+        id: "id1".into(),
+        name: "web1".into(),
+        ip: "10.0.0.1".into(),
+        group: "web".into(),
+        port: 22,
+        user: None,
+        tags: vec!["existing-tag".into()],
+        description: None,
+    };
+    let mut hosts = vec![existing];
+    let ini = "[web]\nweb1 ansible_host=10.0.0.1 # tags=new-tag,existing-tag\n";
+    hss::inventory::import_from_ini(ini, &mut hosts);
+    assert!(hosts[0].tags.contains(&"existing-tag".to_string()));
+    assert!(hosts[0].tags.contains(&"new-tag".to_string()));
+    assert_eq!(hosts[0].tags.len(), 2);
+}
+
+#[test]
+fn test_export_to_ini_basic() {
+    use hss::types::Host;
+    let hosts = vec![
+        Host { id: "1".into(), name: "web1".into(), ip: "10.0.0.1".into(), group: "webservers".into(), port: 22, user: Some("deploy".into()), tags: vec![], description: None },
+        Host { id: "2".into(), name: "db1".into(), ip: "10.0.0.2".into(), group: "databases".into(), port: 5432, user: None, tags: vec![], description: None },
+    ];
+    let ini = hss::inventory::export_to_ini(&hosts);
+    assert!(ini.contains("[webservers]"));
+    assert!(ini.contains("[databases]"));
+    assert!(ini.contains("web1 ansible_host=10.0.0.1 ansible_port=22 ansible_user=deploy"));
+    assert!(ini.contains("db1 ansible_host=10.0.0.2 ansible_port=5432"));
+    assert!(!ini.contains("ansible_user=postgres") && !ini.contains("ansible_user=\n"));
+}
