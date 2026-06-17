@@ -41,19 +41,26 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let search_content = Line::from(vec![
-        Span::styled("🔍 ", Style::default().fg(Color::DarkGray)),
-        Span::styled(&app.search_query, Style::default().fg(Color::White)),
-        if app.search_focused { Span::styled("█", Style::default().fg(Color::Blue)) } else { Span::raw("") },
-    ]);
+    let search_content = if app.search_query.is_empty() && !app.search_focused {
+        Line::from(Span::styled("Search...", Style::default().fg(Color::DarkGray)))
+    } else {
+        Line::from(vec![
+            Span::styled(&app.search_query, Style::default().fg(Color::White)),
+            if app.search_focused {
+                Span::styled("█", Style::default().fg(Color::Blue))
+            } else {
+                Span::raw("")
+            },
+        ])
+    };
     f.render_widget(
         Paragraph::new(search_content).block(Block::default().borders(Borders::ALL).border_style(border_style)),
         chunks[1],
     );
 
     // Server table
-    let header = Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "LAST CONN"])
-        .style(Style::default().fg(Color::DarkGray));
+    let header = Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "TAGS"])
+        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = hosts.iter().map(|h| {
         Row::new(vec![
@@ -61,12 +68,13 @@ pub fn draw(f: &mut Frame, app: &App) {
             Cell::from(h.group.clone()).style(Style::default().fg(group_color(&h.group))),
             Cell::from(h.ip.clone()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(h.port.to_string()).style(Style::default().fg(Color::DarkGray)),
-            Cell::from(
-                app.server_records.iter()
-                    .find(|r| r.host_id == h.name && r.last_credential_id.is_some())
-                    .map(|_| "✓")
-                    .unwrap_or("—")
-            ).style(Style::default().fg(Color::DarkGray)),
+            Cell::from({
+                if h.tags.is_empty() {
+                    "".to_string()
+                } else {
+                    h.tags.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
+                }
+            }).style(Style::default().fg(Color::DarkGray)),
         ])
     }).collect();
 
@@ -88,9 +96,18 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Hotkey bar
     let hotkeys = if app.search_focused {
-        hotkey_line(&[("Tab", "table"), ("Esc", "clear")])
+        hotkey_line(&[("Esc", "clear/back"), ("Tab", "table")])
+    } else if app.delete_confirm.is_some() {
+        Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[D]", Style::default().fg(Color::Red)),
+            Span::styled(" again to confirm deletion, or any other key to cancel", Style::default().fg(Color::DarkGray)),
+        ])
     } else {
-        hotkey_line(&[("Enter", "connect"), ("R", "switch creds"), ("C", "credentials"), ("S", "settings"), ("Tab", "search"), ("Q", "quit")])
+        hotkey_line(&[
+            ("Enter", "connect"), ("N", "new"), ("E", "edit"), ("D", "delete"),
+            ("I", "import"), ("R", "creds"), ("S", "settings"), ("Q", "quit"),
+        ])
     };
     f.render_widget(Paragraph::new(hotkeys), chunks[3]);
 }
@@ -99,8 +116,8 @@ fn hotkey_line<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
     let mut spans = vec![];
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 { spans.push(Span::raw("  ")); }
-        spans.push(Span::styled(*key, Style::default().fg(Color::Blue)));
-        spans.push(Span::styled(format!("={label}"), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(format!("[{key}]"), Style::default().fg(Color::Blue)));
+        spans.push(Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray)));
     }
     Line::from(spans)
 }
@@ -112,6 +129,26 @@ fn group_color(group: &str) -> Color {
 
 pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
     let hosts_len = app.filtered_hosts().len();
+
+    // D with pending confirm: actually delete
+    if !app.search_focused {
+        if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) && app.delete_confirm.is_some() {
+            if let Some(idx) = app.delete_confirm.take() {
+                app.hosts.remove(idx);
+                app.save_hosts()?;
+                app.selected_row = app.selected_row.min(app.hosts.len().saturating_sub(1));
+                app.status_message = Some("Host deleted.".into());
+            }
+            return Ok(());
+        }
+        // Clear delete confirm on any other key
+        if !matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
+            if app.delete_confirm.is_some() {
+                app.delete_confirm = None;
+                app.status_message = None;
+            }
+        }
+    }
 
     match key.code {
         KeyCode::Tab => {
@@ -160,6 +197,41 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Enter if !app.search_focused && hosts_len > 0 => {
             connect_selected(terminal, app)?;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') if !app.search_focused => {
+            app.host_form = Some(crate::types::HostForm {
+                editing_id: None,
+                port: "22".into(),
+                ..Default::default()
+            });
+            app.screen = Screen::HostForm;
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') if !app.search_focused && hosts_len > 0 => {
+            if let Some(idx) = get_host_idx_in_all(app) {
+                let h = &app.hosts[idx];
+                app.host_form = Some(crate::types::HostForm {
+                    editing_id: Some(h.id.clone()),
+                    name: h.name.clone(),
+                    ip: h.ip.clone(),
+                    group: h.group.clone(),
+                    port: h.port.to_string(),
+                    user: h.user.clone().unwrap_or_default(),
+                    tags: h.tags.join(", "),
+                    description: h.description.clone().unwrap_or_default(),
+                    focused: 0,
+                });
+                app.screen = Screen::HostForm;
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') if !app.search_focused && hosts_len > 0 => {
+            if let Some(idx) = get_host_idx_in_all(app) {
+                app.delete_confirm = Some(idx);
+                app.status_message = Some("Press D again to confirm deletion.".into());
+            }
+        }
+        KeyCode::Char('i') | KeyCode::Char('I') if !app.search_focused => {
+            app.import_path_input.clear();
+            app.screen = Screen::ImportHosts;
         }
         _ => {}
     }
