@@ -1,7 +1,7 @@
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "hss", about = "SSH manager — connect to your servers")]
+#[command(name = "hss", about = "SSH manager — connect to your servers", version)]
 struct Cli {
     /// Quick fzf picker mode
     #[arg(long)]

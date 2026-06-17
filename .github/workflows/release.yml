@@ -75,6 +75,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Stamp the real release version into Cargo.toml before compiling so that
+      # env!("CARGO_PKG_VERSION") and `hss --version` reflect the actual tag.
+      - name: Stamp version into Cargo.toml
+        run: |
+          perl -pi -e 's/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+
       - name: Install musl tools (x86_64 static build)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools
