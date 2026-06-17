@@ -1,13 +1,13 @@
+use crate::tui::{App, Screen, Term};
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    Frame,
 };
-use crossterm::event::{KeyCode, KeyEvent};
-use anyhow::Result;
-use crate::tui::{App, Screen, Term};
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -25,8 +25,16 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Title bar
     let title = Line::from(vec![
-        Span::styled("hss", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" · {} hosts", hosts.len()), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "hss",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {} hosts", hosts.len()),
+            Style::default().fg(Color::DarkGray),
+        ),
         if let Some(ref msg) = app.status_message {
             Span::styled(format!("  ⚠ {msg}"), Style::default().fg(Color::Yellow))
         } else {
@@ -42,7 +50,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
     let search_content = if app.search_query.is_empty() && !app.search_focused {
-        Line::from(Span::styled("Search...", Style::default().fg(Color::DarkGray)))
+        Line::from(Span::styled(
+            "Search...",
+            Style::default().fg(Color::DarkGray),
+        ))
     } else {
         Line::from(vec![
             Span::styled(&app.search_query, Style::default().fg(Color::White)),
@@ -54,40 +65,63 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
     };
     f.render_widget(
-        Paragraph::new(search_content).block(Block::default().borders(Borders::ALL).border_style(border_style)),
+        Paragraph::new(search_content).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        ),
         chunks[1],
     );
 
     // Server table
-    let header = Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "TAGS"])
-        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let header = Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "TAGS"]).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
-    let rows: Vec<Row> = hosts.iter().map(|h| {
-        Row::new(vec![
-            Cell::from(h.name.clone()),
-            Cell::from(h.group.clone()).style(Style::default().fg(group_color(&h.group))),
-            Cell::from(h.ip.clone()).style(Style::default().fg(Color::DarkGray)),
-            Cell::from(h.port.to_string()).style(Style::default().fg(Color::DarkGray)),
-            Cell::from({
-                if h.tags.is_empty() {
-                    "".to_string()
-                } else {
-                    h.tags.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
-                }
-            }).style(Style::default().fg(Color::DarkGray)),
-        ])
-    }).collect();
+    let rows: Vec<Row> = hosts
+        .iter()
+        .map(|h| {
+            Row::new(vec![
+                Cell::from(h.name.clone()),
+                Cell::from(h.group.clone()).style(Style::default().fg(group_color(&h.group))),
+                Cell::from(h.ip.clone()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(h.port.to_string()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from({
+                    if h.tags.is_empty() {
+                        "".to_string()
+                    } else {
+                        h.tags
+                            .iter()
+                            .take(2)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                })
+                .style(Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
 
     let selected = app.selected_row.min(hosts.len().saturating_sub(1));
-    let mut state = TableState::default().with_selected(if hosts.is_empty() { None } else { Some(selected) });
+    let mut state = TableState::default().with_selected(if hosts.is_empty() {
+        None
+    } else {
+        Some(selected)
+    });
 
-    let table = Table::new(rows, [
-        Constraint::Length(22),
-        Constraint::Length(16),
-        Constraint::Length(18),
-        Constraint::Length(6),
-        Constraint::Min(8),
-    ])
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(22),
+            Constraint::Length(16),
+            Constraint::Length(18),
+            Constraint::Length(6),
+            Constraint::Min(8),
+        ],
+    )
     .header(header)
     .row_highlight_style(Style::default().bg(Color::Rgb(31, 41, 55)))
     .highlight_symbol("▶ ");
@@ -112,8 +146,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         hotkey_line(&[("Esc", "clear/back"), ("Tab", "table")])
     } else {
         hotkey_line(&[
-            ("Enter", "connect"), ("N", "new"), ("E", "edit"), ("D", "delete"),
-            ("I", "import"), ("R", "switch cred"), ("C", "credentials"), ("S", "settings"), ("Q", "quit"),
+            ("Enter", "connect"),
+            ("N", "new"),
+            ("E", "edit"),
+            ("D", "delete"),
+            ("I", "import/export"),
+            ("R", "switch cred"),
+            ("C", "credentials"),
+            ("S", "settings"),
+            ("Q", "quit"),
         ])
     };
     f.render_widget(Paragraph::new(hotkeys), chunks[3]);
@@ -122,16 +163,30 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn hotkey_line<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
     let mut spans = vec![];
     for (i, (key, label)) in pairs.iter().enumerate() {
-        if i > 0 { spans.push(Span::raw("  ")); }
-        spans.push(Span::styled(format!("[{key}]"), Style::default().fg(Color::Blue)));
-        spans.push(Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray)));
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            Style::default().fg(Color::Blue),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     Line::from(spans)
 }
 
 fn group_color(group: &str) -> Color {
     let hash: usize = group.bytes().map(|b| b as usize).sum::<usize>() % 5;
-    [Color::Green, Color::Cyan, Color::Yellow, Color::Magenta, Color::LightBlue][hash]
+    [
+        Color::Green,
+        Color::Cyan,
+        Color::Yellow,
+        Color::Magenta,
+        Color::LightBlue,
+    ][hash]
 }
 
 pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
@@ -187,7 +242,11 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 app.config.connect_timeout.to_string(),
                 app.config.strict_host_checking.clone(),
                 app.config.ssh_extra_args.clone(),
-                if app.config.auto_save_credential { "yes".into() } else { "no".into() },
+                if app.config.auto_save_credential {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
             ];
             app.settings_focused_field = 0;
             app.screen = Screen::Settings;
@@ -196,7 +255,10 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             let idx_in_all = get_host_idx_in_all(app);
             if let Some(idx) = idx_in_all {
                 app.popup_selected = 0;
-                app.screen = Screen::CredentialPicker { host_idx: idx, after_failure: false };
+                app.screen = Screen::CredentialPicker {
+                    host_idx: idx,
+                    after_failure: false,
+                };
             }
         }
         KeyCode::Enter if !app.search_focused && hosts_len > 0 => {
@@ -257,19 +319,24 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
 
 fn get_host_idx_in_all(app: &App) -> Option<usize> {
     let filtered = app.filtered_hosts();
-    if filtered.is_empty() { return None; }
+    if filtered.is_empty() {
+        return None;
+    }
     let host_name = &filtered[app.selected_row.min(filtered.len() - 1)].name;
     app.hosts.iter().position(|h| &h.name == host_name)
 }
 
 fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
     let filtered = app.filtered_hosts();
-    if filtered.is_empty() { return Ok(()); }
+    if filtered.is_empty() {
+        return Ok(());
+    }
     let host = filtered[app.selected_row.min(filtered.len() - 1)].clone();
 
     let last_cred_id = app.last_credential_id(&host.name).map(|s| s.to_string());
-    let cred = crate::ssh::resolve_credential(&app.credentials, &app.config, last_cred_id.as_deref())?
-        .cloned();
+    let cred =
+        crate::ssh::resolve_credential(&app.credentials, &app.config, last_cred_id.as_deref())?
+            .cloned();
 
     if let Some(cred) = cred {
         crate::tui::do_connect(terminal, app, &host.name, &cred)?;
@@ -277,7 +344,10 @@ fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
         // No credential resolved — show picker
         if let Some(idx) = app.hosts.iter().position(|h| h.name == host.name) {
             app.popup_selected = 0;
-            app.screen = Screen::CredentialPicker { host_idx: idx, after_failure: false };
+            app.screen = Screen::CredentialPicker {
+                host_idx: idx,
+                after_failure: false,
+            };
         }
     }
     Ok(())

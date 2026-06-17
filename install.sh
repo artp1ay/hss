@@ -66,7 +66,7 @@ fi
 # When piped through curl|bash, stdin is the script — read from /dev/tty instead.
 offer_alias() {
   local exe="${INSTALL_DIR}/${BIN}"
-  local alias_line="alias ${BIN}='${exe} --fzf'"
+  local alias_line="alias ${BIN}s='${exe} --fzf'"
 
   # Detect current shell's rc file
   local shell_name rc_file
