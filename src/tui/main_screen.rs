@@ -106,7 +106,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         hotkey_line(&[
             ("Enter", "connect"), ("N", "new"), ("E", "edit"), ("D", "delete"),
-            ("I", "import"), ("R", "creds"), ("S", "settings"), ("Q", "quit"),
+            ("I", "import"), ("R", "switch cred"), ("C", "credentials"), ("S", "settings"), ("Q", "quit"),
         ])
     };
     f.render_widget(Paragraph::new(hotkeys), chunks[3]);
@@ -161,6 +161,9 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             } else {
                 app.search_focused = false;
             }
+        }
+        KeyCode::Char('/') if !app.search_focused => {
+            app.search_focused = true;
         }
         KeyCode::Char(c) if app.search_focused => {
             app.search_query.push(c);

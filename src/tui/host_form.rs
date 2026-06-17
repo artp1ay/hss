@@ -88,7 +88,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 pub fn draw_import(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 20, f.area());
+    let area = centered_rect(60, 50, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()

@@ -60,7 +60,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_stateful_widget(table, chunks[1], &mut state);
 
     f.render_widget(
-        Paragraph::new(hotkey_line(&[("A", "add"), ("E", "edit"), ("D", "delete"), ("*", "set default"), ("Esc", "back")])),
+        Paragraph::new(hotkey_line(&[("A", "add"), ("E", "edit"), ("D", "delete"), ("*", "default"), ("Esc", "back")])),
         chunks[2],
     );
 
@@ -71,7 +71,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_form(f: &mut Frame, form: &CredentialForm, area: Rect) {
-    let popup = centered_rect(55, 60, area);
+    let popup = centered_rect(62, 70, area);
     f.render_widget(Clear, popup);
 
     let title = if form.editing_id.is_some() { " Edit credential " } else { " New credential " };
@@ -114,11 +114,12 @@ fn draw_form(f: &mut Frame, form: &CredentialForm, area: Rect) {
         render_field(f, "Key path:", &form.key_path, form.focused == 3, chunks[3]);
     } else {
         let masked: String = "•".repeat(form.password.len());
-        render_field(f, "Password:", &masked, form.focused == 3, chunks[3]);
+        let pw_label = if form.editing_id.is_some() { "Password: (blank=keep)" } else { "Password:" };
+        render_field(f, pw_label, &masked, form.focused == 3, chunks[3]);
     }
 
     f.render_widget(
-        Paragraph::new(hotkey_line(&[("Tab", "next field"), ("Space", "toggle type"), ("Enter", "save"), ("Esc", "cancel")])),
+        Paragraph::new(hotkey_line(&[("Tab", "next"), ("Space", "toggle type"), ("Enter", "save"), ("Esc", "cancel")])),
         chunks[4],
     );
 }
@@ -141,8 +142,8 @@ fn hotkey_line<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
     let mut spans = vec![];
     for (i, (key, label)) in pairs.iter().enumerate() {
         if i > 0 { spans.push(Span::raw("  ")); }
-        spans.push(Span::styled(*key, Style::default().fg(Color::Blue)));
-        spans.push(Span::styled(format!("={label}"), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(format!("[{key}]"), Style::default().fg(Color::Blue)));
+        spans.push(Span::styled(format!(" {label}"), Style::default().fg(Color::DarkGray)));
     }
     Line::from(spans)
 }
