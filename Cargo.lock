@@ -680,6 +680,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "keyring",
+ "libc",
  "ratatui",
  "serde",
  "skim",

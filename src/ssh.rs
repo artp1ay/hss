@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::os::unix::fs::PermissionsExt;
+use libc;
 use std::process::Command;
 use crate::config::{self, AppConfig};
 use crate::credentials;
@@ -71,7 +72,12 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig) -> R
         None
     };
 
+    // Ignore SIGINT in hss while SSH runs: Ctrl+C kills SSH but returns control here.
+    // Without this, Ctrl+C sends SIGINT to the whole process group and hss exits too.
+    let old_sigint = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
     let result = cmd.spawn().and_then(|mut child| child.wait());
+    unsafe { libc::signal(libc::SIGINT, old_sigint); }
+
     if let Some(ref path) = askpass_path {
         let _ = std::fs::remove_file(path);
     }

@@ -138,6 +138,10 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
     let hosts_len = app.filtered_hosts().len();
 
     match key.code {
+        // Q always quits, even while typing in search
+        KeyCode::Char('q') | KeyCode::Char('Q') => {
+            app.should_quit = true;
+        }
         KeyCode::Tab => {
             app.search_focused = !app.search_focused;
         }
@@ -148,6 +152,10 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             } else {
                 app.search_focused = false;
             }
+        }
+        // Enter in search → drop to table (don't connect yet)
+        KeyCode::Enter if app.search_focused => {
+            app.search_focused = false;
         }
         KeyCode::Char('/') if !app.search_focused => {
             app.search_focused = true;
@@ -167,9 +175,6 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Up | KeyCode::Char('k') if !app.search_focused => {
             app.selected_row = app.selected_row.saturating_sub(1);
-        }
-        KeyCode::Char('q') | KeyCode::Char('Q') if !app.search_focused => {
-            app.should_quit = true;
         }
         KeyCode::Char('c') | KeyCode::Char('C') if !app.search_focused => {
             app.screen = Screen::Credentials;
