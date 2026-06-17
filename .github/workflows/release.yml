@@ -77,9 +77,14 @@ jobs:
 
       # Stamp the real release version into Cargo.toml before compiling so that
       # env!("CARGO_PKG_VERSION") and `hss --version` reflect the actual tag.
+      # SemVer forbids leading zeros (1.0.0004 is invalid); strip them with awk
+      # so Cargo.toml gets "1.0.4" while git tags remain "v1.0.0004".
+      # hss --update compares via parse::<u64>() so "0004" == "4" — no breakage.
       - name: Stamp version into Cargo.toml
         run: |
-          perl -pi -e 's/^version = ".*"/version = "${{ needs.version.outputs.version }}"/' Cargo.toml
+          RAW="${{ needs.version.outputs.version }}"
+          SEMVER=$(echo "$RAW" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
+          perl -pi -e "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
 
       - name: Install musl tools (x86_64 static build)
         if: matrix.target == 'x86_64-unknown-linux-musl'
