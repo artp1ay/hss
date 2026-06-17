@@ -1,7 +1,10 @@
 [package]
 name = "hss"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "Terminal SSH server manager — TUI, credential storage, Ansible inventory"
+license = "MIT"
+repository = "https://github.com/OWNER/hss"
 
 [lib]
 name = "hss"
@@ -16,9 +19,16 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "5"
-keyring = "3"
+# linux-native: kernel keyutils (no D-Bus, session-scoped); apple-native: macOS Keychain
+keyring = { version = "3", default-features = false, features = ["linux-native", "apple-native"] }
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 skim = "0.10"
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

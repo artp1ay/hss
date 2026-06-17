@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 1. Determine next version and push tag ────────────────────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: ver
+        run: |
+          COUNT=$(git tag -l "v1.0.*" | wc -l | tr -d ' ')
+          N=$((COUNT + 1))
+          TAG="v1.0.$(printf '%04d' $N)"
+          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
+          echo "version=1.0.$(printf '%04d' $N)" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+  # ── 2. Cross-compile for all targets ─────────────────────────────────────
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: hss-linux-x86_64
+            cross: false
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: hss-linux-aarch64
+            cross: true
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: hss-macos-x86_64
+            cross: false
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: hss-macos-aarch64
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Stage artifact
+        run: cp target/${{ matrix.target }}/release/hss ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # ── 3. Publish GitHub release with changelog ─────────────────────────────
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          # second tag in descending order = previous release
+          PREV=$(git tag --sort=-version:refname | grep "^v1\.0\." | sed -n '2p')
+          if [ -z "$PREV" ]; then
+            git log --pretty=format:"- %s" > CHANGELOG.md
+          else
+            git log --pretty=format:"- %s" "${PREV}..${TAG}" > CHANGELOG.md
+          fi
+
+      - uses: actions/download-artifact@v4
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.version }}
+          body_path: CHANGELOG.md
+          files: |
+            hss-linux-x86_64/hss-linux-x86_64
+            hss-linux-aarch64/hss-linux-aarch64
+            hss-macos-x86_64/hss-macos-x86_64
+            hss-macos-aarch64/hss-macos-aarch64
