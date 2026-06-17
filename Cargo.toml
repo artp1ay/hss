@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Terminal SSH server manager — TUI, credential storage, Ansible inventory"
 license = "MIT"
-repository = "https://github.com/OWNER/hss"
+repository = "https://github.com/artp1ay/hss"
 
 [lib]
 name = "hss"

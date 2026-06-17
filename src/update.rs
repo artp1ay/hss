@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 
 // Replace OWNER with your GitHub username after creating the repo.
-const GITHUB_REPO: &str = "OWNER/hss";
+const GITHUB_REPO: &str = "artp1ay/hss";
 
 #[derive(serde::Deserialize)]
 struct Release {
