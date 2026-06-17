@@ -203,14 +203,25 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
             });
         }
         KeyCode::Char('d') | KeyCode::Char('D') if creds_len > 0 => {
-            let id = app.credentials[app.cred_selected.min(creds_len - 1)].id.clone();
-            crate::credentials::delete_credential(&id)?;
-            if app.config.default_credential_id.as_deref() == Some(&id) {
-                app.config.default_credential_id = None;
-                crate::config::save_config(&app.config)?;
+            let idx = app.cred_selected.min(creds_len - 1);
+            let name = app.credentials[idx].name.clone();
+            if app.skip_delete_confirm {
+                let id = app.credentials[idx].id.clone();
+                crate::credentials::delete_credential(&id)?;
+                if app.config.default_credential_id.as_deref() == Some(&id) {
+                    app.config.default_credential_id = None;
+                    crate::config::save_config(&app.config)?;
+                }
+                app.reload_credentials()?;
+                app.cred_selected = app.cred_selected.saturating_sub(1);
+            } else {
+                app.delete_popup = Some(crate::types::DeletePopup {
+                    kind: crate::types::DeleteKind::Credential,
+                    name,
+                    idx,
+                    dont_ask: false,
+                });
             }
-            app.reload_credentials()?;
-            app.cred_selected = app.cred_selected.saturating_sub(1);
         }
         KeyCode::Char('*') if creds_len > 0 => {
             let id = app.credentials[app.cred_selected.min(creds_len - 1)].id.clone();

@@ -45,6 +45,20 @@ pub struct CredentialForm {
     pub focused: usize, // 0=type toggle, 1=name, 2=username, 3=secret
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteKind {
+    Host,
+    Credential,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeletePopup {
+    pub kind: DeleteKind,
+    pub name: String,
+    pub idx: usize,
+    pub dont_ask: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HostForm {
     pub editing_id: Option<String>, // None = new host

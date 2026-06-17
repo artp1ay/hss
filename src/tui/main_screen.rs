@@ -97,12 +97,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Hotkey bar
     let hotkeys = if app.search_focused {
         hotkey_line(&[("Esc", "clear/back"), ("Tab", "table")])
-    } else if app.delete_confirm.is_some() {
-        Line::from(vec![
-            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[D]", Style::default().fg(Color::Red)),
-            Span::styled(" again to confirm deletion, or any other key to cancel", Style::default().fg(Color::DarkGray)),
-        ])
     } else {
         hotkey_line(&[
             ("Enter", "connect"), ("N", "new"), ("E", "edit"), ("D", "delete"),
@@ -129,26 +123,6 @@ fn group_color(group: &str) -> Color {
 
 pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
     let hosts_len = app.filtered_hosts().len();
-
-    // D with pending confirm: actually delete
-    if !app.search_focused {
-        if matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) && app.delete_confirm.is_some() {
-            if let Some(idx) = app.delete_confirm.take() {
-                app.hosts.remove(idx);
-                app.save_hosts()?;
-                app.selected_row = app.selected_row.min(app.hosts.len().saturating_sub(1));
-                app.status_message = Some("Host deleted.".into());
-            }
-            return Ok(());
-        }
-        // Clear delete confirm on any other key
-        if !matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')) {
-            if app.delete_confirm.is_some() {
-                app.delete_confirm = None;
-                app.status_message = None;
-            }
-        }
-    }
 
     match key.code {
         KeyCode::Tab => {
@@ -237,8 +211,20 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Char('d') | KeyCode::Char('D') if !app.search_focused && hosts_len > 0 => {
             if let Some(idx) = get_host_idx_in_all(app) {
-                app.delete_confirm = Some(idx);
-                app.status_message = Some("Press D again to confirm deletion.".into());
+                let name = app.hosts[idx].name.clone();
+                if app.skip_delete_confirm {
+                    app.hosts.remove(idx);
+                    app.save_hosts()?;
+                    app.selected_row = app.selected_row.min(app.hosts.len().saturating_sub(1));
+                    app.status_message = Some(format!("Host '{name}' deleted."));
+                } else {
+                    app.delete_popup = Some(crate::types::DeletePopup {
+                        kind: crate::types::DeleteKind::Host,
+                        name,
+                        idx,
+                        dont_ask: false,
+                    });
+                }
             }
         }
         KeyCode::Char('i') | KeyCode::Char('I') if !app.search_focused => {

@@ -3,9 +3,10 @@ use anyhow::Result;
 use crossterm::{execute, terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::config::AppConfig;
-use crate::types::{Credential, CredentialForm, Host, HostForm, ServerRecord};
+use crate::types::{Credential, CredentialForm, DeleteKind, DeletePopup, Host, HostForm, ServerRecord};
 
 pub mod credentials_screen;
+pub mod delete_popup;
 pub mod host_form;
 pub mod main_screen;
 pub mod popup;
@@ -44,7 +45,9 @@ pub struct App {
     // Host form / import state
     pub host_form: Option<HostForm>,
     pub import_path_input: String,
-    pub delete_confirm: Option<usize>,  // Some(host_idx) = waiting for 2nd D press
+    // Delete confirmation popup
+    pub delete_popup: Option<DeletePopup>,
+    pub skip_delete_confirm: bool,
     // Global
     pub should_quit: bool,
     pub status_message: Option<String>,
@@ -68,7 +71,8 @@ impl App {
             popup_selected: 0,
             host_form: None,
             import_path_input: String::new(),
-            delete_confirm: None,
+            delete_popup: None,
+            skip_delete_confirm: false,
             should_quit: false,
             status_message: None,
         }
@@ -198,9 +202,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             host_form::draw_import(f, app);
         }
     }
+    // Delete confirmation popup renders on top of any screen
+    if app.delete_popup.is_some() {
+        delete_popup::draw(f, app);
+    }
 }
 
 fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
+    if app.delete_popup.is_some() {
+        return delete_popup::handle_key(terminal, app, key);
+    }
     let screen = app.screen.clone();
     match screen {
         Screen::Main => main_screen::handle_key(terminal, app, key),
