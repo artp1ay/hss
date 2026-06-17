@@ -120,7 +120,7 @@ pub fn do_connect(terminal: &mut Term, app: &mut App, host_name: &str, cred: &Cr
     let (ip, port) = host.as_ref().map(|h| (h.ip.clone(), h.port)).unwrap_or_else(|| (host_name.to_string(), 22));
 
     restore_terminal(terminal)?;
-    let status = crate::ssh::spawn_ssh(&ip, port, cred)?;
+    let status = crate::ssh::spawn_ssh(&ip, port, cred, &app.config)?;
     *terminal = setup_terminal()?;
 
     if status.success() {

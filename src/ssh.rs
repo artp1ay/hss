@@ -26,7 +26,7 @@ pub fn resolve_credential<'a>(
     Ok(None)
 }
 
-pub fn spawn_ssh(host: &str, port: u16, cred: &Credential) -> Result<std::process::ExitStatus> {
+pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig) -> Result<std::process::ExitStatus> {
     // If keychain entry is missing (e.g. session keyring cleared on logout),
     // fall back to SSH's own interactive password prompt rather than crashing.
     let password = if cred.kind == CredentialKind::Password {
@@ -36,12 +36,18 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential) -> Result<std::proces
     };
 
     let mut ssh_args: Vec<String> = vec![
-        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(), format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        "-o".into(), format!("ConnectTimeout={}", cfg.connect_timeout),
         "-p".into(), port.to_string(),
         "-l".into(), cred.username.clone(),
     ];
     if let Some(ref key) = cred.key_path {
         ssh_args.extend_from_slice(&["-i".into(), key.clone()]);
+    }
+    if !cfg.ssh_extra_args.is_empty() {
+        for arg in cfg.ssh_extra_args.split_whitespace() {
+            ssh_args.push(arg.to_string());
+        }
     }
     ssh_args.push(host.to_string());
 
@@ -93,7 +99,7 @@ pub fn connect_direct(host: &str) -> Result<()> {
     let cred = resolve_credential(&creds, &cfg, last_cred_id.as_deref())?
         .ok_or_else(|| anyhow::anyhow!("No credentials configured. Run `hss` to set up credentials."))?;
 
-    spawn_ssh(&ssh_host, port, cred)?;
+    spawn_ssh(&ssh_host, port, cred, &cfg)?;
     Ok(())
 }
 

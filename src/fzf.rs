@@ -56,7 +56,7 @@ pub fn run() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Credential not found"))?
     };
 
-    let status = ssh::spawn_ssh(&host.ip, host.port, &cred)?;
+    let status = ssh::spawn_ssh(&host.ip, host.port, &cred, &cfg)?;
     if status.success() {
         // Save last credential
         let mut records = config::load_server_records()?;
