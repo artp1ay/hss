@@ -186,6 +186,15 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             app.cred_selected = 0;
         }
         KeyCode::Char('s') | KeyCode::Char('S') if !app.search_focused => {
+            app.settings_inputs = vec![
+                app.config.default_user.clone().unwrap_or_default(),
+                app.config.default_port.to_string(),
+                app.config.connect_timeout.to_string(),
+                app.config.strict_host_checking.clone(),
+                app.config.ssh_extra_args.clone(),
+                if app.config.auto_save_credential { "yes".into() } else { "no".into() },
+            ];
+            app.settings_focused_field = 0;
             app.screen = Screen::Settings;
         }
         KeyCode::Char('r') | KeyCode::Char('R') if !app.search_focused && hosts_len > 0 => {

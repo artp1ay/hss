@@ -37,7 +37,7 @@ pub struct App {
     pub cred_selected: usize,
     pub cred_form: Option<CredentialForm>,
     // Settings screen state
-    pub settings_inventory_input: String,
+    pub settings_inputs: Vec<String>,   // 6 strings for the editable settings fields
     pub settings_focused_field: usize,
     // Popup state
     pub popup_selected: usize,
@@ -63,7 +63,7 @@ impl App {
             search_focused: true,
             cred_selected: 0,
             cred_form: None,
-            settings_inventory_input: String::new(),
+            settings_inputs: Vec::new(),
             settings_focused_field: 0,
             popup_selected: 0,
             host_form: None,
