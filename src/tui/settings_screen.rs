@@ -77,32 +77,11 @@ pub fn draw(f: &mut Frame, app: &App) {
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => {
-            // Discard changes
-            app.settings_inventory_input = app.config.inventory_path.clone().unwrap_or_default();
-            // Only allow going back if inventory is already configured
-            if app.config.inventory_path.is_some() {
-                app.screen = Screen::Main;
-            }
+            app.screen = Screen::Main;
         }
         KeyCode::Enter => {
-            let path = app.settings_inventory_input.trim().to_string();
-            if !path.is_empty() {
-                app.config.inventory_path = Some(path.clone());
-                crate::config::save_config(&app.config)?;
-                // Reload inventory
-                if std::path::Path::new(&path).exists() {
-                    let (hosts, records) = crate::inventory::load_and_sync(&path)?;
-                    app.hosts = hosts;
-                    app.server_records = records;
-                }
-                app.screen = Screen::Main;
-            }
-        }
-        KeyCode::Backspace => {
-            app.settings_inventory_input.pop();
-        }
-        KeyCode::Char(c) => {
-            app.settings_inventory_input.push(c);
+            crate::config::save_config(&app.config)?;
+            app.screen = Screen::Main;
         }
         _ => {}
     }

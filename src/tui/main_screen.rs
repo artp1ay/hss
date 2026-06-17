@@ -63,7 +63,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Cell::from(h.port.to_string()).style(Style::default().fg(Color::DarkGray)),
             Cell::from(
                 app.server_records.iter()
-                    .find(|r| r.name == h.name && r.last_credential_id.is_some())
+                    .find(|r| r.host_id == h.name && r.last_credential_id.is_some())
                     .map(|_| "✓")
                     .unwrap_or("—")
             ).style(Style::default().fg(Color::DarkGray)),
@@ -149,7 +149,6 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             app.cred_selected = 0;
         }
         KeyCode::Char('s') | KeyCode::Char('S') if !app.search_focused => {
-            app.settings_inventory_input = app.config.inventory_path.clone().unwrap_or_default();
             app.screen = Screen::Settings;
         }
         KeyCode::Char('r') | KeyCode::Char('R') if !app.search_focused && hosts_len > 0 => {

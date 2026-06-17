@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use crate::types::{Credential, ServerRecord};
+use crate::types::{Credential, Host, ServerRecord};
 
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
@@ -9,23 +9,42 @@ pub fn config_dir() -> PathBuf {
         .join("hss")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+fn default_port() -> u16 { 22 }
+fn default_timeout() -> u8 { 10 }
+fn default_strict_host_checking() -> String { "accept-new".to_string() }
+fn default_true() -> bool { true }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    pub inventory_path: Option<String>,
     pub default_credential_id: Option<String>,
+    pub default_user: Option<String>,
+    #[serde(default = "default_port")]
+    pub default_port: u16,
+    #[serde(default = "default_timeout")]
+    pub connect_timeout: u8,
+    #[serde(default)]
+    pub ssh_extra_args: String,
+    #[serde(default = "default_strict_host_checking")]
+    pub strict_host_checking: String,
+    #[serde(default = "default_true")]
+    pub auto_save_credential: bool,
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct CredentialsFile {
-    #[serde(default, rename = "credential")]
-    credentials: Vec<Credential>,
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_credential_id: None,
+            default_user: None,
+            default_port: 22,
+            connect_timeout: 10,
+            ssh_extra_args: String::new(),
+            strict_host_checking: "accept-new".to_string(),
+            auto_save_credential: true,
+        }
+    }
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct ServersFile {
-    #[serde(default, rename = "server")]
-    servers: Vec<ServerRecord>,
-}
+// ── AppConfig ────────────────────────────────────────────────────────────────
 
 pub fn load_config() -> Result<AppConfig> {
     let path = config_dir().join("config.toml");
@@ -39,8 +58,52 @@ pub fn load_config() -> Result<AppConfig> {
 pub fn save_config(cfg: &AppConfig) -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("config.toml"), toml::to_string_pretty(cfg)?)?;
+    let tmp = dir.join("config.toml.tmp");
+    std::fs::write(&tmp, toml::to_string_pretty(cfg)?)?;
+    std::fs::rename(tmp, dir.join("config.toml"))?;
     Ok(())
+}
+
+// ── Hosts ────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default)]
+struct HostsFile {
+    #[serde(default, rename = "host")]
+    hosts: Vec<Host>,
+}
+
+pub fn serialize_hosts(hosts: &[Host]) -> Result<String> {
+    Ok(toml::to_string_pretty(&HostsFile { hosts: hosts.to_vec() })?)
+}
+
+pub fn parse_hosts(s: &str) -> Result<Vec<Host>> {
+    Ok(toml::from_str::<HostsFile>(s)?.hosts)
+}
+
+pub fn load_hosts() -> Result<Vec<Host>> {
+    let path = config_dir().join("hosts.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => parse_hosts(&s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn save_hosts(hosts: &[Host]) -> Result<()> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join("hosts.toml.tmp");
+    std::fs::write(&tmp, serialize_hosts(hosts)?)?;
+    std::fs::rename(tmp, dir.join("hosts.toml"))?;
+    Ok(())
+}
+
+// ── Credentials ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default)]
+struct CredentialsFile {
+    #[serde(default, rename = "credential")]
+    credentials: Vec<Credential>,
 }
 
 pub fn serialize_credentials(creds: &[Credential]) -> Result<String> {
@@ -65,8 +128,16 @@ pub fn save_credentials(creds: &[Credential]) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join("credentials.toml.tmp");
     std::fs::write(&tmp, serialize_credentials(creds)?)?;
-    std::fs::rename(&tmp, dir.join("credentials.toml"))?;
+    std::fs::rename(tmp, dir.join("credentials.toml"))?;
     Ok(())
+}
+
+// ── Server records ───────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default)]
+struct ServersFile {
+    #[serde(default, rename = "server")]
+    servers: Vec<ServerRecord>,
 }
 
 pub fn serialize_server_records(records: &[ServerRecord]) -> Result<String> {
@@ -91,6 +162,6 @@ pub fn save_server_records(records: &[ServerRecord]) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join("servers.toml.tmp");
     std::fs::write(&tmp, serialize_server_records(records)?)?;
-    std::fs::rename(&tmp, dir.join("servers.toml"))?;
+    std::fs::rename(tmp, dir.join("servers.toml"))?;
     Ok(())
 }

@@ -3,7 +3,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use crate::config::{self, AppConfig};
 use crate::credentials;
-use crate::inventory;
 use crate::types::{Credential, CredentialKind};
 
 pub fn resolve_credential<'a>(
@@ -79,21 +78,14 @@ fn write_askpass_helper(_password: &str) -> Result<std::path::PathBuf> {
 pub fn connect_direct(host: &str) -> Result<()> {
     let cfg = config::load_config()?;
     let creds = config::load_credentials()?;
+    let records = config::load_server_records()?;
+    let hosts = config::load_hosts()?;
 
-    let (ssh_host, port, last_cred_id) = if let Some(ref inv_path) = cfg.inventory_path {
-        if std::path::Path::new(inv_path).exists() {
-            let (hosts, records) = inventory::load_and_sync(inv_path)?;
-            if let Some(h) = hosts.into_iter().find(|h| h.name == host || h.ip == host) {
-                let last_id = records.iter()
-                    .find(|r| r.name == h.name)
-                    .and_then(|r| r.last_credential_id.clone());
-                (h.ip, h.port, last_id)
-            } else {
-                (host.to_string(), 22, None)
-            }
-        } else {
-            (host.to_string(), 22, None)
-        }
+    let (ssh_host, port, last_cred_id) = if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
+        let last_id = records.iter()
+            .find(|r| r.host_id == h.name)
+            .and_then(|r| r.last_credential_id.clone());
+        (h.ip.clone(), h.port, last_id)
     } else {
         (host.to_string(), 22, None)
     };

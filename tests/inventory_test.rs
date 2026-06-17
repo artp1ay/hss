@@ -15,11 +15,11 @@ db1 ansible_host=10.0.0.5
     assert_eq!(web1.ip, "192.168.1.10");
     assert_eq!(web1.port, 2222);
     assert_eq!(web1.group, "webservers");
-    assert_eq!(web1.ansible_user, Some("deploy".into()));
+    assert_eq!(web1.user, Some("deploy".into()));
 
     let web2 = hosts.iter().find(|h| h.name == "web2").unwrap();
     assert_eq!(web2.port, 22);
-    assert_eq!(web2.ansible_user, None);
+    assert_eq!(web2.user, None);
 
     let db1 = hosts.iter().find(|h| h.name == "db1").unwrap();
     assert_eq!(db1.group, "databases");
@@ -63,22 +63,22 @@ fn test_parse_ignores_comments_and_blank_lines() {
 fn test_sync_removes_deleted_hosts() {
     use hss::types::ServerRecord;
     let records = vec![
-        ServerRecord { name: "web1".into(), last_credential_id: Some("c1".into()) },
-        ServerRecord { name: "old-gone".into(), last_credential_id: None },
+        ServerRecord { host_id: "uuid-web1".into(), last_credential_id: Some("c1".into()) },
+        ServerRecord { host_id: "uuid-old-gone".into(), last_credential_id: None },
     ];
-    let active = vec!["web1".to_string()];
+    let active = vec!["uuid-web1".to_string()];
     let synced = hss::inventory::sync_server_records(records, &active);
     assert_eq!(synced.len(), 1);
-    assert_eq!(synced[0].name, "web1");
+    assert_eq!(synced[0].host_id, "uuid-web1");
 }
 
 #[test]
 fn test_sync_preserves_last_credential() {
     use hss::types::ServerRecord;
     let records = vec![
-        ServerRecord { name: "web1".into(), last_credential_id: Some("cred-42".into()) },
+        ServerRecord { host_id: "uuid-web1".into(), last_credential_id: Some("cred-42".into()) },
     ];
-    let active = vec!["web1".to_string()];
+    let active = vec!["uuid-web1".to_string()];
     let synced = hss::inventory::sync_server_records(records, &active);
     assert_eq!(synced[0].last_credential_id, Some("cred-42".into()));
 }

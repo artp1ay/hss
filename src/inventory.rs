@@ -1,4 +1,5 @@
 use anyhow::Result;
+use uuid::Uuid;
 use crate::types::{Host, ServerRecord};
 
 pub fn parse_inventory(content: &str) -> Vec<Host> {
@@ -26,7 +27,7 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
 
         let mut ip = name.clone();
         let mut port = 22u16;
-        let mut ansible_user = None;
+        let mut user = None;
 
         if let Some(vars) = parts.next() {
             for token in vars.split_whitespace() {
@@ -35,26 +36,39 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
                 } else if let Some(v) = token.strip_prefix("ansible_port=") {
                     port = v.parse().unwrap_or(22);
                 } else if let Some(v) = token.strip_prefix("ansible_user=") {
-                    ansible_user = Some(v.to_string());
+                    user = Some(v.to_string());
                 }
             }
         }
 
-        hosts.push(Host { name, ip, group: current_group.clone(), port, ansible_user });
+        hosts.push(Host {
+            id: Uuid::new_v4().to_string(),
+            name,
+            ip,
+            group: current_group.clone(),
+            port,
+            user,
+            tags: vec![],
+            description: None,
+        });
     }
     hosts
 }
 
-pub fn sync_server_records(records: Vec<ServerRecord>, active_names: &[String]) -> Vec<ServerRecord> {
-    records.into_iter().filter(|r| active_names.contains(&r.name)).collect()
+pub fn sync_server_records(records: Vec<ServerRecord>, active_ids: &[String]) -> Vec<ServerRecord> {
+    records.into_iter().filter(|r| active_ids.contains(&r.host_id)).collect()
 }
+
+// stub — will be replaced in inventory task
+pub fn import_from_ini(_content: &str, _hosts: &mut Vec<Host>) -> usize { 0 }
+pub fn export_to_ini(_hosts: &[Host]) -> String { String::new() }
 
 pub fn load_and_sync(inventory_path: &str) -> Result<(Vec<Host>, Vec<ServerRecord>)> {
     let content = std::fs::read_to_string(inventory_path)?;
     let hosts = parse_inventory(&content);
-    let active_names: Vec<String> = hosts.iter().map(|h| h.name.clone()).collect();
+    let active_ids: Vec<String> = hosts.iter().map(|h| h.id.clone()).collect();
     let records = crate::config::load_server_records()?;
-    let synced = sync_server_records(records, &active_names);
+    let synced = sync_server_records(records, &active_ids);
     crate::config::save_server_records(&synced)?;
     Ok((hosts, synced))
 }

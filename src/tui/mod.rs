@@ -6,6 +6,7 @@ use crate::config::AppConfig;
 use crate::types::{Credential, CredentialForm, Host, ServerRecord};
 
 pub mod credentials_screen;
+pub mod host_form;
 pub mod main_screen;
 pub mod popup;
 pub mod settings_screen;
@@ -45,7 +46,6 @@ pub struct App {
 
 impl App {
     pub fn new(hosts: Vec<Host>, credentials: Vec<Credential>, config: AppConfig, server_records: Vec<ServerRecord>) -> Self {
-        let settings_inventory_input = config.inventory_path.clone().unwrap_or_default();
         Self {
             screen: Screen::Main,
             hosts,
@@ -57,7 +57,7 @@ impl App {
             search_focused: true,
             cred_selected: 0,
             cred_form: None,
-            settings_inventory_input,
+            settings_inventory_input: String::new(),
             settings_focused_field: 0,
             popup_selected: 0,
             should_quit: false,
@@ -79,16 +79,16 @@ impl App {
 
     pub fn last_credential_id(&self, host_name: &str) -> Option<&str> {
         self.server_records.iter()
-            .find(|r| r.name == host_name)
+            .find(|r| r.host_id == host_name)  // temporarily using name as host_id
             .and_then(|r| r.last_credential_id.as_deref())
     }
 
     pub fn save_last_credential(&mut self, host_name: &str, cred_id: &str) -> Result<()> {
-        if let Some(r) = self.server_records.iter_mut().find(|r| r.name == host_name) {
+        if let Some(r) = self.server_records.iter_mut().find(|r| r.host_id == host_name) {
             r.last_credential_id = Some(cred_id.to_string());
         } else {
             self.server_records.push(ServerRecord {
-                name: host_name.to_string(),
+                host_id: host_name.to_string(),
                 last_credential_id: Some(cred_id.to_string()),
             });
         }
@@ -138,24 +138,9 @@ pub fn do_connect(terminal: &mut Term, app: &mut App, host_name: &str, cred: &Cr
 
 pub fn run() -> Result<()> {
     let cfg = crate::config::load_config()?;
-
-    if cfg.inventory_path.is_none() {
-        let mut terminal = setup_terminal()?;
-        let mut app = App::new(vec![], crate::config::load_credentials()?, cfg, vec![]);
-        app.screen = Screen::Settings;
-        let result = run_loop(&mut terminal, &mut app);
-        restore_terminal(&mut terminal)?;
-        return result;
-    }
-
-    let inv_path = cfg.inventory_path.as_deref().unwrap();
-    let (hosts, records) = if std::path::Path::new(inv_path).exists() {
-        crate::inventory::load_and_sync(inv_path)?
-    } else {
-        (vec![], vec![])
-    };
+    let hosts = crate::config::load_hosts()?;
     let credentials = crate::config::load_credentials()?;
-
+    let records = crate::config::load_server_records()?;
     let mut terminal = setup_terminal()?;
     let mut app = App::new(hosts, credentials, cfg, records);
     let result = run_loop(&mut terminal, &mut app);
