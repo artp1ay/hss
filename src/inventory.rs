@@ -1,6 +1,5 @@
-use anyhow::Result;
 use uuid::Uuid;
-use crate::types::{Host, ServerRecord};
+use crate::types::Host;
 
 pub fn parse_inventory(content: &str) -> Vec<Host> {
     let mut hosts = Vec::new();
@@ -53,10 +52,6 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
         });
     }
     hosts
-}
-
-pub fn sync_server_records(records: Vec<ServerRecord>, active_ids: &[String]) -> Vec<ServerRecord> {
-    records.into_iter().filter(|r| active_ids.contains(&r.host_id)).collect()
 }
 
 pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
@@ -164,12 +159,3 @@ pub fn export_to_ini(hosts: &[Host]) -> String {
     out
 }
 
-pub fn load_and_sync(inventory_path: &str) -> Result<(Vec<Host>, Vec<ServerRecord>)> {
-    let content = std::fs::read_to_string(inventory_path)?;
-    let hosts = parse_inventory(&content);
-    let active_ids: Vec<String> = hosts.iter().map(|h| h.id.clone()).collect();
-    let records = crate::config::load_server_records()?;
-    let synced = sync_server_records(records, &active_ids);
-    crate::config::save_server_records(&synced)?;
-    Ok((hosts, synced))
-}

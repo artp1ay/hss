@@ -242,11 +242,12 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
             app.import_path_input.push(c);
         }
         KeyCode::Enter => {
-            let path = app.import_path_input.trim().to_string();
-            if path.is_empty() {
+            let raw = app.import_path_input.trim().to_string();
+            if raw.is_empty() {
                 app.screen = Screen::Main;
                 return Ok(());
             }
+            let path = expand_tilde(&raw);
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     let count = crate::inventory::import_from_ini(&content, &mut app.hosts);
@@ -266,6 +267,15 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
         _ => {}
     }
     Ok(())
+}
+
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[1..]);
+        }
+    }
+    path.to_string()
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

@@ -92,7 +92,20 @@ pub fn draw(f: &mut Frame, app: &App) {
     .row_highlight_style(Style::default().bg(Color::Rgb(31, 41, 55)))
     .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(table, chunks[2], &mut state);
+    if hosts.is_empty() {
+        let hint = if app.search_query.is_empty() {
+            "No hosts — press [N] to add, [I] to import"
+        } else {
+            "No matches"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[2],
+        );
+    } else {
+        f.render_stateful_widget(table, chunks[2], &mut state);
+    }
 
     // Hotkey bar
     let hotkeys = if app.search_focused {

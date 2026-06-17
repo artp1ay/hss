@@ -59,29 +59,6 @@ fn test_parse_ignores_comments_and_blank_lines() {
     assert_eq!(hosts.len(), 1);
 }
 
-#[test]
-fn test_sync_removes_deleted_hosts() {
-    use hss::types::ServerRecord;
-    let records = vec![
-        ServerRecord { host_id: "uuid-web1".into(), last_credential_id: Some("c1".into()) },
-        ServerRecord { host_id: "uuid-old-gone".into(), last_credential_id: None },
-    ];
-    let active = vec!["uuid-web1".to_string()];
-    let synced = hss::inventory::sync_server_records(records, &active);
-    assert_eq!(synced.len(), 1);
-    assert_eq!(synced[0].host_id, "uuid-web1");
-}
-
-#[test]
-fn test_sync_preserves_last_credential() {
-    use hss::types::ServerRecord;
-    let records = vec![
-        ServerRecord { host_id: "uuid-web1".into(), last_credential_id: Some("cred-42".into()) },
-    ];
-    let active = vec!["uuid-web1".to_string()];
-    let synced = hss::inventory::sync_server_records(records, &active);
-    assert_eq!(synced[0].last_credential_id, Some("cred-42".into()));
-}
 
 #[test]
 fn test_import_adds_new_hosts() {

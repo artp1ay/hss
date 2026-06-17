@@ -58,9 +58,13 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig) -> R
         .stderr(std::process::Stdio::inherit());
 
     let askpass_path = if let Some(ref pw) = password {
-        let path = write_askpass_helper(pw)?;
+        let path = write_askpass_helper()?;
+        // DISPLAY is required by some SSH implementations (older macOS, some Linux) even
+        // when SSH_ASKPASS_REQUIRE=force is set. Use the existing DISPLAY or a dummy value.
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
         cmd.env("SSH_ASKPASS", &path)
             .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", display)
             .env("HSS_PASSWORD", pw);
         Some(path)
     } else {
@@ -74,7 +78,7 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig) -> R
     Ok(result?)
 }
 
-fn write_askpass_helper(_password: &str) -> Result<std::path::PathBuf> {
+fn write_askpass_helper() -> Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join(format!("hss-askpass-{}", std::process::id()));
     std::fs::write(&path, "#!/bin/sh\necho \"$HSS_PASSWORD\"\n")?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;

@@ -57,7 +57,18 @@ pub fn draw(f: &mut Frame, app: &App) {
     .row_highlight_style(Style::default().bg(Color::Rgb(31, 41, 55)))
     .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(table, chunks[1], &mut state);
+    if app.credentials.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "No credentials — press [A] to add one",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .alignment(ratatui::layout::Alignment::Center),
+            chunks[1],
+        );
+    } else {
+        f.render_stateful_widget(table, chunks[1], &mut state);
+    }
 
     f.render_widget(
         Paragraph::new(hotkey_line(&[("A", "add"), ("E", "edit"), ("D", "delete"), ("*", "default"), ("Esc", "back")])),

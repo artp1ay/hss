@@ -63,7 +63,7 @@ impl App {
             server_records,
             search_query: String::new(),
             selected_row: 0,
-            search_focused: true,
+            search_focused: false,
             cred_selected: 0,
             cred_form: None,
             settings_inputs: Vec::new(),
@@ -173,7 +173,9 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                handle_key(terminal, app, key)?;
+                if let Err(e) = handle_key(terminal, app, key) {
+                    app.status_message = Some(format!("Error: {e}"));
+                }
             }
         }
 
