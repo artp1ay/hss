@@ -12,6 +12,22 @@ Terminal SSH server manager. Browse servers, manage credentials, and connect —
 
 ## Install
 
+```sh
+curl -fsSL https://raw.githubusercontent.com/artp1ay/hss/main/install.sh | bash
+```
+
+Downloads the latest release for your platform and installs it to `~/.local/bin/hss`.
+No root required. The script will tell you if `~/.local/bin` needs to be added to `$PATH`.
+
+To update an existing installation:
+
+```sh
+hss --update
+```
+
+<details>
+<summary>Manual install</summary>
+
 Download a binary from [Releases](../../releases):
 
 | Platform | File |
@@ -23,8 +39,10 @@ Download a binary from [Releases](../../releases):
 
 ```sh
 chmod +x hss-linux-x86_64
-sudo mv hss-linux-x86_64 /usr/local/bin/hss
+mv hss-linux-x86_64 ~/.local/bin/hss
 ```
+
+</details>
 
 ## Usage
 
