@@ -28,8 +28,10 @@ pub fn resolve_credential<'a>(
 }
 
 pub fn spawn_ssh(host: &str, port: u16, cred: &Credential) -> Result<std::process::ExitStatus> {
+    // If keychain entry is missing (e.g. session keyring cleared on logout),
+    // fall back to SSH's own interactive password prompt rather than crashing.
     let password = if cred.kind == CredentialKind::Password {
-        Some(credentials::get_password(&cred.id)?)
+        credentials::get_password(&cred.id).ok()
     } else {
         None
     };
