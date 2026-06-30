@@ -1,6 +1,6 @@
 use std::io::{self, Stdout};
 use anyhow::Result;
-use crossterm::{execute, terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}};
+use crossterm::{execute, cursor::Show, terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::config::AppConfig;
 use crate::types::{Credential, CredentialForm, DeletePopup, Host, HostForm, ServerRecord};
@@ -131,7 +131,7 @@ pub fn setup_terminal() -> Result<Term> {
 
 pub fn restore_terminal(terminal: &mut Term) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)?;
     Ok(())
 }
 
