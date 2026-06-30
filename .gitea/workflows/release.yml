@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  # ── 1. Determine next version and push tag ────────────────────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: ver
+        run: |
+          LATEST=$(git tag -l "v1.0.*" | sort -V | tail -1)
+          if [ -z "$LATEST" ]; then
+            N=1
+          else
+            N=$(echo "$LATEST" | awk -F'.' '{n=int($NF)+1; print n}')
+          fi
+          TAG="v1.0.$(printf '%04d' $N)"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=1.0.$(printf '%04d' $N)" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        run: |
+          git config user.name  "gitea-actions"
+          git config user.email "gitea-actions@freakware.ru"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+  # ── 2. Build Linux static binaries ───────────────────────────────────────
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            artifact: hss-linux-x86_64
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            artifact: hss-linux-aarch64
+            cross: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Stamp version into Cargo.toml
+        run: |
+          RAW="${{ needs.version.outputs.version }}"
+          SEMVER=$(echo "$RAW" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
+          perl -pi -e "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Stage artifact
+        run: cp target/${{ matrix.target }}/release/hss ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  # ── 3. Create Gitea release ───────────────────────────────────────────────
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+
+      - name: Generate changelog
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          PREV=$(git tag --sort=-version:refname | grep "^v1\.0\." | sed -n '2p')
+          if [ -z "$PREV" ]; then
+            git log --pretty=format:"- %s" > CHANGELOG.md
+          else
+            git log --pretty=format:"- %s" "${PREV}..${TAG}" > CHANGELOG.md
+          fi
+
+      - name: Create release and upload assets
+        run: |
+          BODY=$(python3 -c "import json; print(json.dumps(open('CHANGELOG.md').read()))")
+          RELEASE_ID=$(curl -sf -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"${{ needs.version.outputs.tag }}\",\"name\":\"${{ needs.version.outputs.version }}\",\"body\":$BODY}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          for f in hss-linux-x86_64/hss-linux-x86_64 hss-linux-aarch64/hss-linux-aarch64; do
+            curl -sf -X POST \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases/${RELEASE_ID}/assets?name=$(basename $f)" \
+              -F "attachment=@${f}"
+          done
+
+  # ── 4. Mirror to GitHub (triggers GitHub Actions for macOS builds) ────────
+  mirror:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push all branches and tags to GitHub
+        run: |
+          git remote add github "https://artp1ay:${{ secrets.GITHUB_MIRROR_TOKEN }}@github.com/artp1ay/hss.git"
+          git push github --all
+          git push github --tags

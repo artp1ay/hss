@@ -2,47 +2,18 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    tags: ['v1.0.*']
 
 permissions:
   contents: write
 
 jobs:
-  # ── 1. Determine next version and push tag ────────────────────────────────
-  version:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.ver.outputs.tag }}
-      version: ${{ steps.ver.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Determine version
-        id: ver
-        run: |
-          COUNT=$(git tag -l "v1.0.*" | wc -l | tr -d ' ')
-          N=$((COUNT + 1))
-          TAG="v1.0.$(printf '%04d' $N)"
-          echo "tag=$TAG"      >> "$GITHUB_OUTPUT"
-          echo "version=1.0.$(printf '%04d' $N)" >> "$GITHUB_OUTPUT"
-
-      - name: Push tag
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.ver.outputs.tag }}"
-          git push origin "${{ steps.ver.outputs.tag }}"
-
-  # ── 2. Cross-compile for all targets ─────────────────────────────────────
+  # ── Build for all targets (Linux + macOS) ────────────────────────────────
   build:
-    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
-          # musl targets: fully static, no glibc dependency — runs on any Linux
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: hss-linux-x86_64
@@ -75,18 +46,15 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Stamp the real release version into Cargo.toml before compiling so that
-      # env!("CARGO_PKG_VERSION") and `hss --version` reflect the actual tag.
-      # SemVer forbids leading zeros (1.0.0004 is invalid); strip them with awk
-      # so Cargo.toml gets "1.0.4" while git tags remain "v1.0.0004".
-      # hss --update compares via parse::<u64>() so "0004" == "4" — no breakage.
+      # Strip leading zeros for SemVer: v1.0.0007 → 1.0.7 in Cargo.toml.
+      # hss --update compares parse::<u64>() so "0007" == "7" — no breakage.
       - name: Stamp version into Cargo.toml
         run: |
-          RAW="${{ needs.version.outputs.version }}"
-          SEMVER=$(echo "$RAW" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
+          TAG="${GITHUB_REF_NAME}"
+          SEMVER=$(echo "${TAG#v}" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
           perl -pi -e "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
 
-      - name: Install musl tools (x86_64 static build)
+      - name: Install musl tools
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools
 
@@ -112,9 +80,9 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-  # ── 3. Publish GitHub release with changelog ─────────────────────────────
+  # ── Publish GitHub release with all platform binaries ────────────────────
   release:
-    needs: [version, build]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,8 +91,7 @@ jobs:
 
       - name: Generate changelog
         run: |
-          TAG="${{ needs.version.outputs.tag }}"
-          # second tag in descending order = previous release
+          TAG="${GITHUB_REF_NAME}"
           PREV=$(git tag --sort=-version:refname | grep "^v1\.0\." | sed -n '2p')
           if [ -z "$PREV" ]; then
             git log --pretty=format:"- %s" > CHANGELOG.md
@@ -136,8 +103,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.version.outputs.tag }}
-          name: ${{ needs.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           body_path: CHANGELOG.md
           files: |
             hss-linux-x86_64/hss-linux-x86_64
