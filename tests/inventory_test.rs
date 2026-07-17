@@ -83,6 +83,7 @@ fn test_import_updates_existing_host() {
         user: None,
         tags: vec!["custom-tag".into()],
         description: Some("My server".into()),
+        jump_host_id: None,
     };
     let mut hosts = vec![existing];
     let ini = "[webservers]\nweb1 ansible_host=10.0.0.1 ansible_user=deploy\n";
@@ -106,6 +107,7 @@ fn test_import_merges_tags() {
         user: None,
         tags: vec!["existing-tag".into()],
         description: None,
+        jump_host_id: None,
     };
     let mut hosts = vec![existing];
     let ini = "[web]\nweb1 ansible_host=10.0.0.1 # tags=new-tag,existing-tag\n";
@@ -119,8 +121,8 @@ fn test_import_merges_tags() {
 fn test_export_to_ini_basic() {
     use hss::types::Host;
     let hosts = vec![
-        Host { id: "1".into(), name: "web1".into(), ip: "10.0.0.1".into(), group: "webservers".into(), port: 22, user: Some("deploy".into()), tags: vec![], description: None },
-        Host { id: "2".into(), name: "db1".into(), ip: "10.0.0.2".into(), group: "databases".into(), port: 5432, user: None, tags: vec![], description: None },
+        Host { id: "1".into(), name: "web1".into(), ip: "10.0.0.1".into(), group: "webservers".into(), port: 22, user: Some("deploy".into()), tags: vec![], description: None, jump_host_id: None },
+        Host { id: "2".into(), name: "db1".into(), ip: "10.0.0.2".into(), group: "databases".into(), port: 5432, user: None, tags: vec![], description: None, jump_host_id: None },
     ];
     let ini = hss::inventory::export_to_ini(&hosts);
     assert!(ini.contains("[webservers]"));

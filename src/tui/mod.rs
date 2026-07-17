@@ -139,9 +139,10 @@ pub fn restore_terminal(terminal: &mut Term) -> Result<()> {
 pub fn do_connect(terminal: &mut Term, app: &mut App, host_name: &str, cred: &Credential) -> Result<()> {
     let host = app.hosts.iter().find(|h| h.name == host_name || h.ip == host_name).cloned();
     let (ip, port) = host.as_ref().map(|h| (h.ip.clone(), h.port)).unwrap_or_else(|| (host_name.to_string(), 22));
+    let jump = host.as_ref().and_then(|h| crate::ssh::jump_spec(&app.hosts, h));
 
     restore_terminal(terminal)?;
-    let status = crate::ssh::spawn_ssh(&ip, port, cred, &app.config)?;
+    let status = crate::ssh::spawn_ssh(&ip, port, cred, &app.config, jump.as_deref())?;
     *terminal = setup_terminal()?;
 
     if status.success() {

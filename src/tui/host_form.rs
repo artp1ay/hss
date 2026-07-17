@@ -25,9 +25,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Layout: 7 field rows + 1 hotkey row
-    let constraints: Vec<Constraint> = (0..8).map(|i| {
-        if i == 7 { Constraint::Length(1) } else { Constraint::Length(2) }
+    // Layout: 8 field rows + 1 hotkey row
+    let constraints: Vec<Constraint> = (0..9).map(|i| {
+        if i == 8 { Constraint::Length(1) } else { Constraint::Length(2) }
     }).collect();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -75,6 +75,32 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Paragraph::new(line), chunks[i]);
     }
 
+    // Jump host selector (field 7): cycled with ←/→ among existing hosts
+    {
+        let focused = form.focused == 7;
+        let label_style = if focused {
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let value = form.jump_host_id.as_deref()
+            .and_then(|id| app.hosts.iter().find(|h| h.id == id))
+            .map(|h| format!("{} ({})", h.name, h.ip))
+            .unwrap_or_else(|| "(none)".into());
+        let input_style = if focused {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let display = if focused { format!("◂ {value} ▸") } else { value };
+        let line = Line::from(vec![
+            Span::styled(format!("{:<18}", "Jump host"), label_style),
+            Span::styled(display, input_style),
+            Span::styled(" (←/→ to select)", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), chunks[7]);
+    }
+
     // Hotkeys
     let hotkeys = Line::from(vec![
         Span::styled("[Tab]", Style::default().fg(Color::Blue)),
@@ -84,7 +110,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::styled("[Esc]", Style::default().fg(Color::Blue)),
         Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
     ]);
-    f.render_widget(Paragraph::new(hotkeys), chunks[7]);
+    f.render_widget(Paragraph::new(hotkeys), chunks[8]);
 }
 
 pub fn draw_import(f: &mut Frame, app: &App) {
@@ -163,7 +189,7 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
         return Ok(());
     }
 
-    const FIELD_COUNT: usize = 7;
+    const FIELD_COUNT: usize = 8;
 
     match key.code {
         KeyCode::Esc => {
@@ -178,13 +204,22 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
             let form = app.host_form.as_mut().unwrap();
             form.focused = form.focused.checked_sub(1).unwrap_or(FIELD_COUNT - 1);
         }
+        KeyCode::Left | KeyCode::Right if app.host_form.as_ref().unwrap().focused == 7 => {
+            cycle_jump_host(app, key.code == KeyCode::Right);
+        }
         KeyCode::Backspace => {
             let form = app.host_form.as_mut().unwrap();
-            active_field(form).pop();
+            if form.focused == 7 {
+                form.jump_host_id = None;
+            } else {
+                active_field(form).pop();
+            }
         }
         KeyCode::Char(c) => {
             let form = app.host_form.as_mut().unwrap();
-            active_field(form).push(c);
+            if form.focused != 7 {
+                active_field(form).push(c);
+            }
         }
         KeyCode::Enter => {
             save_host(app)?;
@@ -192,6 +227,27 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
         _ => {}
     }
     Ok(())
+}
+
+/// Cycle jump host selection through "(none)" + all hosts except the one being edited.
+fn cycle_jump_host(app: &mut App, forward: bool) {
+    let form = app.host_form.as_ref().unwrap();
+    let candidates: Vec<String> = app.hosts.iter()
+        .filter(|h| Some(&h.id) != form.editing_id.as_ref())
+        .map(|h| h.id.clone())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    // Options: None, candidates[0], candidates[1], ...
+    let current = form.jump_host_id.as_ref()
+        .and_then(|id| candidates.iter().position(|c| c == id))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let total = candidates.len() + 1;
+    let next = if forward { (current + 1) % total } else { (current + total - 1) % total };
+    let form = app.host_form.as_mut().unwrap();
+    form.jump_host_id = if next == 0 { None } else { Some(candidates[next - 1].clone()) };
 }
 
 fn active_field(form: &mut HostForm) -> &mut String {
@@ -236,6 +292,7 @@ fn save_host(app: &mut App) -> Result<()> {
             h.user = if form.user.trim().is_empty() { None } else { Some(form.user.trim().to_string()) };
             h.tags = tags;
             h.description = if form.description.trim().is_empty() { None } else { Some(form.description.trim().to_string()) };
+            h.jump_host_id = form.jump_host_id.clone();
         }
         app.status_message = Some(format!("Host '{}' updated.", form.name.trim()));
     } else {
@@ -249,6 +306,7 @@ fn save_host(app: &mut App) -> Result<()> {
             user: if form.user.trim().is_empty() { None } else { Some(form.user.trim().to_string()) },
             tags,
             description: if form.description.trim().is_empty() { None } else { Some(form.description.trim().to_string()) },
+            jump_host_id: form.jump_host_id.clone(),
         });
         app.status_message = Some(format!("Host '{}' added.", form.name.trim()));
     }
