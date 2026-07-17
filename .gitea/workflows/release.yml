@@ -48,10 +48,8 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             artifact: hss-linux-x86_64
-            cross: false
           - target: aarch64-unknown-linux-musl
             artifact: hss-linux-aarch64
-            cross: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,23 +68,21 @@ jobs:
           SEMVER=$(echo "$RAW" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
           perl -pi -e "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
 
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y musl-tools
-
-      - name: Install cross
-        if: matrix.cross == true
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+      # cross needs Docker, which the Gitea runner container doesn't have.
+      # All deps are pure Rust, so a plain cross-linker is enough for static musl builds.
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            sudo apt-get install -y musl-tools
+          else
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
 
       - name: Build
-        run: |
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Stage artifact
         run: cp target/${{ matrix.target }}/release/hss ${{ matrix.artifact }}
