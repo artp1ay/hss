@@ -152,6 +152,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             ("D", "delete"),
             ("I", "import/export"),
             ("R", "switch cred"),
+            ("M", "mcp server"),
             ("C", "credentials"),
             ("S", "settings"),
             ("Q", "quit"),
@@ -305,6 +306,16 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                         dont_ask: false,
                     });
                 }
+            }
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') if !app.search_focused => {
+            match crate::mcp::McpServer::start() {
+                Ok(mcp) => {
+                    app.mcp = Some(mcp);
+                    app.screen = Screen::McpServer;
+                    app.status_message = None;
+                }
+                Err(e) => app.status_message = Some(format!("{e}")),
             }
         }
         KeyCode::Char('i') | KeyCode::Char('I') if !app.search_focused => {

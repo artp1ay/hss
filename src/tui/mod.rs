@@ -9,6 +9,7 @@ pub mod credentials_screen;
 pub mod delete_popup;
 pub mod host_form;
 pub mod main_screen;
+pub mod mcp_screen;
 pub mod popup;
 pub mod settings_screen;
 
@@ -22,6 +23,7 @@ pub enum Screen {
     CredentialPicker { host_idx: usize, after_failure: bool },
     HostForm,      // overlay for add/edit host
     ImportHosts,   // overlay for importing from INI file path
+    McpServer,     // modal: MCP server status + log while it runs
 }
 
 pub struct App {
@@ -46,6 +48,8 @@ pub struct App {
     pub host_form: Option<HostForm>,
     pub import_path_input: String,
     pub import_export_mode: bool, // false = import, true = export
+    // MCP server (Some while running; screen is modal)
+    pub mcp: Option<crate::mcp::McpServer>,
     // Delete confirmation popup
     pub delete_popup: Option<DeletePopup>,
     pub skip_delete_confirm: bool,
@@ -73,6 +77,7 @@ impl App {
             host_form: None,
             import_path_input: String::new(),
             import_export_mode: false,
+            mcp: None,
             delete_popup: None,
             skip_delete_confirm: false,
             should_quit: false,
@@ -165,6 +170,9 @@ pub fn run() -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut app = App::new(hosts, credentials, cfg, records);
     let result = run_loop(&mut terminal, &mut app);
+    if let Some(mcp) = app.mcp.take() {
+        mcp.stop();
+    }
     restore_terminal(&mut terminal)?;
     result
 }
@@ -205,6 +213,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             main_screen::draw(f, app);
             host_form::draw_import(f, app);
         }
+        Screen::McpServer => mcp_screen::draw(f, app),
     }
     // Delete confirmation popup renders on top of any screen
     if app.delete_popup.is_some() {
@@ -226,5 +235,6 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
         }
         Screen::HostForm => host_form::handle_key(terminal, app, key),
         Screen::ImportHosts => host_form::handle_import_key(terminal, app, key),
+        Screen::McpServer => mcp_screen::handle_key(terminal, app, key),
     }
 }

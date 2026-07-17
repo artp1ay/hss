@@ -84,6 +84,66 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig) -> R
     Ok(result?)
 }
 
+/// Run a single command on a host non-interactively, capturing output.
+/// Host is looked up by name or IP; credentials resolve the same way as interactive connect.
+pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Output> {
+    let cfg = config::load_config()?;
+    let creds = config::load_credentials()?;
+    let records = config::load_server_records()?;
+    let hosts = config::load_hosts()?;
+
+    let h = hosts.iter().find(|h| h.name == host_query || h.ip == host_query)
+        .ok_or_else(|| anyhow::anyhow!("Host not found: {host_query}"))?;
+    let last_id = records.iter()
+        .find(|r| r.host_id == h.name)
+        .and_then(|r| r.last_credential_id.clone());
+    let cred = resolve_credential(&creds, &cfg, last_id.as_deref())?
+        .ok_or_else(|| anyhow::anyhow!("No credential resolved for host '{}'", h.name))?;
+
+    let password = if cred.kind == CredentialKind::Password {
+        credentials::get_password(&cred.id).ok()
+    } else {
+        None
+    };
+
+    let mut ssh_args: Vec<String> = vec![
+        "-o".into(), format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        "-o".into(), format!("ConnectTimeout={}", cfg.connect_timeout),
+        "-p".into(), h.port.to_string(),
+        "-l".into(), cred.username.clone(),
+    ];
+    if let Some(ref key) = cred.key_path {
+        ssh_args.extend_from_slice(&["-i".into(), key.clone()]);
+    }
+    if password.is_none() {
+        // Key auth: never hang on an interactive prompt
+        ssh_args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
+    }
+    ssh_args.push(h.ip.clone());
+    ssh_args.push(command.to_string());
+
+    let mut cmd = Command::new("ssh");
+    cmd.args(&ssh_args).stdin(std::process::Stdio::null());
+
+    let askpass_path = if let Some(ref pw) = password {
+        let path = write_askpass_helper()?;
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+        cmd.env("SSH_ASKPASS", &path)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", display)
+            .env("HSS_PASSWORD", pw);
+        Some(path)
+    } else {
+        None
+    };
+
+    let out = cmd.output();
+    if let Some(ref path) = askpass_path {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(out?)
+}
+
 fn write_askpass_helper() -> Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join(format!("hss-askpass-{}", std::process::id()));
     std::fs::write(&path, "#!/bin/sh\necho \"$HSS_PASSWORD\"\n")?;
