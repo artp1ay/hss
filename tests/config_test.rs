@@ -21,6 +21,7 @@ fn test_hosts_roundtrip() {
         user: Some("deploy".into()),
         tags: vec!["production".into(), "nginx".into()],
         description: Some("Primary web server".into()),
+        jump_host_id: None,
     }];
     let s = hss::config::serialize_hosts(&hosts).unwrap();
     let parsed = hss::config::parse_hosts(&s).unwrap();

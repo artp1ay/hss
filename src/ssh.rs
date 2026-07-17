@@ -4,7 +4,25 @@ use libc;
 use std::process::Command;
 use crate::config::{self, AppConfig};
 use crate::credentials;
-use crate::types::{Credential, CredentialKind};
+use crate::types::{Credential, CredentialKind, Host};
+
+/// Build the ssh -J destination ("user@ip:port") for a host's jump host, if any.
+/// Dangling ids and self-references resolve to None.
+pub fn jump_spec(hosts: &[Host], host: &Host) -> Option<String> {
+    let id = host.jump_host_id.as_deref()?;
+    if id == host.id { return None; }
+    let jump = hosts.iter().find(|h| h.id == id)?;
+    let mut spec = String::new();
+    if let Some(ref user) = jump.user {
+        spec.push_str(user);
+        spec.push('@');
+    }
+    spec.push_str(&jump.ip);
+    if jump.port != 22 {
+        spec.push_str(&format!(":{}", jump.port));
+    }
+    Some(spec)
+}
 
 pub fn resolve_credential<'a>(
     creds: &'a [Credential],
@@ -27,7 +45,7 @@ pub fn resolve_credential<'a>(
     Ok(None)
 }
 
-pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig) -> Result<std::process::ExitStatus> {
+pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig, jump: Option<&str>) -> Result<std::process::ExitStatus> {
     // If keychain entry is missing (e.g. session keyring cleared on logout),
     // fall back to SSH's own interactive password prompt rather than crashing.
     let password = if cred.kind == CredentialKind::Password {
@@ -44,6 +62,9 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig) -> R
     ];
     if let Some(ref key) = cred.key_path {
         ssh_args.extend_from_slice(&["-i".into(), key.clone()]);
+    }
+    if let Some(j) = jump {
+        ssh_args.extend_from_slice(&["-J".into(), j.to_string()]);
     }
     if !cfg.ssh_extra_args.is_empty() {
         for arg in cfg.ssh_extra_args.split_whitespace() {
@@ -97,19 +118,19 @@ pub fn connect_direct(host: &str) -> Result<()> {
     let records = config::load_server_records()?;
     let hosts = config::load_hosts()?;
 
-    let (ssh_host, port, last_cred_id) = if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
+    let (ssh_host, port, last_cred_id, jump) = if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
         let last_id = records.iter()
             .find(|r| r.host_id == h.name)
             .and_then(|r| r.last_credential_id.clone());
-        (h.ip.clone(), h.port, last_id)
+        (h.ip.clone(), h.port, last_id, jump_spec(&hosts, h))
     } else {
-        (host.to_string(), 22, None)
+        (host.to_string(), 22, None, None)
     };
 
     let cred = resolve_credential(&creds, &cfg, last_cred_id.as_deref())?
         .ok_or_else(|| anyhow::anyhow!("No credentials configured. Run `hss` to set up credentials."))?;
 
-    spawn_ssh(&ssh_host, port, cred, &cfg)?;
+    spawn_ssh(&ssh_host, port, cred, &cfg, jump.as_deref())?;
     Ok(())
 }
 
@@ -120,6 +141,33 @@ mod tests {
 
     fn key_cred(id: &str) -> Credential {
         Credential { id: id.into(), name: "t".into(), username: "u".into(), kind: CredentialKind::Key, key_path: None }
+    }
+
+    fn host(id: &str, jump: Option<&str>, user: Option<&str>, port: u16) -> Host {
+        Host {
+            id: id.into(), name: id.into(), ip: format!("ip-{id}"), group: String::new(),
+            port, user: user.map(Into::into), tags: vec![], description: None,
+            jump_host_id: jump.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn jump_spec_full() {
+        let hosts = vec![host("bastion", None, Some("admin"), 2222), host("target", Some("bastion"), None, 22)];
+        assert_eq!(jump_spec(&hosts, &hosts[1]).unwrap(), "admin@ip-bastion:2222");
+    }
+
+    #[test]
+    fn jump_spec_no_user_default_port() {
+        let hosts = vec![host("bastion", None, None, 22), host("target", Some("bastion"), None, 22)];
+        assert_eq!(jump_spec(&hosts, &hosts[1]).unwrap(), "ip-bastion");
+    }
+
+    #[test]
+    fn jump_spec_none_dangling_and_self() {
+        let hosts = vec![host("a", Some("missing"), None, 22), host("b", Some("b"), None, 22)];
+        assert!(jump_spec(&hosts, &hosts[0]).is_none());
+        assert!(jump_spec(&hosts, &hosts[1]).is_none());
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub struct Host {
     #[serde(default)]
     pub tags: Vec<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub jump_host_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,5 +71,6 @@ pub struct HostForm {
     pub user: String,
     pub tags: String,        // comma-separated
     pub description: String,
-    pub focused: usize,      // 0=name 1=ip 2=group 3=port 4=user 5=tags 6=description
+    pub jump_host_id: Option<String>, // selected from existing hosts, cycled with ←/→
+    pub focused: usize,      // 0=name 1=ip 2=group 3=port 4=user 5=tags 6=description 7=jump host
 }

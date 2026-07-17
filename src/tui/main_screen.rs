@@ -284,6 +284,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     user: h.user.clone().unwrap_or_default(),
                     tags: h.tags.join(", "),
                     description: h.description.clone().unwrap_or_default(),
+                    jump_host_id: h.jump_host_id.clone(),
                     focused: 0,
                 });
                 app.screen = Screen::HostForm;
