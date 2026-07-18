@@ -74,7 +74,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
 
     // Server table
-    let header = Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "TAGS"]).style(
+    let header = Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "TAGS", "DESCRIPTION"]).style(
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -101,6 +101,8 @@ pub fn draw(f: &mut Frame, app: &App) {
                     }
                 })
                 .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(h.description.clone().unwrap_or_default())
+                    .style(Style::default().fg(Color::DarkGray)),
             ])
         })
         .collect();
@@ -119,7 +121,8 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(16),
             Constraint::Length(18),
             Constraint::Length(6),
-            Constraint::Min(8),
+            Constraint::Length(14),
+            Constraint::Min(10),
         ],
     )
     .header(header)
