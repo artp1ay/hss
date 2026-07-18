@@ -47,6 +47,16 @@ pub struct CredentialForm {
     pub focused: usize, // 0=type toggle, 1=name, 2=username, 3=secret
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CopyIdForm {
+    pub host_idx: usize,
+    pub keys: Vec<(String, bool)>, // (path, selected)
+    pub key_cursor: usize,
+    pub user: String,
+    pub password: String,
+    pub focused: usize, // 0=key list 1=user 2=password
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeleteKind {
     Host,

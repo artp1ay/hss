@@ -152,6 +152,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             ("D", "delete"),
             ("I", "import/export"),
             ("R", "switch cred"),
+            ("P", "ssh-copy-id"),
             ("M", "mcp server"),
             ("C", "credentials"),
             ("S", "settings"),
@@ -307,6 +308,27 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                         dont_ask: false,
                     });
                 }
+            }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') if !app.search_focused && hosts_len > 0 => {
+            if let Some(idx) = get_host_idx_in_all(app) {
+                let host = &app.hosts[idx];
+                let mut keys: Vec<(String, bool)> = crate::ssh::find_public_keys(&app.credentials)
+                    .into_iter().map(|p| (p, false)).collect();
+                if keys.len() == 1 {
+                    keys[0].1 = true;
+                }
+                let user = host.user.clone()
+                    .or_else(|| app.config.default_user.clone())
+                    .or_else(|| std::env::var("USER").ok())
+                    .unwrap_or_default();
+                app.copy_id_form = Some(crate::types::CopyIdForm {
+                    host_idx: idx,
+                    keys,
+                    user,
+                    ..Default::default()
+                });
+                app.screen = Screen::CopyId;
             }
         }
         KeyCode::Char('m') | KeyCode::Char('M') if !app.search_focused => {

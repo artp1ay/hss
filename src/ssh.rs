@@ -165,6 +165,86 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
     Ok(out?)
 }
 
+/// Discover public keys to offer for ssh-copy-id: ~/.ssh/*.pub plus
+/// .pub siblings of key paths referenced by credentials.
+pub fn find_public_keys(creds: &[Credential]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rd) = std::fs::read_dir(home.join(".ssh")) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "pub") {
+                    keys.push(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    for c in creds {
+        if let Some(ref kp) = c.key_path {
+            let kp = expand_tilde(kp);
+            let pubp = format!("{kp}.pub");
+            if std::path::Path::new(&pubp).exists() && !keys.contains(&pubp) {
+                keys.push(pubp);
+            }
+        }
+    }
+    keys.sort();
+    keys
+}
+
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[1..]);
+        }
+    }
+    path.to_string()
+}
+
+/// Run ssh-copy-id for one public key, non-interactively.
+/// With a password it goes through the askpass helper; without one,
+/// BatchMode relies on agent/default keys so nothing can hang on a prompt.
+pub fn copy_id(
+    ip: &str,
+    port: u16,
+    user: &str,
+    pub_key_path: &str,
+    password: Option<&str>,
+    cfg: &AppConfig,
+) -> Result<std::process::Output> {
+    let mut args: Vec<String> = vec![
+        "-i".into(), pub_key_path.into(),
+        "-p".into(), port.to_string(),
+        "-o".into(), format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        "-o".into(), format!("ConnectTimeout={}", cfg.connect_timeout),
+    ];
+    if password.is_none() {
+        args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
+    }
+    args.push(format!("{user}@{ip}"));
+
+    let mut cmd = Command::new("ssh-copy-id");
+    cmd.args(&args).stdin(std::process::Stdio::null());
+
+    let askpass_path = if let Some(pw) = password {
+        let path = write_askpass_helper()?;
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+        cmd.env("SSH_ASKPASS", &path)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", display)
+            .env("HSS_PASSWORD", pw);
+        Some(path)
+    } else {
+        None
+    };
+
+    let out = cmd.output();
+    if let Some(ref path) = askpass_path {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(out?)
+}
+
 fn write_askpass_helper() -> Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join(format!("hss-askpass-{}", std::process::id()));
     std::fs::write(&path, "#!/bin/sh\necho \"$HSS_PASSWORD\"\n")?;
@@ -209,6 +289,33 @@ mod tests {
             port, user: user.map(Into::into), tags: vec![], description: None,
             jump_host_id: jump.map(Into::into),
         }
+    }
+
+    #[test]
+    fn find_public_keys_scans_ssh_dir_and_cred_siblings() {
+        let tmp = std::env::temp_dir().join(format!("hss-test-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".ssh")).unwrap();
+        std::fs::write(tmp.join(".ssh/id_ed25519.pub"), "k").unwrap();
+        std::fs::write(tmp.join(".ssh/id_ed25519"), "k").unwrap();
+        std::fs::write(tmp.join("work_key"), "k").unwrap();
+        std::fs::write(tmp.join("work_key.pub"), "k").unwrap();
+
+        let old_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", &tmp); }
+
+        let cred = Credential {
+            id: "c".into(), name: "c".into(), username: "u".into(),
+            kind: CredentialKind::Key,
+            key_path: Some(tmp.join("work_key").to_string_lossy().into_owned()),
+        };
+        let keys = find_public_keys(&[cred]);
+
+        if let Some(h) = old_home { unsafe { std::env::set_var("HOME", h); } }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|k| k.ends_with(".ssh/id_ed25519.pub")));
+        assert!(keys.iter().any(|k| k.ends_with("work_key.pub")));
     }
 
     #[test]

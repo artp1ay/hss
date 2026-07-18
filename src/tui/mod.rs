@@ -5,6 +5,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::config::AppConfig;
 use crate::types::{Credential, CredentialForm, DeletePopup, Host, HostForm, ServerRecord};
 
+pub mod copy_id;
 pub mod credentials_screen;
 pub mod delete_popup;
 pub mod host_form;
@@ -24,6 +25,7 @@ pub enum Screen {
     HostForm,      // overlay for add/edit host
     ImportHosts,   // overlay for importing from INI file path
     McpServer,     // modal: MCP server status + log while it runs
+    CopyId,        // overlay for ssh-copy-id (key multi-select + password)
 }
 
 pub struct App {
@@ -50,6 +52,8 @@ pub struct App {
     pub import_export_mode: bool, // false = import, true = export
     // MCP server (Some while running; screen is modal)
     pub mcp: Option<crate::mcp::McpServer>,
+    // ssh-copy-id overlay state
+    pub copy_id_form: Option<crate::types::CopyIdForm>,
     // Delete confirmation popup
     pub delete_popup: Option<DeletePopup>,
     pub skip_delete_confirm: bool,
@@ -78,6 +82,7 @@ impl App {
             import_path_input: String::new(),
             import_export_mode: false,
             mcp: None,
+            copy_id_form: None,
             delete_popup: None,
             skip_delete_confirm: false,
             should_quit: false,
@@ -215,6 +220,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             host_form::draw_import(f, app);
         }
         Screen::McpServer => mcp_screen::draw(f, app),
+        Screen::CopyId => {
+            main_screen::draw(f, app);
+            copy_id::draw(f, app);
+        }
     }
     // Delete confirmation popup renders on top of any screen
     if app.delete_popup.is_some() {
@@ -237,5 +246,6 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
         Screen::HostForm => host_form::handle_key(terminal, app, key),
         Screen::ImportHosts => host_form::handle_import_key(terminal, app, key),
         Screen::McpServer => mcp_screen::handle_key(terminal, app, key),
+        Screen::CopyId => copy_id::handle_key(terminal, app, key),
     }
 }
