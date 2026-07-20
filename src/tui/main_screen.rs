@@ -80,6 +80,14 @@ pub fn draw(f: &mut Frame, app: &App) {
             .add_modifier(Modifier::BOLD),
     );
 
+    // Tags column sized to content (capped) so tags aren't cut while space remains
+    let tags_width = hosts
+        .iter()
+        .map(|h| h.tags.join(", ").chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(4, 28);
+
     let rows: Vec<Row> = hosts
         .iter()
         .map(|h| {
@@ -88,19 +96,8 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Cell::from(h.group.clone()).style(Style::default().fg(group_color(&h.group))),
                 Cell::from(h.ip.clone()).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(h.port.to_string()).style(Style::default().fg(Color::DarkGray)),
-                Cell::from({
-                    if h.tags.is_empty() {
-                        "".to_string()
-                    } else {
-                        h.tags
-                            .iter()
-                            .take(2)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    }
-                })
-                .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(fit_tags(&h.tags, tags_width))
+                    .style(Style::default().fg(Color::Cyan)),
                 Cell::from(h.description.clone().unwrap_or_default())
                     .style(Style::default().fg(Color::DarkGray)),
             ])
@@ -121,7 +118,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(16),
             Constraint::Length(18),
             Constraint::Length(6),
-            Constraint::Length(14),
+            Constraint::Length(tags_width as u16),
             Constraint::Min(10),
         ],
     )
@@ -183,15 +180,53 @@ fn hotkey_line<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
     Line::from(spans)
 }
 
+/// Join tags into `width` chars; when they don't fit, show whole tags
+/// that do fit plus a " +N" marker so hidden tags are visible.
+fn fit_tags(tags: &[String], width: usize) -> String {
+    let full = tags.join(", ");
+    if full.chars().count() <= width {
+        return full;
+    }
+    let mut out = String::new();
+    let mut shown = 0;
+    for t in tags {
+        let cand = if out.is_empty() { t.clone() } else { format!("{out}, {t}") };
+        let suffix_len = format!(" +{}", tags.len() - shown - 1).chars().count();
+        if cand.chars().count() + suffix_len <= width {
+            out = cand;
+            shown += 1;
+        } else {
+            break;
+        }
+    }
+    if shown == 0 {
+        return format!("+{}", tags.len());
+    }
+    format!("{out} +{}", tags.len() - shown)
+}
+
 fn group_color(group: &str) -> Color {
-    let hash: usize = group.bytes().map(|b| b as usize).sum::<usize>() % 5;
-    [
+    // FNV-1a: a byte sum collides on anagrams and similar-length names
+    let mut h: u32 = 2166136261;
+    for b in group.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    const PALETTE: [Color; 12] = [
         Color::Green,
         Color::Cyan,
         Color::Yellow,
         Color::Magenta,
         Color::LightBlue,
-    ][hash]
+        Color::LightGreen,
+        Color::LightCyan,
+        Color::LightMagenta,
+        Color::Indexed(208), // orange
+        Color::Indexed(141), // violet
+        Color::Indexed(219), // pink
+        Color::Indexed(115), // teal
+    ];
+    PALETTE[(h % PALETTE.len() as u32) as usize]
 }
 
 pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
@@ -352,6 +387,20 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_tags;
+
+    #[test]
+    fn fit_tags_fits_truncates_and_marks_hidden() {
+        let tags: Vec<String> = ["web", "prod", "db"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(fit_tags(&tags, 28), "web, prod, db");
+        assert_eq!(fit_tags(&tags, 10), "web +2");
+        assert_eq!(fit_tags(&tags, 2), "+3");
+        assert_eq!(fit_tags(&[], 10), "");
+    }
 }
 
 fn get_host_idx_in_all(app: &App) -> Option<usize> {
