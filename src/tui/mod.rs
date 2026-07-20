@@ -49,7 +49,7 @@ pub struct App {
     // Host form / import state
     pub host_form: Option<HostForm>,
     pub import_path_input: String,
-    pub import_export_mode: bool, // false = import, true = export
+    pub import_export_mode: usize, // 0 = import INI, 1 = export INI, 2 = export ssh_config
     // MCP server (Some while running; screen is modal)
     pub mcp: Option<crate::mcp::McpServer>,
     // ssh-copy-id overlay state
@@ -80,7 +80,7 @@ impl App {
             popup_selected: 0,
             host_form: None,
             import_path_input: String::new(),
-            import_export_mode: false,
+            import_export_mode: 0,
             mcp: None,
             copy_id_form: None,
             delete_popup: None,

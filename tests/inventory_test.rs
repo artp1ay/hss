@@ -118,6 +118,23 @@ fn test_import_merges_tags() {
 }
 
 #[test]
+fn test_export_to_ssh_config() {
+    use hss::types::Host;
+    let hosts = vec![
+        Host { id: "b".into(), name: "bastion".into(), ip: "1.2.3.4".into(), group: "infra".into(), port: 2222, user: Some("ops".into()), tags: vec![], description: None, jump_host_id: None },
+        Host { id: "w".into(), name: "web1".into(), ip: "10.0.0.1".into(), group: "webservers".into(), port: 22, user: Some("deploy".into()), tags: vec!["web".into(), "prod".into()], description: Some("Main server".into()), jump_host_id: Some("b".into()) },
+    ];
+    let cfg = hss::inventory::export_to_ssh_config(&hosts);
+    assert!(cfg.contains("# group: webservers"));
+    assert!(cfg.contains("# tags: web, prod"));
+    assert!(cfg.contains("# Main server"));
+    assert!(cfg.contains("Host web1\n    HostName 10.0.0.1\n    User deploy\n    ProxyJump ops@1.2.3.4:2222"));
+    assert!(cfg.contains("Host bastion\n    HostName 1.2.3.4\n    Port 2222\n    User ops"));
+    // default port omitted for web1
+    assert!(!cfg.contains("Host web1\n    HostName 10.0.0.1\n    Port"));
+}
+
+#[test]
 fn test_export_to_ini_basic() {
     use hss::types::Host;
     let hosts = vec![

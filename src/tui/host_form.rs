@@ -117,8 +117,12 @@ pub fn draw_import(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 50, f.area());
     f.render_widget(Clear, area);
 
-    let is_export = app.import_export_mode;
-    let title = if is_export { " Export Ansible INI " } else { " Import Ansible INI " };
+    let mode = app.import_export_mode;
+    let title = match mode {
+        0 => " Import Ansible INI ",
+        1 => " Export Ansible INI ",
+        _ => " Export SSH config ",
+    };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -141,22 +145,24 @@ pub fn draw_import(f: &mut Frame, app: &App) {
         .split(inner);
 
     // Mode toggle
-    let (imp_style, exp_style) = if is_export {
-        (Style::default().fg(Color::DarkGray), Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD))
+    let style_for = |m: usize| if m == mode {
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
     } else {
-        (Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD), Style::default().fg(Color::DarkGray))
+        Style::default().fg(Color::DarkGray)
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("[Import]", imp_style),
+            Span::styled("[Import INI]", style_for(0)),
             Span::raw("  "),
-            Span::styled("[Export]", exp_style),
+            Span::styled("[Export INI]", style_for(1)),
+            Span::raw("  "),
+            Span::styled("[Export SSH config]", style_for(2)),
             Span::styled("   Tab to switch", Style::default().fg(Color::DarkGray)),
         ])),
         chunks[0],
     );
 
-    let label = if is_export { "Save to path:" } else { "Path to inventory file:" };
+    let label = if mode == 0 { "Path to inventory file:" } else { "Save to path:" };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(label, Style::default().fg(Color::DarkGray)))),
         chunks[2],
@@ -170,7 +176,7 @@ pub fn draw_import(f: &mut Frame, app: &App) {
         chunks[4],
     );
 
-    let action = if is_export { "export" } else { "import" };
+    let action = if mode == 0 { "import" } else { "export" };
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("[Enter]", Style::default().fg(Color::Blue)),
@@ -323,7 +329,7 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
             app.screen = Screen::Main;
         }
         KeyCode::Tab => {
-            app.import_export_mode = !app.import_export_mode;
+            app.import_export_mode = (app.import_export_mode + 1) % 3;
         }
         KeyCode::Backspace => {
             app.import_path_input.pop();
@@ -338,8 +344,12 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
                 return Ok(());
             }
             let path = expand_tilde(&raw);
-            if app.import_export_mode {
-                let content = crate::inventory::export_to_ini(&app.hosts);
+            if app.import_export_mode > 0 {
+                let content = if app.import_export_mode == 1 {
+                    crate::inventory::export_to_ini(&app.hosts)
+                } else {
+                    crate::inventory::export_to_ssh_config(&app.hosts)
+                };
                 match std::fs::write(&path, &content) {
                     Ok(()) => {
                         app.status_message = Some(format!("Exported {} hosts to {path}.", app.hosts.len()));
