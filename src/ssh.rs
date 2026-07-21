@@ -136,6 +136,9 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
     if let Some(ref key) = cred.key_path {
         ssh_args.extend_from_slice(&["-i".into(), key.clone()]);
     }
+    if let Some(j) = jump_spec(&hosts, h) {
+        ssh_args.extend_from_slice(&["-J".into(), j]);
+    }
     if password.is_none() {
         // Key auth: never hang on an interactive prompt
         ssh_args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
