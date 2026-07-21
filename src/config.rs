@@ -165,3 +165,16 @@ pub fn save_server_records(records: &[ServerRecord]) -> Result<()> {
     std::fs::rename(tmp, dir.join("servers.toml"))?;
     Ok(())
 }
+
+/// Records used to be keyed by host *name*, which broke (silently lost the
+/// saved default credential) whenever a host was renamed. Rewrite any
+/// name-keyed entry to the host's stable id; already-migrated (id-keyed)
+/// entries never match a host name, so this is idempotent.
+pub fn migrate_server_records(records: Vec<ServerRecord>, hosts: &[Host]) -> Vec<ServerRecord> {
+    records.into_iter().map(|mut r| {
+        if let Some(h) = hosts.iter().find(|h| h.name == r.host_id) {
+            r.host_id = h.id.clone();
+        }
+        r
+    }).collect()
+}

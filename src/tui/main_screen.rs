@@ -419,7 +419,7 @@ fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
     }
     let host = filtered[app.selected_row.min(filtered.len() - 1)].clone();
 
-    let last_cred_id = app.last_credential_id(&host.name).map(|s| s.to_string());
+    let last_cred_id = app.last_credential_id(&host.id).map(|s| s.to_string());
     let cred =
         crate::ssh::resolve_credential(&app.credentials, &app.config, last_cred_id.as_deref())?
             .cloned();

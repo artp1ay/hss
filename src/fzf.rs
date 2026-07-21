@@ -8,12 +8,12 @@ use crate::types::CredentialKind;
 pub fn run() -> Result<()> {
     let cfg = config::load_config()?;
     let creds = config::load_credentials()?;
-    let records = config::load_server_records()?;
 
     let hosts = config::load_hosts()?;
     if hosts.is_empty() {
         bail!("No hosts configured. Run `hss` to add hosts.");
     }
+    let records = config::migrate_server_records(config::load_server_records()?, &hosts);
 
     // Build display lines: "name  group  host:port"
     let lines: Vec<String> = hosts.iter()
@@ -29,7 +29,7 @@ pub fn run() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Host not found: {host_name}"))?;
 
     let last_cred_id = records.iter()
-        .find(|r| r.host_id == host.name)
+        .find(|r| r.host_id == host.id)
         .and_then(|r| r.last_credential_id.clone());
 
     let cred = ssh::resolve_credential(&creds, &cfg, last_cred_id.as_deref())?;
@@ -60,12 +60,12 @@ pub fn run() -> Result<()> {
     let status = ssh::spawn_ssh(&host.ip, host.port, &cred, &cfg, jump.as_deref())?;
     if status.success() {
         // Save last credential
-        let mut records = config::load_server_records()?;
-        if let Some(r) = records.iter_mut().find(|r| r.host_id == host.name) {
+        let mut records = config::migrate_server_records(config::load_server_records()?, &hosts);
+        if let Some(r) = records.iter_mut().find(|r| r.host_id == host.id) {
             r.last_credential_id = Some(cred.id.clone());
         } else {
             records.push(crate::types::ServerRecord {
-                host_id: host.name.clone(),
+                host_id: host.id.clone(),
                 last_credential_id: Some(cred.id.clone()),
             });
         }

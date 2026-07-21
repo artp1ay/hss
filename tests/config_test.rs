@@ -63,3 +63,21 @@ fn test_server_records_roundtrip() {
     assert_eq!(parsed[0].last_credential_id, Some("cred-1".into()));
     assert_eq!(parsed[1].last_credential_id, None);
 }
+
+#[test]
+fn test_migrate_server_records_rewrites_name_keyed_entries() {
+    use hss::types::{Host, ServerRecord};
+    let hosts = vec![Host {
+        id: "uuid-1".into(), name: "web1".into(), ip: "10.0.0.1".into(), group: "g".into(),
+        port: 22, user: None, tags: vec![], description: None, jump_host_id: None,
+    }];
+    let records = vec![
+        // Old-style entry: host_id happens to equal the host's name
+        ServerRecord { host_id: "web1".into(), last_credential_id: Some("cred-a".into()) },
+        // Already-migrated entry: stays untouched
+        ServerRecord { host_id: "uuid-2".into(), last_credential_id: Some("cred-b".into()) },
+    ];
+    let migrated = hss::config::migrate_server_records(records, &hosts);
+    assert_eq!(migrated[0].host_id, "uuid-1");
+    assert_eq!(migrated[1].host_id, "uuid-2");
+}

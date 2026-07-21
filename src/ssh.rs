@@ -115,8 +115,9 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
 
     let h = hosts.iter().find(|h| h.name == host_query || h.ip == host_query)
         .ok_or_else(|| anyhow::anyhow!("Host not found: {host_query}"))?;
+    let records = config::migrate_server_records(records, &hosts);
     let last_id = records.iter()
-        .find(|r| r.host_id == h.name)
+        .find(|r| r.host_id == h.id)
         .and_then(|r| r.last_credential_id.clone());
     let cred = resolve_credential(&creds, &cfg, last_id.as_deref())?
         .ok_or_else(|| anyhow::anyhow!("No credential resolved for host '{}'", h.name))?;
@@ -261,9 +262,10 @@ pub fn connect_direct(host: &str) -> Result<()> {
     let records = config::load_server_records()?;
     let hosts = config::load_hosts()?;
 
+    let records = config::migrate_server_records(records, &hosts);
     let (ssh_host, port, last_cred_id, jump) = if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
         let last_id = records.iter()
-            .find(|r| r.host_id == h.name)
+            .find(|r| r.host_id == h.id)
             .and_then(|r| r.last_credential_id.clone());
         (h.ip.clone(), h.port, last_id, jump_spec(&hosts, h))
     } else {

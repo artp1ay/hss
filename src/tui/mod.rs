@@ -104,18 +104,18 @@ impl App {
         }).collect()
     }
 
-    pub fn last_credential_id(&self, host_name: &str) -> Option<&str> {
+    pub fn last_credential_id(&self, host_id: &str) -> Option<&str> {
         self.server_records.iter()
-            .find(|r| r.host_id == host_name)  // temporarily using name as host_id
+            .find(|r| r.host_id == host_id)
             .and_then(|r| r.last_credential_id.as_deref())
     }
 
-    pub fn save_last_credential(&mut self, host_name: &str, cred_id: &str) -> Result<()> {
-        if let Some(r) = self.server_records.iter_mut().find(|r| r.host_id == host_name) {
+    pub fn save_last_credential(&mut self, host_id: &str, cred_id: &str) -> Result<()> {
+        if let Some(r) = self.server_records.iter_mut().find(|r| r.host_id == host_id) {
             r.last_credential_id = Some(cred_id.to_string());
         } else {
             self.server_records.push(ServerRecord {
-                host_id: host_name.to_string(),
+                host_id: host_id.to_string(),
                 last_credential_id: Some(cred_id.to_string()),
             });
         }
@@ -150,13 +150,16 @@ pub fn do_connect(terminal: &mut Term, app: &mut App, host_name: &str, cred: &Cr
     let host = app.hosts.iter().find(|h| h.name == host_name || h.ip == host_name).cloned();
     let (ip, port) = host.as_ref().map(|h| (h.ip.clone(), h.port)).unwrap_or_else(|| (host_name.to_string(), 22));
     let jump = host.as_ref().and_then(|h| crate::ssh::jump_spec(&app.hosts, h));
+    let host_id = host.as_ref().map(|h| h.id.clone());
 
     restore_terminal(terminal)?;
     let status = crate::ssh::spawn_ssh(&ip, port, cred, &app.config, jump.as_deref())?;
     *terminal = setup_terminal()?;
 
     if status.success() {
-        app.save_last_credential(host_name, &cred.id)?;
+        if let Some(ref id) = host_id {
+            app.save_last_credential(id, &cred.id)?;
+        }
         app.status_message = None;
     } else if status.code() == Some(255) {
         // Likely auth failure — show picker
@@ -172,7 +175,7 @@ pub fn run() -> Result<()> {
     let cfg = crate::config::load_config()?;
     let hosts = crate::config::load_hosts()?;
     let credentials = crate::config::load_credentials()?;
-    let records = crate::config::load_server_records()?;
+    let records = crate::config::migrate_server_records(crate::config::load_server_records()?, &hosts);
     let mut terminal = setup_terminal()?;
     let mut app = App::new(hosts, credentials, cfg, records);
     let result = run_loop(&mut terminal, &mut app);
