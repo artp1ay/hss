@@ -9,10 +9,52 @@ use serde_json::{json, Value};
 // ponytail: fixed localhost port; add a config field when someone actually needs to change it
 pub const MCP_PORT: u16 = 8822;
 
+/// Severity of a log entry; drives colour in the MCP screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Level {
+    Info,
+    Req,
+    Ok,
+    Err,
+}
+
+impl Level {
+    pub fn label(self) -> &'static str {
+        match self {
+            Level::Info => "INFO",
+            Level::Req => "CALL",
+            Level::Ok => " OK ",
+            Level::Err => "FAIL",
+        }
+    }
+}
+
+/// One structured line: when it happened, how bad it is, which subsystem,
+/// a one-line summary and optional indented detail lines.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub at: f64, // seconds since server start
+    pub level: Level,
+    pub tag: String,
+    pub msg: String,
+    pub detail: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct LogState {
+    pub entries: Vec<LogEntry>,
+    pub requests: u64,
+    pub tool_calls: u64,
+    pub errors: u64,
+    pub client: Option<String>,
+}
+
+pub type Log = Arc<Mutex<LogState>>;
+
 pub struct McpServer {
     server: Arc<tiny_http::Server>,
     thread: Option<std::thread::JoinHandle<()>>,
-    pub log: Arc<Mutex<Vec<String>>>,
+    pub log: Log,
     pub started: Instant,
 }
 
@@ -21,9 +63,12 @@ impl McpServer {
         let server = tiny_http::Server::http(("127.0.0.1", MCP_PORT))
             .map_err(|e| anyhow::anyhow!("MCP server failed to bind 127.0.0.1:{MCP_PORT}: {e}"))?;
         let server = Arc::new(server);
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let log: Log = Arc::new(Mutex::new(LogState::default()));
         let started = Instant::now();
-        push_log(&log, started, format!("Listening on http://127.0.0.1:{MCP_PORT}"));
+        log_line(&log, started, Level::Info, "server", format!("listening on http://127.0.0.1:{MCP_PORT}"), vec![
+            "transport: streamable HTTP (JSON-RPC over POST)".into(),
+            "tools: list-servers, execute-command".into(),
+        ]);
 
         let (srv, lg) = (server.clone(), log.clone());
         let thread = std::thread::spawn(move || serve_loop(srv, lg, started));
@@ -42,17 +87,36 @@ impl McpServer {
     }
 }
 
-fn push_log(log: &Arc<Mutex<Vec<String>>>, started: Instant, msg: String) {
+fn log_line(log: &Log, started: Instant, level: Level, tag: &str, msg: String, detail: Vec<String>) {
     let mut l = log.lock().unwrap();
-    l.push(format!("[{:>4}s] {msg}", started.elapsed().as_secs()));
-    // ponytail: cap memory; no scrollback beyond 500 lines
-    if l.len() > 500 {
-        let drop = l.len() - 500;
-        l.drain(..drop);
+    if level == Level::Err {
+        l.errors += 1;
+    }
+    l.entries.push(LogEntry {
+        at: started.elapsed().as_secs_f64(),
+        level,
+        tag: tag.to_string(),
+        msg,
+        detail,
+    });
+    // ponytail: cap memory; no scrollback beyond 500 entries
+    if l.entries.len() > 500 {
+        let drop = l.entries.len() - 500;
+        l.entries.drain(..drop);
     }
 }
 
-fn serve_loop(server: Arc<tiny_http::Server>, log: Arc<Mutex<Vec<String>>>, started: Instant) {
+/// Shorten a value for single-line display.
+fn clip(s: &str, max: usize) -> String {
+    let one_line = s.replace('\n', "⏎");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let head: String = one_line.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+fn serve_loop(server: Arc<tiny_http::Server>, log: Log, started: Instant) {
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
         let (status, body) = match method {
@@ -62,8 +126,16 @@ fn serve_loop(server: Arc<tiny_http::Server>, log: Arc<Mutex<Vec<String>>>, star
                 handle_rpc(&buf, &log, started)
             }
             // Session termination per streamable-http spec — nothing to clean up
-            tiny_http::Method::Delete => (200, None),
-            _ => (405, None),
+            tiny_http::Method::Delete => {
+                log_line(&log, started, Level::Info, "http", "session closed by client (DELETE)".into(), vec![]);
+                (200, None)
+            }
+            other => {
+                log_line(&log, started, Level::Err, "http", format!("rejected {other} {}", request.url()), vec![
+                    "only POST (JSON-RPC) and DELETE are supported".into(),
+                ]);
+                (405, None)
+            }
         };
 
         let response = match body {
@@ -77,8 +149,13 @@ fn serve_loop(server: Arc<tiny_http::Server>, log: Arc<Mutex<Vec<String>>>, star
 }
 
 /// Returns (http status, optional JSON-RPC response body).
-fn handle_rpc(body: &str, log: &Arc<Mutex<Vec<String>>>, started: Instant) -> (u16, Option<Value>) {
+fn handle_rpc(body: &str, log: &Log, started: Instant) -> (u16, Option<Value>) {
+    log.lock().unwrap().requests += 1;
+
     let Ok(req) = serde_json::from_str::<Value>(body) else {
+        log_line(log, started, Level::Err, "rpc", "malformed JSON request".into(), vec![
+            format!("body: {}", clip(body, 120)),
+        ]);
         return (400, Some(rpc_error(Value::Null, -32700, "Parse error")));
     };
     let id = req.get("id").cloned();
@@ -86,29 +163,50 @@ fn handle_rpc(body: &str, log: &Arc<Mutex<Vec<String>>>, started: Instant) -> (u
 
     // Notifications get no response body
     let Some(id) = id else {
+        log_line(log, started, Level::Info, "rpc", format!("notification {method}"), vec![]);
         return (202, None);
     };
+    let id_str = id.to_string();
 
     let result = match method {
         "initialize" => {
             let proto = req.pointer("/params/protocolVersion")
                 .and_then(|v| v.as_str())
                 .unwrap_or("2025-03-26");
-            push_log(log, started, format!("Client connected (protocol {proto})"));
+            let client = req.pointer("/params/clientInfo/name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let client_ver = req.pointer("/params/clientInfo/version").and_then(|v| v.as_str()).unwrap_or("?");
+            log.lock().unwrap().client = Some(format!("{client} {client_ver}"));
+            log_line(log, started, Level::Ok, "session", format!("client connected: {client} {client_ver}"), vec![
+                format!("protocol: {proto}"),
+                format!("server: hss {}", env!("CARGO_PKG_VERSION")),
+            ]);
             json!({
                 "protocolVersion": proto,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "hss", "version": env!("CARGO_PKG_VERSION") }
             })
         }
-        "ping" => json!({}),
-        "tools/list" => json!({ "tools": tool_definitions() }),
+        "ping" => {
+            log_line(log, started, Level::Info, "rpc", "ping".into(), vec![]);
+            json!({})
+        }
+        "tools/list" => {
+            log_line(log, started, Level::Info, "rpc", "tools/list → 2 tools".into(), vec![
+                "list-servers, execute-command".into(),
+            ]);
+            json!({ "tools": tool_definitions() })
+        }
         "tools/call" => {
             let name = req.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or("");
             let args = req.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-            call_tool(name, &args, log, started)
+            call_tool(name, &args, log, started, &id_str)
         }
-        _ => return (200, Some(rpc_error(id, -32601, &format!("Method not found: {method}")))),
+        _ => {
+            log_line(log, started, Level::Err, "rpc", format!("unknown method: {method}"), vec![
+                format!("request id {id_str}"),
+            ]);
+            return (200, Some(rpc_error(id, -32601, &format!("Method not found: {method}"))));
+        }
     };
 
     (200, Some(json!({ "jsonrpc": "2.0", "id": id, "result": result })))
@@ -140,46 +238,88 @@ fn tool_definitions() -> Value {
     ])
 }
 
-fn call_tool(name: &str, args: &Value, log: &Arc<Mutex<Vec<String>>>, started: Instant) -> Value {
+fn call_tool(name: &str, args: &Value, log: &Log, started: Instant, req_id: &str) -> Value {
+    log.lock().unwrap().tool_calls += 1;
+    let t0 = Instant::now();
+
     match name {
         "list-servers" => {
-            push_log(log, started, "tool: list-servers".into());
+            log_line(log, started, Level::Req, "tool", "list-servers".into(), vec![
+                format!("request id {req_id} · no arguments"),
+            ]);
             match crate::config::load_hosts() {
                 Ok(hosts) => {
+                    let groups: std::collections::BTreeSet<&str> =
+                        hosts.iter().map(|h| h.group.as_str()).filter(|g| !g.is_empty()).collect();
                     let list: Vec<Value> = hosts.iter().map(|h| json!({
                         "name": h.name, "group": h.group, "host": h.ip, "port": h.port,
                         "user": h.user, "tags": h.tags, "description": h.description,
                     })).collect();
-                    tool_text(serde_json::to_string_pretty(&list).unwrap_or_default(), false)
+                    let text = serde_json::to_string_pretty(&list).unwrap_or_default();
+                    log_line(log, started, Level::Ok, "tool", format!("list-servers → {} servers ({} ms)", hosts.len(), t0.elapsed().as_millis()), vec![
+                        format!("groups: {}", if groups.is_empty() { "—".to_string() } else { groups.into_iter().collect::<Vec<_>>().join(", ") }),
+                        format!("payload: {} bytes", text.len()),
+                    ]);
+                    tool_text(text, false)
                 }
-                Err(e) => tool_text(format!("Failed to load hosts: {e}"), true),
+                Err(e) => {
+                    log_line(log, started, Level::Err, "tool", format!("list-servers failed ({} ms)", t0.elapsed().as_millis()), vec![
+                        format!("error: {e}"),
+                    ]);
+                    tool_text(format!("Failed to load hosts: {e}"), true)
+                }
             }
         }
         "execute-command" => {
             let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("");
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if host.is_empty() || command.is_empty() {
+                log_line(log, started, Level::Err, "tool", "execute-command rejected: missing arguments".into(), vec![
+                    format!("host: {:?} · command: {:?}", host, clip(command, 60)),
+                ]);
                 return tool_text("Both 'host' and 'command' are required.".into(), true);
             }
-            push_log(log, started, format!("tool: execute-command on '{host}': {command}"));
+            log_line(log, started, Level::Req, "tool", format!("execute-command @ {host}"), vec![
+                format!("request id {req_id}"),
+                format!("$ {}", clip(command, 100)),
+            ]);
             match crate::ssh::exec_command(host, command) {
                 Ok(out) => {
                     let code = out.status.code().unwrap_or(-1);
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    push_log(log, started, format!("  → exit {code}"));
+                    let ms = t0.elapsed().as_millis();
+                    let mut detail = vec![format!(
+                        "stdout {} lines/{} B · stderr {} lines/{} B",
+                        stdout.lines().count(), stdout.len(), stderr.lines().count(), stderr.len()
+                    )];
+                    if let Some(first) = stdout.lines().find(|l| !l.trim().is_empty()) {
+                        detail.push(format!("out: {}", clip(first, 100)));
+                    }
+                    if let Some(err) = stderr.lines().find(|l| !l.trim().is_empty()) {
+                        detail.push(format!("err: {}", clip(err, 100)));
+                    }
+                    let level = if out.status.success() { Level::Ok } else { Level::Err };
+                    log_line(log, started, level, "tool", format!("execute-command @ {host} → exit {code} ({ms} ms)"), detail);
                     let mut text = format!("exit code: {code}\n");
                     if !stdout.is_empty() { text.push_str(&format!("stdout:\n{stdout}")); }
                     if !stderr.is_empty() { text.push_str(&format!("stderr:\n{stderr}")); }
                     tool_text(text, !out.status.success())
                 }
                 Err(e) => {
-                    push_log(log, started, format!("  → error: {e}"));
+                    log_line(log, started, Level::Err, "tool", format!("execute-command @ {host} failed ({} ms)", t0.elapsed().as_millis()), vec![
+                        format!("error: {e}"),
+                    ]);
                     tool_text(format!("Error: {e}"), true)
                 }
             }
         }
-        _ => tool_text(format!("Unknown tool: {name}"), true),
+        _ => {
+            log_line(log, started, Level::Err, "tool", format!("unknown tool: {name}"), vec![
+                format!("request id {req_id}"),
+            ]);
+            tool_text(format!("Unknown tool: {name}"), true)
+        }
     }
 }
 
@@ -192,7 +332,23 @@ mod tests {
     use super::*;
 
     fn rpc(body: &str) -> (u16, Option<Value>) {
-        handle_rpc(body, &Arc::new(Mutex::new(vec![])), Instant::now())
+        handle_rpc(body, &Arc::new(Mutex::new(LogState::default())), Instant::now())
+    }
+
+    #[test]
+    fn log_records_levels_counters_and_detail() {
+        let log: Log = Arc::new(Mutex::new(LogState::default()));
+        let started = Instant::now();
+        handle_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"claude","version":"1.2"}}}"#, &log, started);
+        handle_rpc("not json", &log, started);
+        let l = log.lock().unwrap();
+        assert_eq!(l.requests, 2);
+        assert_eq!(l.errors, 1);
+        assert_eq!(l.client.as_deref(), Some("claude 1.2"));
+        assert_eq!(l.entries[0].level, Level::Ok);
+        assert!(l.entries[0].msg.contains("claude 1.2"));
+        assert!(l.entries[0].detail.iter().any(|d| d.starts_with("protocol:")));
+        assert_eq!(l.entries[1].level, Level::Err);
     }
 
     #[test]
