@@ -84,20 +84,19 @@ pub fn draw(f: &mut Frame, app: &App) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let text = if focused { format!("{value}█") } else { value };
         let hint = if mask && form.password.is_empty() && !focused {
             "  (empty = use agent/existing keys)"
         } else {
             ""
         };
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{label} "), label_style),
-                Span::styled(text, Style::default().fg(Color::White)),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-            ])),
-            chunk,
-        );
+        let mut spans = vec![Span::styled(format!("{label} "), label_style)];
+        if focused {
+            spans.extend(crate::tui::input::spans(&value, form.cursor, Style::default().fg(Color::White)));
+        } else {
+            spans.push(Span::styled(value, Style::default().fg(Color::White)));
+        }
+        spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+        f.render_widget(Paragraph::new(Line::from(spans)), chunk);
     }
 
     let hotkeys = Line::from(vec![
@@ -116,13 +115,36 @@ pub fn draw(f: &mut Frame, app: &App) {
 pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
     let Some(form) = app.copy_id_form.as_mut() else { return Ok(()) };
 
+    // Text fields (1=user, 2=password) get full line editing; field 0 is the key list.
+    if form.focused > 0 && !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter) {
+        let field = if form.focused == 1 { &mut form.user } else { &mut form.password };
+        let mut cursor = form.cursor;
+        let mut buf = std::mem::take(field);
+        let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
+        *(if form.focused == 1 { &mut form.user } else { &mut form.password }) = buf;
+        form.cursor = cursor;
+        if consumed {
+            return Ok(());
+        }
+    }
+
     match key.code {
         KeyCode::Esc => {
             app.copy_id_form = None;
             app.screen = Screen::Main;
         }
-        KeyCode::Tab => form.focused = (form.focused + 1) % 3,
-        KeyCode::BackTab => form.focused = (form.focused + 2) % 3,
+        KeyCode::Tab | KeyCode::BackTab => {
+            form.focused = if key.code == KeyCode::Tab {
+                (form.focused + 1) % 3
+            } else {
+                (form.focused + 2) % 3
+            };
+            form.cursor = match form.focused {
+                1 => crate::tui::input::end_of(&form.user),
+                2 => crate::tui::input::end_of(&form.password),
+                _ => 0,
+            };
+        }
         KeyCode::Up if form.focused == 0 => form.key_cursor = form.key_cursor.saturating_sub(1),
         KeyCode::Down if form.focused == 0 => {
             if !form.keys.is_empty() {
@@ -134,15 +156,6 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
                 k.1 = !k.1;
             }
         }
-        KeyCode::Backspace => {
-            match form.focused {
-                1 => { form.user.pop(); }
-                2 => { form.password.pop(); }
-                _ => {}
-            }
-        }
-        KeyCode::Char(c) if form.focused == 1 => form.user.push(c),
-        KeyCode::Char(c) if form.focused == 2 => form.password.push(c),
         KeyCode::Enter => run_copy(app)?,
         _ => {}
     }

@@ -53,15 +53,19 @@ pub fn draw(f: &mut Frame, app: &App) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let value_display = if focused { format!("{value}█") } else { value.to_string() };
         let value_style = if focused {
             Style::default().fg(Color::White)
         } else {
             Style::default().fg(Color::Gray)
         };
+        let value_cell = if focused {
+            Cell::from(Line::from(crate::tui::input::spans(value, app.settings_cursor, value_style)))
+        } else {
+            Cell::from(Span::styled(value.to_string(), value_style))
+        };
         Row::new(vec![
             Cell::from(Span::styled(*label, label_style)),
-            Cell::from(Span::styled(value_display, value_style)),
+            value_cell,
             Cell::from(Span::styled(*hint, Style::default().fg(Color::DarkGray))),
         ])
     }).collect();
@@ -111,6 +115,24 @@ fn apply_inputs_to_config(app: &mut App) {
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    // Text fields get full line editing; Space stays a toggle on the two boolean-ish fields.
+    let toggle_field = matches!(app.settings_focused_field, FIELD_STRICT_HOST | FIELD_AUTO_SAVE);
+    let is_toggle_space = toggle_field && key.code == KeyCode::Char(' ');
+    if !is_toggle_space
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab)
+    {
+        if let Some(field) = app.settings_inputs.get_mut(app.settings_focused_field) {
+            let mut cursor = app.settings_cursor;
+            let mut buf = std::mem::take(field);
+            let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
+            app.settings_inputs[app.settings_focused_field] = buf;
+            app.settings_cursor = cursor;
+            if consumed {
+                return Ok(());
+            }
+        }
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Enter => {
             apply_inputs_to_config(app);
@@ -121,11 +143,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Tab => {
             app.settings_focused_field = (app.settings_focused_field + 1) % FIELD_COUNT;
+            app.settings_cursor = focused_len(app);
         }
         KeyCode::BackTab => {
             app.settings_focused_field = app.settings_focused_field
                 .checked_sub(1)
                 .unwrap_or(FIELD_COUNT - 1);
+            app.settings_cursor = focused_len(app);
         }
         KeyCode::Char(' ') => {
             match app.settings_focused_field {
@@ -143,18 +167,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                         "yes".to_string()
                     };
                 }
-                _ => {
-                    app.settings_inputs[app.settings_focused_field].push(' ');
-                }
+                _ => {}
             }
-        }
-        KeyCode::Char(c) => {
-            app.settings_inputs[app.settings_focused_field].push(c);
-        }
-        KeyCode::Backspace => {
-            app.settings_inputs[app.settings_focused_field].pop();
+            app.settings_cursor = focused_len(app);
         }
         _ => {}
     }
     Ok(())
+}
+
+fn focused_len(app: &App) -> usize {
+    app.settings_inputs
+        .get(app.settings_focused_field)
+        .map(|s| crate::tui::input::end_of(s))
+        .unwrap_or(0)
 }

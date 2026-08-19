@@ -52,11 +52,6 @@ pub fn draw(f: &mut Frame, app: &App) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let input_text = if focused {
-            format!("{value}█")
-        } else {
-            value.to_string()
-        };
         let input_style = if focused {
             Style::default().fg(Color::White)
         } else {
@@ -67,11 +62,14 @@ pub fn draw(f: &mut Frame, app: &App) {
             5 => " (comma-separated)",
             _ => "",
         };
-        let line = Line::from(vec![
-            Span::styled(format!("{:<18}", label), label_style),
-            Span::styled(input_text, input_style),
-            Span::styled(suffix, Style::default().fg(Color::DarkGray)),
-        ]);
+        let mut spans = vec![Span::styled(format!("{:<18}", label), label_style)];
+        if focused {
+            spans.extend(crate::tui::input::spans(value, form.cursor, input_style));
+        } else {
+            spans.push(Span::styled(value.to_string(), input_style));
+        }
+        spans.push(Span::styled(suffix, Style::default().fg(Color::DarkGray)));
+        let line = Line::from(spans);
         f.render_widget(Paragraph::new(line), chunks[i]);
     }
 
@@ -169,10 +167,11 @@ pub fn draw_import(f: &mut Frame, app: &App) {
     );
 
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(&app.import_path_input, Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(Color::Blue)),
-        ])),
+        Paragraph::new(Line::from(crate::tui::input::spans(
+            &app.import_path_input,
+            app.import_cursor,
+            Style::default().fg(Color::White),
+        ))),
         chunks[4],
     );
 
@@ -197,6 +196,21 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
 
     const FIELD_COUNT: usize = 8;
 
+    // Text fields (0..=6) get full line editing; field 7 is the jump-host selector.
+    if app.host_form.as_ref().unwrap().focused != 7
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter)
+    {
+        let form = app.host_form.as_mut().unwrap();
+        let mut cursor = form.cursor;
+        let mut buf = std::mem::take(active_field(form));
+        let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
+        *active_field(form) = buf;
+        form.cursor = cursor;
+        if consumed {
+            return Ok(());
+        }
+    }
+
     match key.code {
         KeyCode::Esc => {
             app.host_form = None;
@@ -205,27 +219,18 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
         KeyCode::Tab => {
             let form = app.host_form.as_mut().unwrap();
             form.focused = (form.focused + 1) % FIELD_COUNT;
+            form.cursor = crate::tui::input::end_of(active_field(form));
         }
         KeyCode::BackTab => {
             let form = app.host_form.as_mut().unwrap();
             form.focused = form.focused.checked_sub(1).unwrap_or(FIELD_COUNT - 1);
+            form.cursor = crate::tui::input::end_of(active_field(form));
         }
-        KeyCode::Left | KeyCode::Right if app.host_form.as_ref().unwrap().focused == 7 => {
+        KeyCode::Left | KeyCode::Right => {
             cycle_jump_host(app, key.code == KeyCode::Right);
         }
         KeyCode::Backspace => {
-            let form = app.host_form.as_mut().unwrap();
-            if form.focused == 7 {
-                form.jump_host_id = None;
-            } else {
-                active_field(form).pop();
-            }
-        }
-        KeyCode::Char(c) => {
-            let form = app.host_form.as_mut().unwrap();
-            if form.focused != 7 {
-                active_field(form).push(c);
-            }
+            app.host_form.as_mut().unwrap().jump_host_id = None;
         }
         KeyCode::Enter => {
             save_host(app)?;
@@ -324,18 +329,22 @@ fn save_host(app: &mut App) -> Result<()> {
 }
 
 pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
+    if !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Enter) {
+        let (mut buf, mut cursor) = (std::mem::take(&mut app.import_path_input), app.import_cursor);
+        let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
+        app.import_path_input = buf;
+        app.import_cursor = cursor;
+        if consumed {
+            return Ok(());
+        }
+    }
+
     match key.code {
         KeyCode::Esc => {
             app.screen = Screen::Main;
         }
         KeyCode::Tab => {
             app.import_export_mode = (app.import_export_mode + 1) % 3;
-        }
-        KeyCode::Backspace => {
-            app.import_path_input.pop();
-        }
-        KeyCode::Char(c) => {
-            app.import_path_input.push(c);
         }
         KeyCode::Enter => {
             let raw = app.import_path_input.trim().to_string();

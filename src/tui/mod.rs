@@ -9,6 +9,7 @@ pub mod copy_id;
 pub mod credentials_screen;
 pub mod delete_popup;
 pub mod host_form;
+pub mod input;
 pub mod main_screen;
 pub mod mcp_screen;
 pub mod popup;
@@ -36,6 +37,7 @@ pub struct App {
     pub server_records: Vec<ServerRecord>,
     // Main screen state
     pub search_query: String,
+    pub search_cursor: usize,
     pub selected_row: usize,
     pub search_focused: bool,
     // Credentials screen state
@@ -44,11 +46,13 @@ pub struct App {
     // Settings screen state
     pub settings_inputs: Vec<String>,   // 6 strings for the editable settings fields
     pub settings_focused_field: usize,
+    pub settings_cursor: usize,         // char index inside the focused settings field
     // Popup state
     pub popup_selected: usize,
     // Host form / import state
     pub host_form: Option<HostForm>,
     pub import_path_input: String,
+    pub import_cursor: usize,
     pub import_export_mode: usize, // 0 = import INI, 1 = export INI, 2 = export ssh_config
     // MCP server (Some while running; screen is modal)
     pub mcp: Option<crate::mcp::McpServer>,
@@ -71,15 +75,18 @@ impl App {
             config,
             server_records,
             search_query: String::new(),
+            search_cursor: 0,
             selected_row: 0,
             search_focused: false,
             cred_selected: 0,
             cred_form: None,
             settings_inputs: Vec::new(),
             settings_focused_field: 0,
+            settings_cursor: 0,
             popup_selected: 0,
             host_form: None,
             import_path_input: String::new(),
+            import_cursor: 0,
             import_export_mode: 0,
             mcp: None,
             copy_id_form: None,

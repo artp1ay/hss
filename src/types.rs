@@ -45,6 +45,7 @@ pub struct CredentialForm {
     pub password: String,
     pub key_path: String,
     pub focused: usize, // 0=type toggle, 1=name, 2=username, 3=secret
+    pub cursor: usize,  // char index inside the focused field
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +56,7 @@ pub struct CopyIdForm {
     pub user: String,
     pub password: String,
     pub focused: usize, // 0=key list 1=user 2=password
+    pub cursor: usize,  // char index inside the focused field
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,4 +85,5 @@ pub struct HostForm {
     pub description: String,
     pub jump_host_id: Option<String>, // selected from existing hosts, cycled with ←/→
     pub focused: usize,      // 0=name 1=ip 2=group 3=port 4=user 5=tags 6=description 7=jump host
+    pub cursor: usize,       // char index inside the focused field
 }

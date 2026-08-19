@@ -119,14 +119,14 @@ fn draw_form(f: &mut Frame, form: &CredentialForm, area: Rect) {
     );
 
     // Fields
-    render_field(f, "Name:    ", &form.name, form.focused == 1, chunks[1]);
-    render_field(f, "Username:", &form.username, form.focused == 2, chunks[2]);
+    render_field(f, "Name:    ", &form.name, form.focused == 1, form.cursor, chunks[1]);
+    render_field(f, "Username:", &form.username, form.focused == 2, form.cursor, chunks[2]);
     if form.is_key {
-        render_field(f, "Key path:", &form.key_path, form.focused == 3, chunks[3]);
+        render_field(f, "Key path:", &form.key_path, form.focused == 3, form.cursor, chunks[3]);
     } else {
-        let masked: String = "•".repeat(form.password.len());
+        let masked: String = "•".repeat(form.password.chars().count());
         let pw_label = if form.editing_id.is_some() { "Password: (blank=keep)" } else { "Password:" };
-        render_field(f, pw_label, &masked, form.focused == 3, chunks[3]);
+        render_field(f, pw_label, &masked, form.focused == 3, form.cursor, chunks[3]);
     }
 
     f.render_widget(
@@ -135,9 +135,13 @@ fn draw_form(f: &mut Frame, form: &CredentialForm, area: Rect) {
     );
 }
 
-fn render_field(f: &mut Frame, label: &str, value: &str, focused: bool, area: Rect) {
+fn render_field(f: &mut Frame, label: &str, value: &str, focused: bool, cursor: usize, area: Rect) {
     let border_style = if focused { Style::default().fg(Color::Blue) } else { Style::default().fg(Color::DarkGray) };
-    let display = if focused { format!("{value}█") } else { value.to_string() };
+    let display = if focused {
+        Line::from(crate::tui::input::spans(value, cursor, Style::default()))
+    } else {
+        Line::from(value.to_string())
+    };
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(10), Constraint::Min(0)])
@@ -211,6 +215,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 key_path: c.key_path.clone().unwrap_or_default(),
                 password: String::new(),
                 focused: 1,
+                cursor: crate::tui::input::end_of(&c.name),
             });
         }
         KeyCode::Char('d') | KeyCode::Char('D') if creds_len > 0 => {
@@ -245,10 +250,24 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 fn handle_form_key(app: &mut App, key: KeyEvent, mut form: CredentialForm) -> Result<()> {
+    // Text fields (1..=3) get full line editing; field 0 is the type toggle.
+    if form.focused > 0 && !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Enter) {
+        let mut cursor = form.cursor;
+        let mut buf = std::mem::take(form_field(&mut form));
+        let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
+        *form_field(&mut form) = buf;
+        form.cursor = cursor;
+        if consumed {
+            app.cred_form = Some(form);
+            return Ok(());
+        }
+    }
+
     match key.code {
         KeyCode::Esc => { app.cred_form = None; }
         KeyCode::Tab => {
             form.focused = (form.focused + 1) % 4;
+            form.cursor = crate::tui::input::end_of(form_field(&mut form));
             app.cred_form = Some(form);
         }
         KeyCode::Char(' ') if form.focused == 0 => {
@@ -259,29 +278,18 @@ fn handle_form_key(app: &mut App, key: KeyEvent, mut form: CredentialForm) -> Re
             save_form(app, &form)?;
             app.cred_form = None;
         }
-        KeyCode::Backspace => {
-            match form.focused {
-                1 => { form.name.pop(); }
-                2 => { form.username.pop(); }
-                3 if form.is_key => { form.key_path.pop(); }
-                3 => { form.password.pop(); }
-                _ => {}
-            }
-            app.cred_form = Some(form);
-        }
-        KeyCode::Char(c) => {
-            match form.focused {
-                1 => form.name.push(c),
-                2 => form.username.push(c),
-                3 if form.is_key => form.key_path.push(c),
-                3 => form.password.push(c),
-                _ => {}
-            }
-            app.cred_form = Some(form);
-        }
         _ => {}
     }
     Ok(())
+}
+
+fn form_field(form: &mut CredentialForm) -> &mut String {
+    match form.focused {
+        1 => &mut form.name,
+        2 => &mut form.username,
+        _ if form.is_key => &mut form.key_path,
+        _ => &mut form.password,
+    }
 }
 
 fn save_form(app: &mut App, form: &CredentialForm) -> Result<()> {

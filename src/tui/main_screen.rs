@@ -54,15 +54,17 @@ pub fn draw(f: &mut Frame, app: &App) {
             "Search...",
             Style::default().fg(Color::DarkGray),
         ))
+    } else if app.search_focused {
+        Line::from(crate::tui::input::spans(
+            &app.search_query,
+            app.search_cursor,
+            Style::default().fg(Color::White),
+        ))
     } else {
-        Line::from(vec![
-            Span::styled(&app.search_query, Style::default().fg(Color::White)),
-            if app.search_focused {
-                Span::styled("█", Style::default().fg(Color::Blue))
-            } else {
-                Span::raw("")
-            },
-        ])
+        Line::from(Span::styled(
+            app.search_query.clone(),
+            Style::default().fg(Color::White),
+        ))
     };
     f.render_widget(
         Paragraph::new(search_content).block(
@@ -143,7 +145,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Hotkey bar
     let hotkeys = if app.search_focused {
-        hotkey_line(&[("Esc", "clear/back"), ("Tab", "table")])
+        hotkey_line(&[("←/→", "cursor"), ("Esc", "clear/back"), ("Tab", "table")])
     } else {
         hotkey_line(&[
             ("Enter", "connect"),
@@ -232,17 +234,34 @@ fn group_color(group: &str) -> Color {
 pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
     let hosts_len = app.filtered_hosts().len();
 
+    // While the search box has focus, text editing wins over hotkeys
+    // (Tab/Esc/Enter/Up/Down are not consumed by the editor).
+    if app.search_focused && !matches!(key.code, KeyCode::Tab | KeyCode::Esc | KeyCode::Enter) {
+        let (mut q, mut cur) = (std::mem::take(&mut app.search_query), app.search_cursor);
+        let consumed = crate::tui::input::handle(&mut q, &mut cur, key);
+        let changed = q != app.search_query;
+        app.search_query = q;
+        app.search_cursor = cur;
+        if consumed {
+            if changed {
+                app.selected_row = 0;
+            }
+            return Ok(());
+        }
+    }
+
     match key.code {
-        // Q always quits, even while typing in search
-        KeyCode::Char('q') | KeyCode::Char('Q') => {
+        KeyCode::Char('q') | KeyCode::Char('Q') if !app.search_focused => {
             app.should_quit = true;
         }
         KeyCode::Tab => {
             app.search_focused = !app.search_focused;
+            app.search_cursor = crate::tui::input::end_of(&app.search_query);
         }
         KeyCode::Esc if app.search_focused => {
             if !app.search_query.is_empty() {
                 app.search_query.clear();
+                app.search_cursor = 0;
                 app.selected_row = 0;
             } else {
                 app.search_focused = false;
@@ -254,14 +273,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Char('/') if !app.search_focused => {
             app.search_focused = true;
-        }
-        KeyCode::Char(c) if app.search_focused => {
-            app.search_query.push(c);
-            app.selected_row = 0;
-        }
-        KeyCode::Backspace if app.search_focused => {
-            app.search_query.pop();
-            app.selected_row = 0;
+            app.search_cursor = crate::tui::input::end_of(&app.search_query);
         }
         KeyCode::Down | KeyCode::Char('j') if !app.search_focused => {
             if hosts_len > 0 {
@@ -289,6 +301,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 },
             ];
             app.settings_focused_field = 0;
+            app.settings_cursor = crate::tui::input::end_of(&app.settings_inputs[0]);
             app.screen = Screen::Settings;
         }
         KeyCode::Char('r') | KeyCode::Char('R') if !app.search_focused && hosts_len > 0 => {
@@ -326,6 +339,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     description: h.description.clone().unwrap_or_default(),
                     jump_host_id: h.jump_host_id.clone(),
                     focused: 0,
+                    cursor: crate::tui::input::end_of(&h.name),
                 });
                 app.screen = Screen::HostForm;
             }
@@ -381,6 +395,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Char('i') | KeyCode::Char('I') if !app.search_focused => {
             app.import_path_input.clear();
+            app.import_cursor = 0;
             app.import_export_mode = 0;
             app.screen = Screen::ImportHosts;
         }
@@ -391,7 +406,34 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::fit_tags;
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn test_app() -> App {
+        App::new(vec![], vec![], crate::config::AppConfig::default(), vec![])
+    }
+
+    #[test]
+    fn search_typing_does_not_trigger_hotkeys() {
+        let mut app = test_app();
+        let mut term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
+        app.search_focused = true;
+        for c in "quit".chars() {
+            handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)).unwrap();
+        }
+        assert_eq!(app.search_query, "quit");
+        assert!(!app.should_quit, "'q' must type in search, not quit");
+
+        // Left/Right move the cursor; insert lands at the cursor
+        handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.search_query, "qui-t");
+
+        // Unfocused, 'q' still quits
+        app.search_focused = false;
+        handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)).unwrap();
+        assert!(app.should_quit);
+    }
 
     #[test]
     fn fit_tags_fits_truncates_and_marks_hidden() {
