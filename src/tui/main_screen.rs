@@ -299,6 +299,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 } else {
                     "no".into()
                 },
+                app.config.exec_timeout.to_string(),
             ];
             app.settings_focused_field = 0;
             app.settings_cursor = crate::tui::input::end_of(&app.settings_inputs[0]);

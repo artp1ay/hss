@@ -11,6 +11,7 @@ pub fn config_dir() -> PathBuf {
 
 fn default_port() -> u16 { 22 }
 fn default_timeout() -> u8 { 10 }
+fn default_exec_timeout() -> u32 { 300 }
 fn default_strict_host_checking() -> String { "accept-new".to_string() }
 fn default_true() -> bool { true }
 
@@ -22,6 +23,9 @@ pub struct AppConfig {
     pub default_port: u16,
     #[serde(default = "default_timeout")]
     pub connect_timeout: u8,
+    /// Max seconds an MCP execute-command may run (0 = no limit).
+    #[serde(default = "default_exec_timeout")]
+    pub exec_timeout: u32,
     #[serde(default)]
     pub ssh_extra_args: String,
     #[serde(default = "default_strict_host_checking")]
@@ -37,6 +41,7 @@ impl Default for AppConfig {
             default_user: None,
             default_port: 22,
             connect_timeout: 10,
+            exec_timeout: 300,
             ssh_extra_args: String::new(),
             strict_host_checking: "accept-new".to_string(),
             auto_save_credential: true,

@@ -16,7 +16,8 @@ const FIELD_CONNECT_TIMEOUT: usize = 2;
 const FIELD_STRICT_HOST: usize = 3;
 const FIELD_SSH_EXTRA_ARGS: usize = 4;
 const FIELD_AUTO_SAVE: usize = 5;
-const FIELD_COUNT: usize = 6;
+const FIELD_EXEC_TIMEOUT: usize = 6;
+const FIELD_COUNT: usize = 7;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -43,6 +44,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         ("Strict Host Check", "accept-new / yes / no  [Space] cycle"),
         ("SSH Extra Args",    "appended to all SSH commands"),
         ("Auto-Save Creds",   "remember last-used credential per host  [Space] toggle"),
+        ("Exec Timeout",      "max seconds for MCP command (0=no limit, default 300)"),
     ];
 
     let rows: Vec<Row> = field_defs.iter().enumerate().map(|(i, (label, hint))| {
@@ -112,6 +114,7 @@ fn apply_inputs_to_config(app: &mut App) {
     app.config.strict_host_checking = inputs[FIELD_STRICT_HOST].trim().to_string();
     app.config.ssh_extra_args = inputs[FIELD_SSH_EXTRA_ARGS].trim().to_string();
     app.config.auto_save_credential = inputs[FIELD_AUTO_SAVE] == "yes";
+    app.config.exec_timeout = inputs[FIELD_EXEC_TIMEOUT].trim().parse().unwrap_or(300);
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {

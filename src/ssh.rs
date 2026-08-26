@@ -107,6 +107,7 @@ pub fn spawn_ssh(host: &str, port: u16, cred: &Credential, cfg: &AppConfig, jump
 
 /// Run a single command on a host non-interactively, capturing output.
 /// Host is looked up by name or IP; credentials resolve the same way as interactive connect.
+/// Respects `exec_timeout` from config (0 = no limit, default 300s).
 pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Output> {
     let cfg = config::load_config()?;
     let creds = config::load_credentials()?;
@@ -131,6 +132,9 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
     let mut ssh_args: Vec<String> = vec![
         "-o".into(), format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
         "-o".into(), format!("ConnectTimeout={}", cfg.connect_timeout),
+        // Detect dead connections: probe every 15s, give up after 3 missed replies.
+        "-o".into(), "ServerAliveInterval=15".into(),
+        "-o".into(), "ServerAliveCountMax=3".into(),
         "-p".into(), h.port.to_string(),
         "-l".into(), cred.username.clone(),
     ];
@@ -162,7 +166,36 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
         None
     };
 
-    let out = cmd.output();
+    let timeout = cfg.exec_timeout;
+    let out = if timeout == 0 {
+        cmd.output()
+    } else {
+        // Spawn + wait with deadline so long-running commands don't hang forever.
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout as u64);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break child.wait_with_output(),
+                        Ok(None) => {
+                            if std::time::Instant::now() >= deadline {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!("command timed out after {timeout}s"),
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(250));
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    };
+
     if let Some(ref path) = askpass_path {
         let _ = std::fs::remove_file(path);
     }
