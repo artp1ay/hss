@@ -119,32 +119,73 @@ fn clip(s: &str, max: usize) -> String {
 fn serve_loop(server: Arc<tiny_http::Server>, log: Log, started: Instant) {
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
-        let (status, body) = match method {
-            tiny_http::Method::Post => {
-                let mut buf = String::new();
-                let _ = std::io::Read::read_to_string(request.as_reader(), &mut buf);
-                handle_rpc(&buf, &log, started)
-            }
-            // Session termination per streamable-http spec — nothing to clean up
-            tiny_http::Method::Delete => {
-                log_line(&log, started, Level::Info, "http", "session closed by client (DELETE)".into(), vec![]);
-                (200, None)
-            }
-            other => {
-                log_line(&log, started, Level::Err, "http", format!("rejected {other} {}", request.url()), vec![
-                    "only POST (JSON-RPC) and DELETE are supported".into(),
-                ]);
-                (405, None)
-            }
-        };
 
-        let response = match body {
-            Some(json) => tiny_http::Response::from_string(json.to_string())
-                .with_status_code(status)
-                .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap()),
-            None => tiny_http::Response::from_string("").with_status_code(status),
-        };
-        let _ = request.respond(response);
+        // Fast path: non-POST requests are answered inline.
+        if method != tiny_http::Method::Post {
+            let (status, body) = match method {
+                tiny_http::Method::Delete => {
+                    log_line(&log, started, Level::Info, "http", "session closed by client (DELETE)".into(), vec![]);
+                    (200, None)
+                }
+                other => {
+                    log_line(&log, started, Level::Err, "http", format!("rejected {other} {}", request.url()), vec![
+                        "only POST (JSON-RPC) and DELETE are supported".into(),
+                    ]);
+                    (405, None)
+                }
+            };
+            let _ = request.respond(make_response(status, body));
+            continue;
+        }
+
+        // Read the body in the accept thread (the reader is tied to the request).
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(request.as_reader(), &mut buf);
+
+        // Peek at the method to decide sync vs async.
+        let rpc_method = serde_json::from_str::<Value>(&buf)
+            .ok()
+            .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from));
+
+        let is_tool_call = rpc_method.as_deref() == Some("tools/call");
+
+        if is_tool_call {
+            // Tool calls may run SSH commands that take minutes.
+            // Handle them in a separate thread so the accept loop keeps
+            // responding to pings and other fast requests.
+            let lg = log.clone();
+            std::thread::spawn(move || {
+                let (status, body) = handle_rpc(&buf, &lg, started);
+                let _ = request.respond(make_response(status, body));
+            });
+        } else {
+            // Fast RPC: ping, initialize, tools/list, notifications.
+            let (status, body) = handle_rpc(&buf, &log, started);
+            let _ = request.respond(make_response(status, body));
+        }
+    }
+}
+
+fn make_response(status: u16, body: Option<Value>) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    match body {
+        Some(json) => {
+            let bytes = json.to_string().into_bytes();
+            let len = bytes.len();
+            tiny_http::Response::new(
+                tiny_http::StatusCode(status),
+                vec!["Content-Type: application/json".parse::<tiny_http::Header>().unwrap()],
+                std::io::Cursor::new(bytes),
+                Some(len),
+                None,
+            )
+        }
+        None => tiny_http::Response::new(
+            tiny_http::StatusCode(status),
+            vec![],
+            std::io::Cursor::new(vec![]),
+            Some(0),
+            None,
+        ),
     }
 }
 
