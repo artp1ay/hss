@@ -170,6 +170,8 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
     let out = if timeout == 0 {
         cmd.output()
     } else {
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         // Spawn + wait with deadline so long-running commands don't hang forever.
         match cmd.spawn() {
             Ok(mut child) => {
