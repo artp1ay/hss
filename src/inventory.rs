@@ -228,7 +228,7 @@ pub fn generate_ansible_inventory(
             .clone()
             .or_else(|| resolved_cred.map(|c| c.username.clone()))
             .or_else(|| cfg.default_user.clone());
-        if let Some(u) = user {
+        if let Some(ref u) = user {
             vars.insert("ansible_user".into(), json!(u));
         }
 
