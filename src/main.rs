@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     if cli.ansible_inventory {
         let hosts = hss::config::load_hosts().unwrap_or_default();
         let creds = hss::config::load_credentials().unwrap_or_default();
-        let records = hss::config::load_records().unwrap_or_default();
+        let records = hss::config::load_server_records().unwrap_or_default();
         let cfg = hss::config::load_config().unwrap_or_default();
         let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
         println!("{}", serde_json::to_string_pretty(&inv)?);
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
         // With _meta returned by --list, an empty dict is the standard response.
         let hosts = hss::config::load_hosts().unwrap_or_default();
         let creds = hss::config::load_credentials().unwrap_or_default();
-        let records = hss::config::load_records().unwrap_or_default();
+        let records = hss::config::load_server_records().unwrap_or_default();
         let cfg = hss::config::load_config().unwrap_or_default();
         let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
         if let Some(hostvars) = inv.get("_meta").and_then(|m| m.get("hostvars")).and_then(|hv| hv.get(target)) {
