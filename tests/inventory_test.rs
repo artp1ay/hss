@@ -148,3 +148,100 @@ fn test_export_to_ini_basic() {
     assert!(ini.contains("db1 ansible_host=10.0.0.2 ansible_port=5432"));
     assert!(!ini.contains("ansible_user=postgres") && !ini.contains("ansible_user=\n"));
 }
+
+#[test]
+fn test_generate_ansible_inventory_structure() {
+    use hss::types::{Host, Credential, CredentialKind, ServerRecord};
+    use hss::config::AppConfig;
+
+    let hosts = vec![
+        Host {
+            id: "bastion-id".into(),
+            name: "bastion".into(),
+            ip: "198.51.100.1".into(),
+            group: "gateways".into(),
+            port: 22,
+            user: Some("jumpuser".into()),
+            tags: vec!["edge".into()],
+            description: None,
+            jump_host_id: None,
+        },
+        Host {
+            id: "app-id".into(),
+            name: "app1".into(),
+            ip: "10.0.1.10".into(),
+            group: "web".into(),
+            port: 2222,
+            user: None,
+            tags: vec!["prod".into(), "k8s".into()],
+            description: Some("Production node".into()),
+            jump_host_id: Some("bastion-id".into()),
+        },
+    ];
+
+    let creds = vec![
+        Credential {
+            id: "cred-key".into(),
+            name: "SSH Key".into(),
+            username: "ubuntu".into(),
+            kind: CredentialKind::Key,
+            key_path: Some("/home/user/.ssh/id_rsa".into()),
+        },
+    ];
+
+    let records = vec![
+        ServerRecord {
+            host_id: "app-id".into(),
+            last_credential_id: Some("cred-key".into()),
+        },
+    ];
+
+    let cfg = AppConfig {
+        strict_host_checking: "no".into(),
+        ssh_extra_args: "-o ForwardAgent=yes".into(),
+        ..Default::default()
+    };
+
+    let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
+
+    // Verify _meta.hostvars
+    let hostvars = inv.get("_meta").unwrap().get("hostvars").unwrap();
+    let app1_vars = hostvars.get("app1").unwrap();
+
+    assert_eq!(app1_vars.get("ansible_host").unwrap(), "10.0.1.10");
+    assert_eq!(app1_vars.get("ansible_port").unwrap(), 2222);
+    assert_eq!(app1_vars.get("ansible_user").unwrap(), "ubuntu");
+    assert_eq!(app1_vars.get("ansible_ssh_private_key_file").unwrap(), "/home/user/.ssh/id_rsa");
+    assert_eq!(app1_vars.get("hss_group").unwrap(), "web");
+    assert_eq!(app1_vars.get("hss_description").unwrap(), "Production node");
+
+    let ssh_common = app1_vars.get("ansible_ssh_common_args").unwrap().as_str().unwrap();
+    assert!(ssh_common.contains("-o ProxyJump=jumpuser@198.51.100.1"));
+    assert!(ssh_common.contains("-o StrictHostKeyChecking=no"));
+    assert!(ssh_common.contains("-o ForwardAgent=yes"));
+
+    // Verify groups
+    let web_group = inv.get("web").unwrap().get("hosts").unwrap().as_array().unwrap();
+    assert!(web_group.contains(&serde_json::json!("app1")));
+
+    let gateways_group = inv.get("gateways").unwrap().get("hosts").unwrap().as_array().unwrap();
+    assert!(gateways_group.contains(&serde_json::json!("bastion")));
+
+    // Verify tag groups
+    let tag_prod = inv.get("tag_prod").unwrap().get("hosts").unwrap().as_array().unwrap();
+    assert!(tag_prod.contains(&serde_json::json!("app1")));
+
+    let tag_k8s = inv.get("tag_k8s").unwrap().get("hosts").unwrap().as_array().unwrap();
+    assert!(tag_k8s.contains(&serde_json::json!("app1")));
+
+    let tag_edge = inv.get("tag_edge").unwrap().get("hosts").unwrap().as_array().unwrap();
+    assert!(tag_edge.contains(&serde_json::json!("bastion")));
+
+    // Verify "all" children
+    let all_children = inv.get("all").unwrap().get("children").unwrap().as_array().unwrap();
+    assert!(all_children.contains(&serde_json::json!("gateways")));
+    assert!(all_children.contains(&serde_json::json!("web")));
+    assert!(all_children.contains(&serde_json::json!("tag_prod")));
+    assert!(all_children.contains(&serde_json::json!("tag_k8s")));
+    assert!(all_children.contains(&serde_json::json!("tag_edge")));
+}

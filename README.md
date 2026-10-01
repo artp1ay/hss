@@ -50,6 +50,7 @@ mv hss-linux-x86_64 ~/.local/bin/hss
 hss           open TUI
 hss HOST      connect directly to a named host or IP
 hss --fzf     fuzzy picker
+hss --ansible-inventory  output dynamic Ansible inventory JSON
 ```
 
 ### TUI keys

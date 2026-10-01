@@ -9,13 +9,44 @@ struct Cli {
     /// Check for a newer release and replace this binary automatically
     #[arg(long)]
     update: bool,
-    /// Connect directly to host by name or IP
+    /// Output dynamic Ansible inventory JSON
+    #[arg(long, alias = "list")]
+    ansible_inventory: bool,
+    /// Ansible inventory host query (accepted for compatibility with Ansible inventory scripts)
+    #[arg(long)]
     host: Option<String>,
+    /// Connect directly to host by name or IP
+    direct_host: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    match (cli.update, cli.fzf, cli.host) {
+    if cli.ansible_inventory {
+        let hosts = hss::config::load_hosts().unwrap_or_default();
+        let creds = hss::config::load_credentials().unwrap_or_default();
+        let records = hss::config::load_records().unwrap_or_default();
+        let cfg = hss::config::load_config().unwrap_or_default();
+        let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
+        println!("{}", serde_json::to_string_pretty(&inv)?);
+        return Ok(());
+    }
+    if let Some(ref target) = cli.host {
+        // Ansible calls --host <hostname> if --list did not return _meta or for legacy verification.
+        // With _meta returned by --list, an empty dict is the standard response.
+        let hosts = hss::config::load_hosts().unwrap_or_default();
+        let creds = hss::config::load_credentials().unwrap_or_default();
+        let records = hss::config::load_records().unwrap_or_default();
+        let cfg = hss::config::load_config().unwrap_or_default();
+        let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
+        if let Some(hostvars) = inv.get("_meta").and_then(|m| m.get("hostvars")).and_then(|hv| hv.get(target)) {
+            println!("{}", serde_json::to_string_pretty(hostvars)?);
+        } else {
+            println!("{{}}");
+        }
+        return Ok(());
+    }
+
+    match (cli.update, cli.fzf, cli.direct_host) {
         (true, _, _) => hss::update::run(),
         (_, true, _) => hss::fzf::run(),
         (_, _, Some(host)) => hss::ssh::connect_direct(&host),

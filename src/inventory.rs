@@ -196,3 +196,129 @@ pub fn export_to_ini(hosts: &[Host]) -> String {
     out
 }
 
+/// Generate dynamic Ansible inventory JSON with groups, tags, credentials and jump hosts.
+pub fn generate_ansible_inventory(
+    hosts: &[Host],
+    creds: &[crate::types::Credential],
+    records: &[crate::types::ServerRecord],
+    cfg: &crate::config::AppConfig,
+) -> serde_json::Value {
+    use std::collections::{BTreeMap, BTreeSet};
+    use serde_json::json;
+    use crate::types::CredentialKind;
+
+    let mut hostvars = serde_json::Map::new();
+    let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut tag_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for host in hosts {
+        let last_cred_id = records
+            .iter()
+            .find(|r| r.host_id == host.id)
+            .and_then(|r| r.last_credential_id.as_deref());
+
+        let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_cred_id).ok().flatten();
+
+        let mut vars = serde_json::Map::new();
+        vars.insert("ansible_host".into(), json!(host.ip));
+        vars.insert("ansible_port".into(), json!(host.port));
+
+        let user = host
+            .user
+            .clone()
+            .or_else(|| resolved_cred.map(|c| c.username.clone()))
+            .or_else(|| cfg.default_user.clone());
+        if let Some(u) = user {
+            vars.insert("ansible_user".into(), json!(u));
+        }
+
+        if let Some(cred) = resolved_cred {
+            match cred.kind {
+                CredentialKind::Password => {
+                    if let Ok(pw) = crate::credentials::get_password(&cred.id) {
+                        vars.insert("ansible_password".into(), json!(pw));
+                        // Non-root users with passwords typically use the same password for sudo
+                        if user.as_deref() != Some("root") {
+                            vars.insert("ansible_become_password".into(), json!(pw));
+                        }
+                    }
+                }
+                CredentialKind::Key => {
+                    if let Some(ref key_path) = cred.key_path {
+                        vars.insert("ansible_ssh_private_key_file".into(), json!(key_path));
+                    }
+                }
+            }
+        }
+
+        let mut ssh_args = Vec::new();
+        if let Some(jump) = crate::ssh::jump_spec(hosts, host) {
+            ssh_args.push(format!("-o ProxyJump={jump}"));
+        }
+        if !cfg.strict_host_checking.is_empty() {
+            ssh_args.push(format!("-o StrictHostKeyChecking={}", cfg.strict_host_checking));
+        }
+        if !cfg.ssh_extra_args.is_empty() {
+            ssh_args.push(cfg.ssh_extra_args.clone());
+        }
+        if !ssh_args.is_empty() {
+            vars.insert("ansible_ssh_common_args".into(), json!(ssh_args.join(" ")));
+        }
+
+        vars.insert("hss_group".into(), json!(host.group));
+        vars.insert("hss_tags".into(), json!(host.tags));
+        if let Some(ref desc) = host.description {
+            vars.insert("hss_description".into(), json!(desc));
+        }
+
+        let group_name = if host.group.is_empty() { "ungrouped" } else { &host.group };
+        groups
+            .entry(group_name.to_string())
+            .or_default()
+            .insert(host.name.clone());
+
+        for tag in &host.tags {
+            let t = tag.trim();
+            if !t.is_empty() {
+                tag_groups
+                    .entry(format!("tag_{t}"))
+                    .or_default()
+                    .insert(host.name.clone());
+            }
+        }
+
+        hostvars.insert(host.name.clone(), serde_json::Value::Object(vars));
+    }
+
+    let mut inventory = serde_json::Map::new();
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("hostvars".into(), serde_json::Value::Object(hostvars));
+    inventory.insert("_meta".into(), serde_json::Value::Object(meta));
+
+    let mut all_children: Vec<String> = groups.keys().cloned().collect();
+    for tag_name in tag_groups.keys() {
+        all_children.push(tag_name.clone());
+    }
+    all_children.sort();
+    all_children.dedup();
+
+    let mut all_group = serde_json::Map::new();
+    all_group.insert("children".into(), json!(all_children));
+    inventory.insert("all".into(), serde_json::Value::Object(all_group));
+
+    for (group_name, members) in groups {
+        let mut grp = serde_json::Map::new();
+        grp.insert("hosts".into(), json!(members.into_iter().collect::<Vec<_>>()));
+        inventory.insert(group_name, serde_json::Value::Object(grp));
+    }
+
+    for (tag_name, members) in tag_groups {
+        let mut grp = serde_json::Map::new();
+        grp.insert("hosts".into(), json!(members.into_iter().collect::<Vec<_>>()));
+        inventory.insert(tag_name, serde_json::Value::Object(grp));
+    }
+
+    serde_json::Value::Object(inventory)
+}
+

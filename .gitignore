@@ -19,6 +19,7 @@
 ### macOS ###
 # General
 .DS_Store
+.codegraph/
 .AppleDouble
 .LSOverride
 
