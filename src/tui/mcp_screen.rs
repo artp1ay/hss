@@ -7,7 +7,7 @@ use ratatui::{
 };
 use crossterm::event::{KeyCode, KeyEvent};
 use anyhow::Result;
-use crate::mcp::{Level, McpServer};
+use crate::mcp::Level;
 use crate::tui::{App, Screen, Term};
 
 pub fn draw(f: &mut Frame, app: &App) {

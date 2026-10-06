@@ -86,7 +86,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::styled(format!("? No Creds: {no_cred_cnt}  "), Style::default().fg(Color::Magenta)),
         if state.is_running {
             Span::styled(
-                format!("⏳ In Progress [{}/{}]", state.completed, state.total),
+                format!("⏳ In Progress [{}/{}] ({} left)", state.completed, state.total, checking_cnt),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )
         } else {
@@ -261,24 +261,27 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             }
         }
         KeyCode::Char('c') | KeyCode::Char('C') => {
-            if let Some(ref state) = app.audit_state {
-                if !state.results.is_empty() {
+            let selected_host_id = app.audit_state.as_ref().and_then(|state| {
+                if state.results.is_empty() {
+                    None
+                } else {
                     let sel = state.selected.min(state.results.len() - 1);
-                    let host_id = state.results[sel].host_id.clone();
-                    if let Some(h) = app.hosts.iter().find(|h| h.id == host_id) {
-                        let last_cred_id = app.last_credential_id(&h.id).map(|s| s.to_string());
-                        let cred = crate::ssh::resolve_credential(&app.credentials, &app.config, last_cred_id.as_deref())?.cloned();
-                        if let Some(c) = cred {
-                            crate::tui::do_connect(terminal, app, &h.id, &c)?;
-                        } else {
-                            if let Some(idx) = app.hosts.iter().position(|x| x.id == h.id) {
-                                app.popup_selected = 0;
-                                app.screen = Screen::CredentialPicker {
-                                    host_idx: idx,
-                                    after_failure: false,
-                                };
-                            }
-                        }
+                    Some(state.results[sel].host_id.clone())
+                }
+            });
+
+            if let Some(host_id) = selected_host_id {
+                let last_cred_id = app.last_credential_id(&host_id).map(|s| s.to_string());
+                let cred = crate::ssh::resolve_credential(&app.credentials, &app.config, last_cred_id.as_deref())?.cloned();
+                if let Some(c) = cred {
+                    crate::tui::do_connect(terminal, app, &host_id, &c)?;
+                } else {
+                    if let Some(idx) = app.hosts.iter().position(|x| x.id == host_id) {
+                        app.popup_selected = 0;
+                        app.screen = Screen::CredentialPicker {
+                            host_idx: idx,
+                            after_failure: false,
+                        };
                     }
                 }
             }
