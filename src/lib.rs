@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod config;
 pub mod credentials;
 pub mod fzf;

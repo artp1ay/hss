@@ -11,13 +11,36 @@ use ratatui::{
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+
+    // Hotkey bar computed first so height is dynamic and fits terminal width
+    let hotkey_pairs: &[(&str, &str)] = if app.search_focused {
+        &[("←/→", "cursor"), ("Esc", "clear/back"), ("Tab", "table")]
+    } else {
+        &[
+            ("Enter", "connect"),
+            ("N", "new"),
+            ("E", "edit"),
+            ("D", "delete"),
+            ("A", "audit"),
+            ("I", "import/export"),
+            ("R", "switch cred"),
+            ("P", "ssh-copy-id"),
+            ("M", "mcp server"),
+            ("C", "credentials"),
+            ("S", "settings"),
+            ("Q", "quit"),
+        ]
+    };
+    let hotkey_lines = crate::tui::wrap_hotkey_lines(hotkey_pairs, area.width);
+    let hotkey_height = hotkey_lines.len() as u16;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(hotkey_height),
         ])
         .split(area);
 
@@ -144,42 +167,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     // Hotkey bar
-    let hotkeys = if app.search_focused {
-        hotkey_line(&[("←/→", "cursor"), ("Esc", "clear/back"), ("Tab", "table")])
-    } else {
-        hotkey_line(&[
-            ("Enter", "connect"),
-            ("N", "new"),
-            ("E", "edit"),
-            ("D", "delete"),
-            ("I", "import/export"),
-            ("R", "switch cred"),
-            ("P", "ssh-copy-id"),
-            ("M", "mcp server"),
-            ("C", "credentials"),
-            ("S", "settings"),
-            ("Q", "quit"),
-        ])
-    };
-    f.render_widget(Paragraph::new(hotkeys), chunks[3]);
-}
-
-fn hotkey_line<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
-    let mut spans = vec![];
-    for (i, (key, label)) in pairs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(
-            format!("[{key}]"),
-            Style::default().fg(Color::Blue),
-        ));
-        spans.push(Span::styled(
-            format!(" {label}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    Line::from(spans)
+    f.render_widget(Paragraph::new(hotkey_lines), chunks[3]);
 }
 
 /// Join tags into `width` chars; when they don't fit, show whole tags
@@ -291,6 +279,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             app.settings_inputs = vec![
                 app.config.default_user.clone().unwrap_or_default(),
                 app.config.default_port.to_string(),
+                app.config.default_group.clone(),
                 app.config.connect_timeout.to_string(),
                 app.config.strict_host_checking.clone(),
                 app.config.ssh_extra_args.clone(),
@@ -300,10 +289,18 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     "no".into()
                 },
                 app.config.exec_timeout.to_string(),
+                app.config.mcp_port.to_string(),
+                app.config.mcp_token.clone().unwrap_or_default(),
+                app.config.mcp_log_file.clone().unwrap_or_default(),
+                app.config.audit_timeout.to_string(),
             ];
             app.settings_focused_field = 0;
             app.settings_cursor = crate::tui::input::end_of(&app.settings_inputs[0]);
             app.screen = Screen::Settings;
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') if !app.search_focused => {
+            app.start_audit();
+            app.screen = Screen::Audit;
         }
         KeyCode::Char('r') | KeyCode::Char('R') if !app.search_focused && hosts_len > 0 => {
             let idx_in_all = get_host_idx_in_all(app);
@@ -322,6 +319,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             app.host_form = Some(crate::types::HostForm {
                 editing_id: None,
                 port: "22".into(),
+                group: app.config.default_group.clone(),
                 ..Default::default()
             });
             app.screen = Screen::HostForm;
@@ -451,8 +449,8 @@ fn get_host_idx_in_all(app: &App) -> Option<usize> {
     if filtered.is_empty() {
         return None;
     }
-    let host_name = &filtered[app.selected_row.min(filtered.len() - 1)].name;
-    app.hosts.iter().position(|h| &h.name == host_name)
+    let host_id = &filtered[app.selected_row.min(filtered.len() - 1)].id;
+    app.hosts.iter().position(|h| &h.id == host_id)
 }
 
 fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
@@ -468,10 +466,9 @@ fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
             .cloned();
 
     if let Some(cred) = cred {
-        crate::tui::do_connect(terminal, app, &host.name, &cred)?;
+        crate::tui::do_connect(terminal, app, &host.id, &cred)?;
     } else {
-        // No credential resolved — show picker
-        if let Some(idx) = app.hosts.iter().position(|h| h.name == host.name) {
+        if let Some(idx) = app.hosts.iter().position(|h| h.id == host.id) {
             app.popup_selected = 0;
             app.screen = Screen::CredentialPicker {
                 host_idx: idx,

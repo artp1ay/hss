@@ -15,7 +15,6 @@ pub fn run() -> Result<()> {
     }
     let records = config::migrate_server_records(config::load_server_records()?, &hosts);
 
-    // Build display lines: "name  group  host:port"
     let lines: Vec<String> = hosts.iter()
         .map(|h| format!("{:<20} {:<14} {}:{}", h.name, h.group, h.ip, h.port))
         .collect();
@@ -23,10 +22,9 @@ pub fn run() -> Result<()> {
     let selected_line = pick_one(&lines, "ssh> ")?;
     let Some(line) = selected_line else { return Ok(()) };
 
-    // Match back to host by name (first token)
-    let host_name = line.split_whitespace().next().unwrap_or("").trim().to_string();
-    let host = hosts.iter().find(|h| h.name == host_name)
-        .ok_or_else(|| anyhow::anyhow!("Host not found: {host_name}"))?;
+    let picked_name: String = line.chars().take(20).collect::<String>().trim_end().to_string();
+    let host = hosts.iter().find(|h| h.name == picked_name)
+        .ok_or_else(|| anyhow::anyhow!("Host not found: {picked_name}"))?;
 
     let last_cred_id = records.iter()
         .find(|r| r.host_id == host.id)

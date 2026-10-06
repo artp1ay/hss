@@ -110,9 +110,9 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent, host_idx: u
         }
         KeyCode::Enter if creds_len > 0 => {
             let cred = app.credentials[app.popup_selected.min(creds_len - 1)].clone();
-            let host_name = app.hosts[host_idx].name.clone();
+            let host_id = app.hosts[host_idx].id.clone();
             app.screen = Screen::Main;
-            crate::tui::do_connect(terminal, app, &host_name, &cred)?;
+            crate::tui::do_connect(terminal, app, &host_id, &cred)?;
         }
         _ => {}
     }

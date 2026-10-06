@@ -172,13 +172,29 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
     } else {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        // Spawn + wait with deadline so long-running commands don't hang forever.
         match cmd.spawn() {
             Ok(mut child) => {
+                // Drain stdout and stderr in background threads to prevent pipe-full deadlock.
+                let stdout_pipe = child.stdout.take();
+                let stderr_pipe = child.stderr.take();
+                let stdout_handle = std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    if let Some(mut r) = stdout_pipe {
+                        let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+                    }
+                    buf
+                });
+                let stderr_handle = std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    if let Some(mut r) = stderr_pipe {
+                        let _ = std::io::Read::read_to_end(&mut r, &mut buf);
+                    }
+                    buf
+                });
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout as u64);
-                loop {
+                let status = loop {
                     match child.try_wait() {
-                        Ok(Some(_)) => break child.wait_with_output(),
+                        Ok(Some(s)) => break Ok(s),
                         Ok(None) => {
                             if std::time::Instant::now() >= deadline {
                                 let _ = child.kill();
@@ -192,7 +208,10 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
                         }
                         Err(e) => break Err(e),
                     }
-                }
+                };
+                let stdout_bytes = stdout_handle.join().unwrap_or_default();
+                let stderr_bytes = stderr_handle.join().unwrap_or_default();
+                status.map(|s| std::process::Output { status: s, stdout: stdout_bytes, stderr: stderr_bytes })
             }
             Err(e) => Err(e),
         }
@@ -284,8 +303,19 @@ pub fn copy_id(
     Ok(out?)
 }
 
-fn write_askpass_helper() -> Result<std::path::PathBuf> {
-    let path = std::env::temp_dir().join(format!("hss-askpass-{}", std::process::id()));
+pub fn write_askpass_helper() -> Result<std::path::PathBuf> {
+    let rand: u64 = {
+        let mut buf = [0u8; 8];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+            .unwrap_or_else(|_| {
+                buf = std::process::id().to_ne_bytes()
+                    .into_iter().chain([0u8; 4]).collect::<Vec<_>>()
+                    .try_into().unwrap_or([0u8; 8]);
+            });
+        u64::from_ne_bytes(buf)
+    };
+    let path = std::env::temp_dir().join(format!("hss-askpass-{:016x}", rand));
     std::fs::write(&path, "#!/bin/sh\necho \"$HSS_PASSWORD\"\n")?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
     Ok(path)

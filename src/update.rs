@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Result};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 
-// Replace OWNER with your GitHub username after creating the repo.
 const GITHUB_REPO: &str = "artp1ay/hss";
 
 #[derive(serde::Deserialize)]
@@ -86,6 +85,11 @@ pub fn run() -> Result<()> {
     };
 
     println!("  {:.1} MB downloaded", bytes as f64 / 1_048_576.0);
+
+    if bytes == 0 {
+        let _ = std::fs::remove_file(&tmp_path);
+        bail!("Downloaded file is empty — update aborted");
+    }
 
     std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
     std::fs::rename(&tmp_path, &exe_path).map_err(|e| {

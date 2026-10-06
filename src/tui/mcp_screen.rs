@@ -32,8 +32,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     let status_lines = vec![
         Line::from(vec![
             Span::styled("● Running  ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(McpServer::url(), Style::default().fg(Color::White)),
+            Span::styled(mcp.server_url(), Style::default().fg(Color::White)),
             Span::styled(format!("  up {}m{:02}s", uptime / 60, uptime % 60), Style::default().fg(Color::DarkGray)),
+            if let Some(ref path) = log.log_file {
+                Span::styled(format!("  log: {}", path.display()), Style::default().fg(Color::Cyan))
+            } else {
+                Span::raw("")
+            },
         ]),
         Line::from(vec![
             Span::styled("Client: ", Style::default().fg(Color::DarkGray)),
@@ -52,7 +57,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             ),
         ]),
         Line::from(Span::styled(
-            format!("Add to client:  claude mcp add --transport http hss {}", McpServer::url()),
+            format!("Add to client:  claude mcp add --transport http hss {}", mcp.server_url()),
             Style::default().fg(Color::DarkGray),
         )),
     ];

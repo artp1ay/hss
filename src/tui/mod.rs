@@ -5,6 +5,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::config::AppConfig;
 use crate::types::{Credential, CredentialForm, DeletePopup, Host, HostForm, ServerRecord};
 
+pub mod audit_screen;
 pub mod copy_id;
 pub mod credentials_screen;
 pub mod delete_popup;
@@ -22,6 +23,7 @@ pub enum Screen {
     Main,
     Credentials,
     Settings,
+    Audit,
     CredentialPicker { host_idx: usize, after_failure: bool },
     HostForm,      // overlay for add/edit host
     ImportHosts,   // overlay for importing from INI file path
@@ -35,6 +37,8 @@ pub struct App {
     pub credentials: Vec<Credential>,
     pub config: AppConfig,
     pub server_records: Vec<ServerRecord>,
+    // Audit state
+    pub audit_state: Option<crate::audit::AuditState>,
     // Main screen state
     pub search_query: String,
     pub search_cursor: usize,
@@ -74,6 +78,7 @@ impl App {
             credentials,
             config,
             server_records,
+            audit_state: None,
             search_query: String::new(),
             search_cursor: 0,
             selected_row: 0,
@@ -137,6 +142,23 @@ impl App {
         self.credentials = crate::config::load_credentials()?;
         Ok(())
     }
+
+    pub fn start_audit(&mut self) {
+        let mut state = crate::audit::AuditState::new(&self.hosts);
+        state.start_all(
+            self.hosts.clone(),
+            self.credentials.clone(),
+            self.server_records.clone(),
+            self.config.clone(),
+        );
+        self.audit_state = Some(state);
+    }
+
+    pub fn poll_audit(&mut self) {
+        if let Some(ref mut state) = self.audit_state {
+            state.poll();
+        }
+    }
 }
 
 pub fn setup_terminal() -> Result<Term> {
@@ -152,25 +174,75 @@ pub fn restore_terminal(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
+pub fn wrap_hotkey_lines<'a>(pairs: &[(&'a str, &'a str)], max_width: u16) -> Vec<ratatui::text::Line<'a>> {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+
+    let width = (max_width as usize).max(20);
+    let mut lines = Vec::new();
+    let mut current_spans = Vec::new();
+    let mut current_len = 0;
+
+    for (key, label) in pairs {
+        let item_len = key.chars().count() + 2 + 1 + label.chars().count();
+        let sep_len = if current_len > 0 { 2 } else { 0 };
+
+        if current_len > 0 && current_len + sep_len + item_len > width {
+            lines.push(Line::from(current_spans));
+            current_spans = Vec::new();
+            current_len = 0;
+        }
+
+        if current_len > 0 {
+            current_spans.push(Span::raw("  "));
+            current_len += 2;
+        }
+
+        current_spans.push(Span::styled(
+            format!("[{key}]"),
+            Style::default().fg(Color::Blue),
+        ));
+        current_spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+        current_len += item_len;
+    }
+
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
 /// Tear down TUI, run SSH, re-init TUI. Saves credential on success; shows picker on auth failure.
-pub fn do_connect(terminal: &mut Term, app: &mut App, host_name: &str, cred: &Credential) -> Result<()> {
-    let host = app.hosts.iter().find(|h| h.name == host_name || h.ip == host_name).cloned();
-    let (ip, port) = host.as_ref().map(|h| (h.ip.clone(), h.port)).unwrap_or_else(|| (host_name.to_string(), 22));
+pub fn do_connect(terminal: &mut Term, app: &mut App, host_id: &str, cred: &Credential) -> Result<()> {
+    let host = app.hosts.iter().find(|h| h.id == host_id).cloned();
+    let (ip, port) = host.as_ref().map(|h| (h.ip.clone(), h.port)).unwrap_or_else(|| (host_id.to_string(), 22));
     let jump = host.as_ref().and_then(|h| crate::ssh::jump_spec(&app.hosts, h));
-    let host_id = host.as_ref().map(|h| h.id.clone());
 
     restore_terminal(terminal)?;
-    let status = crate::ssh::spawn_ssh(&ip, port, cred, &app.config, jump.as_deref())?;
+    let status = match crate::ssh::spawn_ssh(&ip, port, cred, &app.config, jump.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            *terminal = setup_terminal()?;
+            return Err(e);
+        }
+    };
     *terminal = setup_terminal()?;
 
     if status.success() {
-        if let Some(ref id) = host_id {
-            app.save_last_credential(id, &cred.id)?;
+        if let Some(ref h) = host {
+            app.save_last_credential(&h.id, &cred.id)?;
         }
         app.status_message = None;
     } else if status.code() == Some(255) {
-        // Likely auth failure — show picker
-        if let Some(idx) = app.hosts.iter().position(|h| h.name == host_name) {
+        if let Some(idx) = host.as_ref().and_then(|h| app.hosts.iter().position(|x| x.id == h.id)) {
             app.screen = Screen::CredentialPicker { host_idx: idx, after_failure: true };
         }
         app.status_message = Some("Authentication failed. Choose different credentials.".into());
@@ -195,6 +267,8 @@ pub fn run() -> Result<()> {
 
 fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
     loop {
+        app.poll_audit();
+
         terminal.draw(|f| draw(f, app))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
@@ -217,6 +291,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::Main => main_screen::draw(f, app),
         Screen::Credentials => credentials_screen::draw(f, app),
         Screen::Settings => settings_screen::draw(f, app),
+        Screen::Audit => audit_screen::draw(f, app),
         Screen::CredentialPicker { .. } => {
             main_screen::draw(f, app);
             popup::draw(f, app);
@@ -250,6 +325,7 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
         Screen::Main => main_screen::handle_key(terminal, app, key),
         Screen::Credentials => credentials_screen::handle_key(terminal, app, key),
         Screen::Settings => settings_screen::handle_key(app, key),
+        Screen::Audit => audit_screen::handle_key(terminal, app, key),
         Screen::CredentialPicker { host_idx, after_failure } => {
             popup::handle_key(terminal, app, key, host_idx, after_failure)
         }

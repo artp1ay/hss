@@ -12,12 +12,17 @@ use crate::tui::{App, Screen};
 // Field indices
 const FIELD_DEFAULT_USER: usize = 0;
 const FIELD_DEFAULT_PORT: usize = 1;
-const FIELD_CONNECT_TIMEOUT: usize = 2;
-const FIELD_STRICT_HOST: usize = 3;
-const FIELD_SSH_EXTRA_ARGS: usize = 4;
-const FIELD_AUTO_SAVE: usize = 5;
-const FIELD_EXEC_TIMEOUT: usize = 6;
-const FIELD_COUNT: usize = 7;
+const FIELD_DEFAULT_GROUP: usize = 2;
+const FIELD_CONNECT_TIMEOUT: usize = 3;
+const FIELD_STRICT_HOST: usize = 4;
+const FIELD_SSH_EXTRA_ARGS: usize = 5;
+const FIELD_AUTO_SAVE: usize = 6;
+const FIELD_EXEC_TIMEOUT: usize = 7;
+const FIELD_MCP_PORT: usize = 8;
+const FIELD_MCP_TOKEN: usize = 9;
+const FIELD_MCP_LOG_FILE: usize = 10;
+const FIELD_AUDIT_TIMEOUT: usize = 11;
+const FIELD_COUNT: usize = 12;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -28,11 +33,20 @@ pub fn draw(f: &mut Frame, app: &App) {
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
+    let hotkey_pairs = &[
+        ("Tab", "next"),
+        ("BackTab", "prev"),
+        ("Space", "toggle"),
+        ("Enter/Esc", "save & back"),
+    ];
+    let hotkey_lines = crate::tui::wrap_hotkey_lines(hotkey_pairs, inner.width);
+    let hotkey_height = hotkey_lines.len() as u16;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),    // fields
-            Constraint::Length(1), // hotkeys
+            Constraint::Length(hotkey_height), // hotkeys
         ])
         .split(inner);
 
@@ -40,11 +54,16 @@ pub fn draw(f: &mut Frame, app: &App) {
     let field_defs: &[(&str, &str)] = &[
         ("Default User",      "fallback when host has no user set"),
         ("Default Port",      "port when host has no port set"),
+        ("Default Group",     "default group for newly created hosts"),
         ("Connect Timeout",   "seconds before SSH gives up"),
         ("Strict Host Check", "accept-new / yes / no  [Space] cycle"),
         ("SSH Extra Args",    "appended to all SSH commands"),
         ("Auto-Save Creds",   "remember last-used credential per host  [Space] toggle"),
         ("Exec Timeout",      "max seconds for MCP command (0=no limit, default 300)"),
+        ("MCP Port",          "HTTP port for MCP server (default 8822)"),
+        ("MCP Token",         "bearer token for MCP auth (empty = no auth required)"),
+        ("MCP Log File",      "file path for MCP request/response logging"),
+        ("Audit Timeout",     "seconds for ping & connection check (default 3)"),
     ];
 
     let rows: Vec<Row> = field_defs.iter().enumerate().map(|(i, (label, hint))| {
@@ -84,21 +103,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     f.render_stateful_widget(table, chunks[0], &mut state);
 
-    let default_cred = app.config.default_credential_id.as_deref()
-        .and_then(|id| app.credentials.iter().find(|c| c.id == id))
-        .map(|c| format!("default cred: {} · ", c.name))
-        .unwrap_or_default();
-
-    let hotkeys = Line::from(vec![
-        Span::styled(default_cred, Style::default().fg(Color::Yellow)),
-        Span::styled("[Tab]", Style::default().fg(Color::Blue)),
-        Span::styled(" next  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[Space]", Style::default().fg(Color::Blue)),
-        Span::styled(" toggle  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[Enter/Esc]", Style::default().fg(Color::Blue)),
-        Span::styled(" save & back", Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(hotkeys), chunks[1]);
+    f.render_widget(Paragraph::new(hotkey_lines), chunks[1]);
 }
 
 fn apply_inputs_to_config(app: &mut App) {
@@ -110,11 +115,28 @@ fn apply_inputs_to_config(app: &mut App) {
         Some(inputs[FIELD_DEFAULT_USER].trim().to_string())
     };
     app.config.default_port = inputs[FIELD_DEFAULT_PORT].trim().parse().unwrap_or(22);
+    app.config.default_group = if inputs[FIELD_DEFAULT_GROUP].trim().is_empty() {
+        "ungrouped".to_string()
+    } else {
+        inputs[FIELD_DEFAULT_GROUP].trim().to_string()
+    };
     app.config.connect_timeout = inputs[FIELD_CONNECT_TIMEOUT].trim().parse().unwrap_or(10);
     app.config.strict_host_checking = inputs[FIELD_STRICT_HOST].trim().to_string();
     app.config.ssh_extra_args = inputs[FIELD_SSH_EXTRA_ARGS].trim().to_string();
     app.config.auto_save_credential = inputs[FIELD_AUTO_SAVE] == "yes";
     app.config.exec_timeout = inputs[FIELD_EXEC_TIMEOUT].trim().parse().unwrap_or(300);
+    app.config.mcp_port = inputs[FIELD_MCP_PORT].trim().parse().unwrap_or(8822);
+    app.config.mcp_token = if inputs[FIELD_MCP_TOKEN].trim().is_empty() {
+        None
+    } else {
+        Some(inputs[FIELD_MCP_TOKEN].trim().to_string())
+    };
+    app.config.mcp_log_file = if inputs[FIELD_MCP_LOG_FILE].trim().is_empty() {
+        None
+    } else {
+        Some(inputs[FIELD_MCP_LOG_FILE].trim().to_string())
+    };
+    app.config.audit_timeout = inputs[FIELD_AUDIT_TIMEOUT].trim().parse().unwrap_or(3);
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {

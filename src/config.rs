@@ -10,8 +10,11 @@ pub fn config_dir() -> PathBuf {
 }
 
 fn default_port() -> u16 { 22 }
-fn default_timeout() -> u8 { 10 }
+fn default_group() -> String { "ungrouped".to_string() }
+fn default_timeout() -> u16 { 10 }
 fn default_exec_timeout() -> u32 { 300 }
+fn default_mcp_port() -> u16 { 8822 }
+fn default_audit_timeout() -> u16 { 3 }
 fn default_strict_host_checking() -> String { "accept-new".to_string() }
 fn default_true() -> bool { true }
 
@@ -21,11 +24,25 @@ pub struct AppConfig {
     pub default_user: Option<String>,
     #[serde(default = "default_port")]
     pub default_port: u16,
+    #[serde(default = "default_group")]
+    pub default_group: String,
     #[serde(default = "default_timeout")]
-    pub connect_timeout: u8,
+    pub connect_timeout: u16,
     /// Max seconds an MCP execute-command may run (0 = no limit).
     #[serde(default = "default_exec_timeout")]
     pub exec_timeout: u32,
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
+    /// Optional bearer token for MCP server authentication.
+    /// Can also be set via HSS_MCP_TOKEN env var.
+    #[serde(default)]
+    pub mcp_token: Option<String>,
+    /// Optional file path for logging MCP requests/responses.
+    #[serde(default)]
+    pub mcp_log_file: Option<String>,
+    /// Timeout in seconds for connectivity and auth audit tests.
+    #[serde(default = "default_audit_timeout")]
+    pub audit_timeout: u16,
     #[serde(default)]
     pub ssh_extra_args: String,
     #[serde(default = "default_strict_host_checking")]
@@ -40,8 +57,13 @@ impl Default for AppConfig {
             default_credential_id: None,
             default_user: None,
             default_port: 22,
+            default_group: "ungrouped".to_string(),
             connect_timeout: 10,
             exec_timeout: 300,
+            mcp_port: 8822,
+            mcp_token: None,
+            mcp_log_file: None,
+            audit_timeout: 3,
             ssh_extra_args: String::new(),
             strict_host_checking: "accept-new".to_string(),
             auto_save_credential: true,
@@ -129,10 +151,12 @@ pub fn load_credentials() -> Result<Vec<Credential>> {
 }
 
 pub fn save_credentials(creds: &[Credential]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let dir = config_dir();
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join("credentials.toml.tmp");
     std::fs::write(&tmp, serialize_credentials(creds)?)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     std::fs::rename(tmp, dir.join("credentials.toml"))?;
     Ok(())
 }
@@ -182,4 +206,13 @@ pub fn migrate_server_records(records: Vec<ServerRecord>, hosts: &[Host]) -> Vec
         }
         r
     }).collect()
+}
+
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return format!("{}{}", home.display(), &path[1..]);
+        }
+    }
+    path.to_string()
 }

@@ -1,12 +1,16 @@
 //! Minimal MCP server (streamable HTTP transport, JSON-RPC over POST).
 //! Exposes hss hosts to MCP clients: `list-servers` and `execute-command`.
+//!
+//! Set `HSS_MCP_TOKEN` env var or `mcp_token` in config.toml to require a
+//! Bearer token. When unset the server accepts unauthenticated requests.
+//! Hosts/credentials are re-read from disk on every tool call, so changes
+//! made in a second hss window are visible without restart.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-// ponytail: fixed localhost port; add a config field when someone actually needs to change it
 pub const MCP_PORT: u16 = 8822;
 
 /// Severity of a log entry; drives colour in the MCP screen.
@@ -47,6 +51,7 @@ pub struct LogState {
     pub tool_calls: u64,
     pub errors: u64,
     pub client: Option<String>,
+    pub log_file: Option<std::path::PathBuf>,
 }
 
 pub type Log = Arc<Mutex<LogState>>;
@@ -56,27 +61,48 @@ pub struct McpServer {
     thread: Option<std::thread::JoinHandle<()>>,
     pub log: Log,
     pub started: Instant,
+    pub port: u16,
 }
 
 impl McpServer {
     pub fn start() -> Result<Self> {
-        let server = tiny_http::Server::http(("127.0.0.1", MCP_PORT))
-            .map_err(|e| anyhow::anyhow!("MCP server failed to bind 127.0.0.1:{MCP_PORT}: {e}"))?;
+        let cfg = crate::config::load_config().unwrap_or_default();
+        let port = if cfg.mcp_port != 0 { cfg.mcp_port } else { MCP_PORT };
+        let server = tiny_http::Server::http(("127.0.0.1", port))
+            .map_err(|e| anyhow::anyhow!("MCP server failed to bind 127.0.0.1:{port}: {e}"))?;
         let server = Arc::new(server);
-        let log: Log = Arc::new(Mutex::new(LogState::default()));
+
+        let log_file = cfg.mcp_log_file.as_deref().and_then(|p| {
+            let p = p.trim();
+            if p.is_empty() { None } else { Some(std::path::PathBuf::from(crate::config::expand_tilde(p))) }
+        });
+
+        let mut initial_state = LogState::default();
+        initial_state.log_file = log_file;
+        let log: Log = Arc::new(Mutex::new(initial_state));
         let started = Instant::now();
-        log_line(&log, started, Level::Info, "server", format!("listening on http://127.0.0.1:{MCP_PORT}"), vec![
+
+        let token = resolve_mcp_token();
+        let auth_hint = if token.is_some() { "auth: bearer token required" } else { "auth: none (set HSS_MCP_TOKEN or mcp_token in config.toml)" };
+        log_line(&log, started, Level::Info, "server", format!("listening on http://127.0.0.1:{port}"), vec![
             "transport: streamable HTTP (JSON-RPC over POST)".into(),
             "tools: list-servers, execute-command".into(),
+            auth_hint.into(),
         ]);
 
         let (srv, lg) = (server.clone(), log.clone());
-        let thread = std::thread::spawn(move || serve_loop(srv, lg, started));
-        Ok(Self { server, thread: Some(thread), log, started })
+        let thread = std::thread::spawn(move || serve_loop(srv, lg, started, token));
+        Ok(Self { server, thread: Some(thread), log, started, port })
     }
 
     pub fn url() -> String {
-        format!("http://127.0.0.1:{MCP_PORT}")
+        let port = crate::config::load_config().map(|c| c.mcp_port).unwrap_or(MCP_PORT);
+        let port = if port != 0 { port } else { MCP_PORT };
+        format!("http://127.0.0.1:{port}")
+    }
+
+    pub fn server_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
     }
 
     pub fn stop(mut self) {
@@ -92,6 +118,18 @@ fn log_line(log: &Log, started: Instant, level: Level, tag: &str, msg: String, d
     if level == Level::Err {
         l.errors += 1;
     }
+
+    if let Some(ref path) = l.log_file {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let at = started.elapsed().as_secs_f64();
+            let _ = writeln!(f, "[{:>7.2}s] [{}] [{:<8}] {}", at, level.label(), tag, msg);
+            for d in &detail {
+                let _ = writeln!(f, "    | {d}");
+            }
+        }
+    }
+
     l.entries.push(LogEntry {
         at: started.elapsed().as_secs_f64(),
         level,
@@ -99,7 +137,7 @@ fn log_line(log: &Log, started: Instant, level: Level, tag: &str, msg: String, d
         msg,
         detail,
     });
-    // ponytail: cap memory; no scrollback beyond 500 entries
+    // Cap log memory to 500 entries
     if l.entries.len() > 500 {
         let drop = l.entries.len() - 500;
         l.entries.drain(..drop);
@@ -116,9 +154,44 @@ fn clip(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-fn serve_loop(server: Arc<tiny_http::Server>, log: Log, started: Instant) {
+fn resolve_mcp_token() -> Option<String> {
+    if let Ok(t) = std::env::var("HSS_MCP_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() { return Some(t); }
+    }
+    if let Ok(cfg) = crate::config::load_config() {
+        if let Some(t) = cfg.mcp_token {
+            let t = t.trim().to_string();
+            if !t.is_empty() { return Some(t); }
+        }
+    }
+    None
+}
+
+fn check_auth(request: &tiny_http::Request, token: &Option<String>) -> bool {
+    let Some(expected) = token else { return true };
+    for h in request.headers() {
+        if h.field.equiv("Authorization") {
+            if let Some(bearer) = h.value.as_str().strip_prefix("Bearer ") {
+                return bearer.trim() == expected;
+            }
+        }
+    }
+    false
+}
+
+fn serve_loop(server: Arc<tiny_http::Server>, log: Log, started: Instant, token: Option<String>) {
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
+
+        // Auth check (applies to all methods when a token is configured)
+        if !check_auth(&request, &token) {
+            log_line(&log, started, Level::Err, "auth", "rejected: invalid or missing Bearer token".into(), vec![
+                format!("{} {}", method, request.url()),
+            ]);
+            let _ = request.respond(make_response(401, Some(json!({"error": "unauthorized"}))));
+            continue;
+        }
 
         // Fast path: non-POST requests are answered inline.
         if method != tiny_http::Method::Post {

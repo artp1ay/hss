@@ -12,9 +12,13 @@ use crate::types::{CredentialForm, CredentialKind};
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+    let hotkeys = &[("A", "add"), ("E", "edit"), ("D", "delete"), ("*", "default"), ("Esc", "back")];
+    let hotkey_lines = crate::tui::wrap_hotkey_lines(hotkeys, area.width);
+    let hotkey_height = hotkey_lines.len() as u16;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(hotkey_height)])
         .split(area);
 
     f.render_widget(
@@ -71,7 +75,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     f.render_widget(
-        Paragraph::new(hotkey_line(&[("A", "add"), ("E", "edit"), ("D", "delete"), ("*", "default"), ("Esc", "back")])),
+        Paragraph::new(hotkey_lines),
         chunks[2],
     );
 
