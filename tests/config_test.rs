@@ -53,8 +53,14 @@ fn test_credentials_roundtrip() {
 fn test_server_records_roundtrip() {
     use hss::types::ServerRecord;
     let records = vec![
-        ServerRecord { host_id: "host-uuid-1".into(), last_credential_id: Some("cred-1".into()) },
-        ServerRecord { host_id: "host-uuid-2".into(), last_credential_id: None },
+        ServerRecord {
+            host_id: "host-uuid-1".into(),
+            last_credential_id: Some("cred-1".into()),
+        },
+        ServerRecord {
+            host_id: "host-uuid-2".into(),
+            last_credential_id: None,
+        },
     ];
     let s = hss::config::serialize_server_records(&records).unwrap();
     let parsed = hss::config::parse_server_records(&s).unwrap();
@@ -68,16 +74,77 @@ fn test_server_records_roundtrip() {
 fn test_migrate_server_records_rewrites_name_keyed_entries() {
     use hss::types::{Host, ServerRecord};
     let hosts = vec![Host {
-        id: "uuid-1".into(), name: "web1".into(), ip: "10.0.0.1".into(), group: "g".into(),
-        port: 22, user: None, tags: vec![], description: None, jump_host_id: None,
+        id: "uuid-1".into(),
+        name: "web1".into(),
+        ip: "10.0.0.1".into(),
+        group: "g".into(),
+        port: 22,
+        user: None,
+        tags: vec![],
+        description: None,
+        jump_host_id: None,
     }];
     let records = vec![
         // Old-style entry: host_id happens to equal the host's name
-        ServerRecord { host_id: "web1".into(), last_credential_id: Some("cred-a".into()) },
+        ServerRecord {
+            host_id: "web1".into(),
+            last_credential_id: Some("cred-a".into()),
+        },
         // Already-migrated entry: stays untouched
-        ServerRecord { host_id: "uuid-2".into(), last_credential_id: Some("cred-b".into()) },
+        ServerRecord {
+            host_id: "uuid-2".into(),
+            last_credential_id: Some("cred-b".into()),
+        },
     ];
     let migrated = hss::config::migrate_server_records(records, &hosts);
     assert_eq!(migrated[0].host_id, "uuid-1");
     assert_eq!(migrated[1].host_id, "uuid-2");
+}
+
+#[test]
+fn test_write_secure_file_sets_0600_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp_dir = std::env::temp_dir().join(format!("hss-test-perm-{}", uuid::Uuid::new_v4()));
+    hss::config::ensure_config_dir(&tmp_dir).unwrap();
+    let dir_mode = std::fs::metadata(&tmp_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700);
+
+    let test_file = tmp_dir.join("secret.toml");
+    hss::config::write_secure_file(&test_file, "secret = 123").unwrap();
+    let file_mode = std::fs::metadata(&test_file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode, 0o600);
+
+    let _ = std::fs::remove_dir_all(tmp_dir);
+}
+
+#[test]
+fn test_write_secure_atomic_file_creates_unique_temp_and_renames() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp_dir = std::env::temp_dir().join(format!("hss-test-atomic-{}", uuid::Uuid::new_v4()));
+    let target_file = tmp_dir.join("test.toml");
+
+    hss::config::write_secure_atomic_file(&target_file, "key = 'val'").unwrap();
+    assert!(target_file.exists());
+
+    let file_mode = std::fs::metadata(&target_file)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600);
+
+    let _ = std::fs::remove_dir_all(tmp_dir);
+}
+
+#[test]
+fn test_server_record_deserializes_with_legacy_name_alias() {
+    let toml_str = r#"
+        [[server]]
+        name = "host-foo"
+        last_credential_id = "cred-123"
+    "#;
+    let records = hss::config::parse_server_records(toml_str).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].host_id, "host-foo");
+    assert_eq!(records[0].last_credential_id, Some("cred-123".into()));
 }

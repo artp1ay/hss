@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git config *)",
+      "Bash(cargo build *)",
+      "Bash(git *)",
+      "Bash(rustc --version)",
+      "Bash(rustup show *)",
+      "Bash(~/.cargo/bin/cargo build *)",
+      "Bash(cargo tree *)",
+      "Bash(cargo test *)",
+      "Bash(/home/max/.rustup/toolchains/stable-aarch64-unknown-linux-gnu/bin/cargo test *)",
+      "Read(//usr/bin/**)",
+      "Read(//usr/local/bin/**)",
+      "Bash(~/.cargo/bin/cargo test *)",
+      "Bash(/home/max/.cargo/bin/cargo test *)",
+      "Bash(/home/max/.cargo/bin/cargo build *)"
+    ]
+  }
+}

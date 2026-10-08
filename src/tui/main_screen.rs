@@ -14,10 +14,16 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Hotkey bar computed first so height is dynamic and fits terminal width
     let hotkey_pairs: &[(&str, &str)] = if app.search_focused {
-        &[("←/→", "cursor"), ("Esc", "clear/back"), ("Tab", "table")]
+        &[
+            ("←/→", "cursor"),
+            ("Enter", "apply"),
+            ("Esc", "clear / close search"),
+            ("Tab", "table"),
+        ]
     } else {
         &[
             ("Enter", "connect"),
+            ("/", "search"),
             ("N", "new"),
             ("E", "edit"),
             ("D", "delete"),
@@ -59,7 +65,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
         if let Some(ref msg) = app.status_message {
-            Span::styled(format!("  ⚠ {msg}"), Style::default().fg(Color::Yellow))
+            let (icon, color) = match msg.kind {
+                crate::types::StatusKind::Success => ("✓", Color::Green),
+                crate::types::StatusKind::Info => ("i", Color::Cyan),
+                crate::types::StatusKind::Warning => ("!", Color::Yellow),
+                crate::types::StatusKind::Error => ("✗", Color::Red),
+            };
+            Span::styled(
+                format!("  {icon} {}", msg.text),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
         } else {
             Span::raw("")
         },
@@ -73,10 +88,13 @@ pub fn draw(f: &mut Frame, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
     let search_content = if app.search_query.is_empty() && !app.search_focused {
-        Line::from(Span::styled(
-            "Search...",
-            Style::default().fg(Color::DarkGray),
-        ))
+        Line::from(vec![
+            Span::styled("Search...", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                " (press [/] to type, [Esc] clear/close)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else if app.search_focused {
         Line::from(crate::tui::input::spans(
             &app.search_query,
@@ -121,8 +139,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Cell::from(h.group.clone()).style(Style::default().fg(group_color(&h.group))),
                 Cell::from(h.ip.clone()).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(h.port.to_string()).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(fit_tags(&h.tags, tags_width))
-                    .style(Style::default().fg(Color::Cyan)),
+                Cell::from(fit_tags(&h.tags, tags_width)).style(Style::default().fg(Color::Cyan)),
                 Cell::from(h.description.clone().unwrap_or_default())
                     .style(Style::default().fg(Color::DarkGray)),
             ])
@@ -170,19 +187,24 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(hotkey_lines), chunks[3]);
 }
 
-/// Join tags into `width` chars; when they don't fit, show whole tags
+/// Join tags into terminal `width` columns; when they don't fit, show whole tags
 /// that do fit plus a " +N" marker so hidden tags are visible.
 fn fit_tags(tags: &[String], width: usize) -> String {
     let full = tags.join(", ");
-    if full.chars().count() <= width {
+    if crate::tui::input::str_width(&full) <= width {
         return full;
     }
     let mut out = String::new();
     let mut shown = 0;
     for t in tags {
-        let cand = if out.is_empty() { t.clone() } else { format!("{out}, {t}") };
-        let suffix_len = format!(" +{}", tags.len() - shown - 1).chars().count();
-        if cand.chars().count() + suffix_len <= width {
+        let cand = if out.is_empty() {
+            t.clone()
+        } else {
+            format!("{out}, {t}")
+        };
+        let suffix = format!(" +{}", tags.len() - shown - 1);
+        let suffix_width = crate::tui::input::str_width(&suffix);
+        if crate::tui::input::str_width(&cand) + suffix_width <= width {
             out = cand;
             shown += 1;
         } else {
@@ -291,6 +313,17 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 app.config.exec_timeout.to_string(),
                 app.config.mcp_port.to_string(),
                 app.config.mcp_token.clone().unwrap_or_default(),
+                if app.config.mcp_read_only {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
+                app.config.mcp_allowed_hosts.clone(),
+                if app.config.mcp_dlp_filter {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
                 app.config.mcp_log_file.clone().unwrap_or_default(),
                 app.config.audit_timeout.to_string(),
             ];
@@ -316,9 +349,14 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             connect_selected(terminal, app)?;
         }
         KeyCode::Char('n') | KeyCode::Char('N') if !app.search_focused => {
+            let default_port = if app.config.default_port != 0 {
+                app.config.default_port.to_string()
+            } else {
+                "22".into()
+            };
             app.host_form = Some(crate::types::HostForm {
                 editing_id: None,
-                port: "22".into(),
+                port: default_port,
                 group: app.config.default_group.clone(),
                 ..Default::default()
             });
@@ -339,6 +377,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     jump_host_id: h.jump_host_id.clone(),
                     focused: 0,
                     cursor: crate::tui::input::end_of(&h.name),
+                    error_message: None,
                 });
                 app.screen = Screen::HostForm;
             }
@@ -350,7 +389,9 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     app.hosts.remove(idx);
                     app.save_hosts()?;
                     app.selected_row = app.selected_row.min(app.hosts.len().saturating_sub(1));
-                    app.status_message = Some(format!("Host '{name}' deleted."));
+                    app.status_message = Some(crate::types::StatusMessage::info(format!(
+                        "Host '{name}' deleted."
+                    )));
                 } else {
                     app.delete_popup = Some(crate::types::DeletePopup {
                         kind: crate::types::DeleteKind::Host,
@@ -365,11 +406,15 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             if let Some(idx) = get_host_idx_in_all(app) {
                 let host = &app.hosts[idx];
                 let mut keys: Vec<(String, bool)> = crate::ssh::find_public_keys(&app.credentials)
-                    .into_iter().map(|p| (p, false)).collect();
+                    .into_iter()
+                    .map(|p| (p, false))
+                    .collect();
                 if keys.len() == 1 {
                     keys[0].1 = true;
                 }
-                let user = host.user.clone()
+                let user = host
+                    .user
+                    .clone()
                     .or_else(|| app.config.default_user.clone())
                     .or_else(|| std::env::var("USER").ok())
                     .unwrap_or_default();
@@ -389,7 +434,9 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     app.screen = Screen::McpServer;
                     app.status_message = None;
                 }
-                Err(e) => app.status_message = Some(format!("{e}")),
+                Err(e) => {
+                    app.status_message = Some(crate::types::StatusMessage::error(format!("{e}")));
+                }
             }
         }
         KeyCode::Char('i') | KeyCode::Char('I') if !app.search_focused => {
@@ -401,47 +448,6 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         _ => {}
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::KeyModifiers;
-
-    fn test_app() -> App {
-        App::new(vec![], vec![], crate::config::AppConfig::default(), vec![])
-    }
-
-    #[test]
-    fn search_typing_does_not_trigger_hotkeys() {
-        let mut app = test_app();
-        let mut term = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout())).unwrap();
-        app.search_focused = true;
-        for c in "quit".chars() {
-            handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)).unwrap();
-        }
-        assert_eq!(app.search_query, "quit");
-        assert!(!app.should_quit, "'q' must type in search, not quit");
-
-        // Left/Right move the cursor; insert lands at the cursor
-        handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
-        handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE)).unwrap();
-        assert_eq!(app.search_query, "qui-t");
-
-        // Unfocused, 'q' still quits
-        app.search_focused = false;
-        handle_key(&mut term, &mut app, KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)).unwrap();
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn fit_tags_fits_truncates_and_marks_hidden() {
-        let tags: Vec<String> = ["web", "prod", "db"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(fit_tags(&tags, 28), "web, prod, db");
-        assert_eq!(fit_tags(&tags, 10), "web +2");
-        assert_eq!(fit_tags(&tags, 2), "+3");
-        assert_eq!(fit_tags(&[], 10), "");
-    }
 }
 
 fn get_host_idx_in_all(app: &App) -> Option<usize> {
@@ -477,4 +483,70 @@ fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn test_app() -> App {
+        App::new(vec![], vec![], crate::config::AppConfig::default(), vec![])
+    }
+
+    #[test]
+    fn search_typing_does_not_trigger_hotkeys() {
+        let mut app = test_app();
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+                .unwrap();
+        app.search_focused = true;
+        for c in "quit".chars() {
+            handle_key(
+                &mut term,
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(app.search_query, "quit");
+        assert!(!app.should_quit, "'q' must type in search, not quit");
+
+        // Left/Right move the cursor; insert lands at the cursor
+        handle_key(
+            &mut term,
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle_key(
+            &mut term,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.search_query, "qui-t");
+
+        // Unfocused, 'q' still quits
+        app.search_focused = false;
+        handle_key(
+            &mut term,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn fit_tags_fits_truncates_and_marks_hidden() {
+        let tags: Vec<String> = ["web", "prod", "db"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(fit_tags(&tags, 28), "web, prod, db");
+        assert_eq!(fit_tags(&tags, 10), "web +2");
+        assert_eq!(fit_tags(&tags, 2), "+3");
+        assert_eq!(fit_tags(&[], 10), "");
+    }
 }

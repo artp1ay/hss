@@ -41,13 +41,38 @@ if [ -z "$URL" ]; then
   exit 1
 fi
 
-# ── Download → temp → atomic move ────────────────────────────────────────────
+# ── Download → verify checksum → atomic move ──────────────────────────────────
 mkdir -p "$INSTALL_DIR"
 TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
+TMP_SUMS=$(mktemp)
+trap 'rm -f "$TMP" "$TMP_SUMS"' EXIT
 
 echo "Installing ${BIN} ${TAG} → ${INSTALL_DIR}/${BIN}"
 curl -fL --progress-bar "$URL" -o "$TMP"
+
+# Download SHA256SUMS if present and verify
+CHECKSUMS_URL="https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS"
+if curl -fsSL "$CHECKSUMS_URL" -o "$TMP_SUMS" 2>/dev/null; then
+  EXPECTED_HASH=$(grep "  ${ASSET}\$" "$TMP_SUMS" | awk '{print $1}' || grep " ${ASSET}\$" "$TMP_SUMS" | awk '{print $1}' || true)
+  if [ -n "$EXPECTED_HASH" ]; then
+    if command -v sha256sum &>/dev/null; then
+      ACTUAL_HASH=$(sha256sum "$TMP" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+      ACTUAL_HASH=$(shasum -a 256 "$TMP" | awk '{print $1}')
+    else
+      ACTUAL_HASH=""
+    fi
+
+    if [ -n "$ACTUAL_HASH" ]; then
+      if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+        echo "error: SHA256 mismatch! Expected: ${EXPECTED_HASH}, got: ${ACTUAL_HASH}" >&2
+        exit 1
+      fi
+      echo "Verified SHA256: ${ACTUAL_HASH}"
+    fi
+  fi
+fi
+
 chmod +x "$TMP"
 mv "$TMP" "${INSTALL_DIR}/${BIN}"
 trap - EXIT

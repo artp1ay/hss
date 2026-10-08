@@ -25,9 +25,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Title bar
-            Constraint::Length(3), // Summary bar
-            Constraint::Min(0),    // Table
+            Constraint::Length(1),             // Title bar
+            Constraint::Length(3),             // Summary bar
+            Constraint::Min(0),                // Table
             Constraint::Length(hotkey_height), // Hotkey bar
         ])
         .split(area);
@@ -79,15 +79,39 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 
     let summary_line = Line::from(vec![
-        Span::styled(format!("Total: {}  ·  ", state.total), Style::default().fg(Color::White)),
-        Span::styled(format!("● OK: {ok_cnt}  "), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("⚠ Auth Fail: {auth_cnt}  "), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("✖ Down: {unreach_cnt}  "), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("? No Creds: {no_cred_cnt}  "), Style::default().fg(Color::Magenta)),
+        Span::styled(
+            format!("Total: {}  ·  ", state.total),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!("● OK: {ok_cnt}  "),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("⚠ Auth Fail: {auth_cnt}  "),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("✖ Down: {unreach_cnt}  "),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("? No Creds: {no_cred_cnt}  "),
+            Style::default().fg(Color::Magenta),
+        ),
         if state.is_running {
             Span::styled(
-                format!("⏳ In Progress [{}/{}] ({} left)", state.completed, state.total, checking_cnt),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                format!(
+                    "⏳ In Progress [{}/{}] ({} left)",
+                    state.completed, state.total, checking_cnt
+                ),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled("✓ Finished", Style::default().fg(Color::DarkGray))
@@ -112,7 +136,13 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // 3. Table
     let header = Row::new(vec![
-        "STATUS", "HOST", "GROUP", "ADDRESS", "LATENCY", "CREDENTIAL", "DETAILS",
+        "STATUS",
+        "HOST",
+        "GROUP",
+        "ADDRESS",
+        "LATENCY",
+        "CREDENTIAL",
+        "DETAILS",
     ])
     .style(
         Style::default()
@@ -125,9 +155,22 @@ pub fn draw(f: &mut Frame, app: &App) {
         .iter()
         .map(|r| {
             let (status_badge, status_style) = match &r.status {
-                HostStatus::Ok => ("● OK", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                HostStatus::AuthFailed(_) => ("⚠ AUTH", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                HostStatus::Unreachable(_) => ("✖ DOWN", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                HostStatus::Ok => (
+                    "● OK",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                HostStatus::AuthFailed(_) => (
+                    "⚠ AUTH",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                HostStatus::Unreachable(_) => (
+                    "✖ DOWN",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 HostStatus::PortClosed(_) => ("⊘ CLOSED", Style::default().fg(Color::Red)),
                 HostStatus::NoCredential => ("? NO CRED", Style::default().fg(Color::Magenta)),
                 HostStatus::Checking => ("⏳ CHECK", Style::default().fg(Color::Cyan)),
@@ -227,7 +270,11 @@ fn group_color(group: &str) -> Color {
 }
 
 pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
-    let results_len = app.audit_state.as_ref().map(|s| s.results.len()).unwrap_or(0);
+    let results_len = app
+        .audit_state
+        .as_ref()
+        .map(|s| s.results.len())
+        .unwrap_or(0);
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -272,7 +319,12 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
 
             if let Some(host_id) = selected_host_id {
                 let last_cred_id = app.last_credential_id(&host_id).map(|s| s.to_string());
-                let cred = crate::ssh::resolve_credential(&app.credentials, &app.config, last_cred_id.as_deref())?.cloned();
+                let cred = crate::ssh::resolve_credential(
+                    &app.credentials,
+                    &app.config,
+                    last_cred_id.as_deref(),
+                )?
+                .cloned();
                 if let Some(c) = cred {
                     crate::tui::do_connect(terminal, app, &host_id, &c)?;
                 } else {

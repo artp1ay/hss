@@ -59,15 +59,38 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 |---|---|
 | `↑↓` / `j k` | Navigate |
 | `Enter` | Connect |
-| `/` | Search |
+| `/` | Search (Esc to clear, Esc again to exit) |
 | `N` | Add host |
 | `E` | Edit selected host |
 | `D` | Delete (with confirmation) |
-| `I` | Import / Export Ansible INI |
+| `A` | Connectivity & auth audit |
+| `P` | Copy public keys (`ssh-copy-id`) |
+| `I` | Import / Export Ansible INI / SSH config |
 | `R` | Switch credential for selected host |
+| `M` | Start/view local MCP server |
 | `C` | Manage credentials |
 | `S` | Settings |
 | `Q` | Quit |
+
+## MCP Server (Model Context Protocol)
+
+`hss` can serve as an MCP server for LLM agents (Claude Desktop, Zed, Cursor, OpenCode):
+
+- **Tools exposed:** `list-servers`, `execute-command`.
+- **Zero-knowledge security:** private keys and passwords never leave `hss`; commands are executed locally through SSH sessions.
+- **DLP Protection:** automatic redaction of detected private keys and certificates in command outputs.
+- **Read-Only guard:** optional blocking of destructive commands (`rm`, `sudo`, `dd`, `shutdown`).
+- **Host scoping:** restrict MCP access to specific server globs or tags (e.g. `tag:mcp`).
+
+Run over Stdio (recommended for Zed / Claude Desktop config):
+```sh
+hss --mcp-stdio
+```
+
+Or standalone HTTP daemon:
+```sh
+hss --mcp
+```
 
 ## Config
 
@@ -76,7 +99,7 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 | Linux | `~/.config/hss/` |
 | macOS | `~/Library/Application Support/hss/` |
 
-`config.toml` — settings · `hosts.toml` — server list · `records.toml` — last-used credentials
+`config.toml` — settings · `hosts.toml` — server list · `servers.toml` — last-used credentials
 
 Passwords are stored in the system keychain, not in any config file.
 

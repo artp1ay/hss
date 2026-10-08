@@ -1,23 +1,27 @@
+use crate::tui::{App, Screen, Term};
+use crate::types::{Host, HostForm};
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
 };
-use crossterm::event::{KeyCode, KeyEvent};
-use anyhow::Result;
 use uuid::Uuid;
-use crate::tui::{App, Screen, Term};
-use crate::types::{Host, HostForm};
 
 pub fn draw(f: &mut Frame, app: &App) {
     let Some(form) = &app.host_form else { return };
 
-    let area = centered_rect(60, 80, f.area());
+    let area = crate::tui::adaptive_centered_rect(60, 80, 70, 22, f.area());
     f.render_widget(Clear, area);
 
-    let title = if form.editing_id.is_some() { " Edit Host " } else { " Add Host " };
+    let title = if form.editing_id.is_some() {
+        " Edit Host "
+    } else {
+        " Add Host "
+    };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -25,10 +29,16 @@ pub fn draw(f: &mut Frame, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Layout: 8 field rows + 1 hotkey row
-    let constraints: Vec<Constraint> = (0..9).map(|i| {
-        if i == 8 { Constraint::Length(1) } else { Constraint::Length(2) }
-    }).collect();
+    // Layout: 8 field rows + 1 error row + 1 hotkey row
+    let constraints: Vec<Constraint> = (0..10)
+        .map(|i| {
+            if i >= 8 {
+                Constraint::Length(1)
+            } else {
+                Constraint::Length(2)
+            }
+        })
+        .collect();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -48,7 +58,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     for (i, (label, value)) in fields.iter().enumerate() {
         let focused = form.focused == i;
         let label_style = if focused {
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -77,11 +89,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     {
         let focused = form.focused == 7;
         let label_style = if focused {
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let value = form.jump_host_id.as_deref()
+        let value = form
+            .jump_host_id
+            .as_deref()
             .and_then(|id| app.hosts.iter().find(|h| h.id == id))
             .map(|h| format!("{} ({})", h.name, h.ip))
             .unwrap_or_else(|| "(none)".into());
@@ -90,13 +106,29 @@ pub fn draw(f: &mut Frame, app: &App) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        let display = if focused { format!("◂ {value} ▸") } else { value };
+        let display = if focused {
+            format!("◂ {value} ▸")
+        } else {
+            value
+        };
         let line = Line::from(vec![
             Span::styled(format!("{:<18}", "Jump host"), label_style),
             Span::styled(display, input_style),
             Span::styled(" (←/→ to select)", Style::default().fg(Color::DarkGray)),
         ]);
         f.render_widget(Paragraph::new(line), chunks[7]);
+    }
+
+    // Inline validation error message
+    if let Some(ref err) = form.error_message {
+        let err_line = Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(err, Style::default().fg(Color::Red)),
+        ]);
+        f.render_widget(Paragraph::new(err_line), chunks[8]);
     }
 
     // Hotkeys
@@ -108,11 +140,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::styled("[Esc]", Style::default().fg(Color::Blue)),
         Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
     ]);
-    f.render_widget(Paragraph::new(hotkeys), chunks[8]);
+    f.render_widget(Paragraph::new(hotkeys), chunks[9]);
 }
 
 pub fn draw_import(f: &mut Frame, app: &App) {
-    let area = centered_rect(60, 50, f.area());
+    let area = crate::tui::adaptive_centered_rect(60, 50, 60, 16, f.area());
     f.render_widget(Clear, area);
 
     let mode = app.import_export_mode;
@@ -143,10 +175,14 @@ pub fn draw_import(f: &mut Frame, app: &App) {
         .split(inner);
 
     // Mode toggle
-    let style_for = |m: usize| if m == mode {
-        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    let style_for = |m: usize| {
+        if m == mode {
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -160,9 +196,16 @@ pub fn draw_import(f: &mut Frame, app: &App) {
         chunks[0],
     );
 
-    let label = if mode == 0 { "Path to inventory file:" } else { "Save to path:" };
+    let label = if mode == 0 {
+        "Path to inventory file:"
+    } else {
+        "Save to path:"
+    };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(label, Style::default().fg(Color::DarkGray)))),
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::DarkGray),
+        ))),
         chunks[2],
     );
 
@@ -198,7 +241,10 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
 
     // Text fields (0..=6) get full line editing; field 7 is the jump-host selector.
     if app.host_form.as_ref().unwrap().focused != 7
-        && !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter)
+        && !matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter
+        )
     {
         let form = app.host_form.as_mut().unwrap();
         let mut cursor = form.cursor;
@@ -243,7 +289,9 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
 /// Cycle jump host selection through "(none)" + all hosts except the one being edited.
 fn cycle_jump_host(app: &mut App, forward: bool) {
     let form = app.host_form.as_ref().unwrap();
-    let candidates: Vec<String> = app.hosts.iter()
+    let candidates: Vec<String> = app
+        .hosts
+        .iter()
         .filter(|h| Some(&h.id) != form.editing_id.as_ref())
         .map(|h| h.id.clone())
         .collect();
@@ -251,14 +299,24 @@ fn cycle_jump_host(app: &mut App, forward: bool) {
         return;
     }
     // Options: None, candidates[0], candidates[1], ...
-    let current = form.jump_host_id.as_ref()
+    let current = form
+        .jump_host_id
+        .as_ref()
         .and_then(|id| candidates.iter().position(|c| c == id))
         .map(|p| p + 1)
         .unwrap_or(0);
     let total = candidates.len() + 1;
-    let next = if forward { (current + 1) % total } else { (current + total - 1) % total };
+    let next = if forward {
+        (current + 1) % total
+    } else {
+        (current + total - 1) % total
+    };
     let form = app.host_form.as_mut().unwrap();
-    form.jump_host_id = if next == 0 { None } else { Some(candidates[next - 1].clone()) };
+    form.jump_host_id = if next == 0 {
+        None
+    } else {
+        Some(candidates[next - 1].clone())
+    };
 }
 
 fn active_field(form: &mut HostForm) -> &mut String {
@@ -279,16 +337,72 @@ fn save_host(app: &mut App) -> Result<()> {
         None => return Ok(()),
     };
 
+    let set_error = |app: &mut App, err: String, focus: usize| {
+        if let Some(ref mut f) = app.host_form {
+            f.error_message = Some(err.clone());
+            f.focused = focus;
+            f.cursor = crate::tui::input::end_of(active_field(f));
+        }
+        app.status_message = Some(crate::types::StatusMessage::error(err));
+    };
+
     if form.name.trim().is_empty() {
-        app.status_message = Some("Name is required.".into());
+        set_error(app, "Name is required.".into(), 0);
+        return Ok(());
+    }
+
+    // Host name uniqueness validation
+    let trimmed_name = form.name.trim();
+    let name_conflict = app
+        .hosts
+        .iter()
+        .any(|h| h.name == trimmed_name && Some(&h.id) != form.editing_id.as_ref());
+    if name_conflict {
+        set_error(
+            app,
+            format!("Host name '{trimmed_name}' already exists."),
+            0,
+        );
+        return Ok(());
+    }
+
+    // Reserved group name validation
+    let trimmed_group = form.group.trim().to_lowercase();
+    if trimmed_group == "all" || trimmed_group == "_meta" {
+        set_error(
+            app,
+            format!(
+                "Group name '{}' is reserved by Ansible inventory and cannot be used.",
+                form.group.trim()
+            ),
+            2,
+        );
         return Ok(());
     }
     if form.ip.trim().is_empty() {
-        app.status_message = Some("IP / Hostname is required.".into());
+        set_error(app, "IP / Hostname is required.".into(), 1);
         return Ok(());
     }
-    let port: u16 = form.port.trim().parse().unwrap_or(22);
-    let tags: Vec<String> = form.tags.split(',')
+    if let Err(e) = crate::ssh::validate_host(form.ip.trim()) {
+        set_error(app, format!("Invalid IP / Hostname: {e}"), 1);
+        return Ok(());
+    }
+    if !form.user.trim().is_empty() {
+        if let Err(e) = crate::ssh::validate_username(form.user.trim()) {
+            set_error(app, format!("Invalid Username: {e}"), 4);
+            return Ok(());
+        }
+    }
+    let port: u16 = match form.port.trim().parse() {
+        Ok(p) if p > 0 => p,
+        _ => {
+            set_error(app, "Port must be a number between 1 and 65535.".into(), 3);
+            return Ok(());
+        }
+    };
+    let tags: Vec<String> = form
+        .tags
+        .split(',')
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect();
@@ -300,12 +414,23 @@ fn save_host(app: &mut App) -> Result<()> {
             h.ip = form.ip.trim().to_string();
             h.group = form.group.trim().to_string();
             h.port = port;
-            h.user = if form.user.trim().is_empty() { None } else { Some(form.user.trim().to_string()) };
+            h.user = if form.user.trim().is_empty() {
+                None
+            } else {
+                Some(form.user.trim().to_string())
+            };
             h.tags = tags;
-            h.description = if form.description.trim().is_empty() { None } else { Some(form.description.trim().to_string()) };
+            h.description = if form.description.trim().is_empty() {
+                None
+            } else {
+                Some(form.description.trim().to_string())
+            };
             h.jump_host_id = form.jump_host_id.clone();
         }
-        app.status_message = Some(format!("Host '{}' updated.", form.name.trim()));
+        app.status_message = Some(crate::types::StatusMessage::success(format!(
+            "Host '{}' updated.",
+            form.name.trim()
+        )));
     } else {
         // Add new host
         app.hosts.push(Host {
@@ -314,12 +439,23 @@ fn save_host(app: &mut App) -> Result<()> {
             ip: form.ip.trim().to_string(),
             group: form.group.trim().to_string(),
             port,
-            user: if form.user.trim().is_empty() { None } else { Some(form.user.trim().to_string()) },
+            user: if form.user.trim().is_empty() {
+                None
+            } else {
+                Some(form.user.trim().to_string())
+            },
             tags,
-            description: if form.description.trim().is_empty() { None } else { Some(form.description.trim().to_string()) },
+            description: if form.description.trim().is_empty() {
+                None
+            } else {
+                Some(form.description.trim().to_string())
+            },
             jump_host_id: form.jump_host_id.clone(),
         });
-        app.status_message = Some(format!("Host '{}' added.", form.name.trim()));
+        app.status_message = Some(crate::types::StatusMessage::success(format!(
+            "Host '{}' added.",
+            form.name.trim()
+        )));
     }
 
     app.save_hosts()?;
@@ -330,7 +466,10 @@ fn save_host(app: &mut App) -> Result<()> {
 
 pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
     if !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Enter) {
-        let (mut buf, mut cursor) = (std::mem::take(&mut app.import_path_input), app.import_cursor);
+        let (mut buf, mut cursor) = (
+            std::mem::take(&mut app.import_path_input),
+            app.import_cursor,
+        );
         let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
         app.import_path_input = buf;
         app.import_cursor = cursor;
@@ -361,11 +500,16 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
                 };
                 match std::fs::write(&path, &content) {
                     Ok(()) => {
-                        app.status_message = Some(format!("Exported {} hosts to {path}.", app.hosts.len()));
+                        app.status_message = Some(crate::types::StatusMessage::success(format!(
+                            "Exported {} hosts to {path}.",
+                            app.hosts.len()
+                        )));
                         app.screen = Screen::Main;
                     }
                     Err(e) => {
-                        app.status_message = Some(format!("Export error: {e}"));
+                        app.status_message = Some(crate::types::StatusMessage::error(format!(
+                            "Export error: {e}"
+                        )));
                     }
                 }
             } else {
@@ -374,13 +518,15 @@ pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> 
                         let count = crate::inventory::import_from_ini(&content, &mut app.hosts);
                         let updated = app.hosts.len();
                         app.save_hosts()?;
-                        app.status_message = Some(format!(
+                        app.status_message = Some(crate::types::StatusMessage::success(format!(
                             "Import complete: {count} new hosts added ({updated} total)."
-                        ));
+                        )));
                         app.screen = Screen::Main;
                     }
                     Err(e) => {
-                        app.status_message = Some(format!("Error reading file: {e}"));
+                        app.status_message = Some(crate::types::StatusMessage::error(format!(
+                            "Error reading file: {e}"
+                        )));
                     }
                 }
             }
@@ -397,23 +543,4 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(v[1])[1]
 }
