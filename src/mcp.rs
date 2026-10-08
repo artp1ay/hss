@@ -685,8 +685,9 @@ fn call_tool(
                 "tool",
                 format!("execute-command @ {host}"),
                 vec![
-                    format!("request id {req_id}"),
-                    format!("$ {}", clip(command, 100)),
+                    format!("request id: {req_id}"),
+                    format!("target host: {host}"),
+                    format!("exec command: {command}"),
                 ],
             );
             match crate::ssh::exec_command(host, command) {
@@ -695,18 +696,26 @@ fn call_tool(
                     let stdout = String::from_utf8_lossy(&out.stdout);
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     let ms = t0.elapsed().as_millis();
-                    let mut detail = vec![format!(
-                        "stdout {} lines/{} B · stderr {} lines/{} B",
-                        stdout.lines().count(),
-                        stdout.len(),
-                        stderr.lines().count(),
-                        stderr.len()
-                    )];
+                    let mut detail = vec![
+                        format!("exit status: {code} (duration: {ms} ms)"),
+                        format!(
+                            "stdout: {} bytes, {} lines",
+                            stdout.len(),
+                            stdout.lines().count()
+                        ),
+                    ];
                     if let Some(first) = stdout.lines().find(|l| !l.trim().is_empty()) {
-                        detail.push(format!("out: {}", clip(first, 100)));
+                        detail.push(format!("stdout sample: {}", clip(first, 120)));
                     }
-                    if let Some(err) = stderr.lines().find(|l| !l.trim().is_empty()) {
-                        detail.push(format!("err: {}", clip(err, 100)));
+                    if !stderr.is_empty() {
+                        detail.push(format!(
+                            "stderr: {} bytes, {} lines",
+                            stderr.len(),
+                            stderr.lines().count()
+                        ));
+                        if let Some(err) = stderr.lines().find(|l| !l.trim().is_empty()) {
+                            detail.push(format!("stderr sample: {}", clip(err, 120)));
+                        }
                     }
                     let level = if out.status.success() {
                         Level::Ok
@@ -718,7 +727,7 @@ fn call_tool(
                         started,
                         level,
                         "tool",
-                        format!("execute-command @ {host} → exit {code} ({ms} ms)"),
+                        format!("execute-command @ {host} finished (exit {code}, {ms} ms)"),
                         detail,
                     );
                     let mut text = format!("exit code: {code}\n");

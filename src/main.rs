@@ -17,6 +17,9 @@ struct Cli {
     host: Option<String>,
     /// Connect directly to host by name or IP
     direct_host: Option<String>,
+    /// Run headless MCP server directly in terminal without TUI
+    #[arg(long)]
+    mcp: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,6 +48,39 @@ fn main() -> anyhow::Result<()> {
         } else {
             println!("{{}}");
         }
+        return Ok(());
+    }
+
+    if cli.mcp {
+        println!("Starting hss MCP server in standalone mode...");
+        let server = hss::mcp::McpServer::start()?;
+        println!("hss MCP server listening on {}", server.server_url());
+        println!("Press Ctrl+C to stop.");
+
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = running.clone();
+
+        unsafe {
+            // Signal handler flag
+            static RUNNING_FLAG: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(true);
+            extern "C" fn handle_sigint(_: libc::c_int) {
+                RUNNING_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            libc::signal(
+                libc::SIGINT,
+                handle_sigint as *const () as libc::sighandler_t,
+            );
+            while RUNNING_FLAG.load(std::sync::atomic::Ordering::SeqCst)
+                && r.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+
+        println!("\nStopping MCP server...");
+        server.stop();
+        println!("MCP server stopped.");
         return Ok(());
     }
 

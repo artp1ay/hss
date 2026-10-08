@@ -75,6 +75,7 @@ pub struct App {
     pub import_export_mode: usize, // 0 = import INI, 1 = export INI, 2 = export ssh_config
     // MCP server (Some while running; screen is modal)
     pub mcp: Option<crate::mcp::McpServer>,
+    pub mcp_scroll_offset: usize,
     // ssh-copy-id overlay state
     pub copy_id_form: Option<crate::types::CopyIdForm>,
     pub copy_id_rx: Option<std::sync::mpsc::Receiver<CopyIdEvent>>,
@@ -116,6 +117,7 @@ impl App {
             import_cursor: 0,
             import_export_mode: 0,
             mcp: None,
+            mcp_scroll_offset: 0,
             copy_id_form: None,
             copy_id_rx: None,
             delete_popup: None,
