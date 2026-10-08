@@ -1099,7 +1099,10 @@ mod tests {
         };
         let server = match McpServer::start_with_config(&cfg) {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("Skipping payload_too_large_returns_413 in restricted CI sandbox: {e}");
+                return;
+            }
         };
 
         // Send payload > 1 MiB

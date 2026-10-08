@@ -22,7 +22,7 @@ jobs:
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features --locked -- --nocapture
 
   # ── Build for all targets (Linux + macOS) ────────────────────────────────
   build:
