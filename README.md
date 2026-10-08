@@ -72,6 +72,26 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 | `S` | Settings |
 | `Q` | Quit |
 
+## MCP Server (Model Context Protocol)
+
+`hss` can serve as an MCP server for LLM agents (Claude Desktop, Zed, Cursor, OpenCode):
+
+- **Tools exposed:** `list-servers`, `execute-command`.
+- **Zero-knowledge security:** private keys and passwords never leave `hss`; commands are executed locally through SSH sessions.
+- **DLP Protection:** automatic redaction of detected private keys and certificates in command outputs.
+- **Read-Only guard:** optional blocking of destructive commands (`rm`, `sudo`, `dd`, `shutdown`).
+- **Host scoping:** restrict MCP access to specific server globs or tags (e.g. `tag:mcp`).
+
+Run over Stdio (recommended for Zed / Claude Desktop config):
+```sh
+hss --mcp-stdio
+```
+
+Or standalone HTTP daemon:
+```sh
+hss --mcp
+```
+
 ## Config
 
 | OS | Path |

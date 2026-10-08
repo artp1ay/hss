@@ -313,6 +313,17 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 app.config.exec_timeout.to_string(),
                 app.config.mcp_port.to_string(),
                 app.config.mcp_token.clone().unwrap_or_default(),
+                if app.config.mcp_read_only {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
+                app.config.mcp_allowed_hosts.clone(),
+                if app.config.mcp_dlp_filter {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
                 app.config.mcp_log_file.clone().unwrap_or_default(),
                 app.config.audit_timeout.to_string(),
             ];

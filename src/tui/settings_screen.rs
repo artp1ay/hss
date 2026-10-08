@@ -20,9 +20,12 @@ const FIELD_AUTO_SAVE: usize = 6;
 const FIELD_EXEC_TIMEOUT: usize = 7;
 const FIELD_MCP_PORT: usize = 8;
 const FIELD_MCP_TOKEN: usize = 9;
-const FIELD_MCP_LOG_FILE: usize = 10;
-const FIELD_AUDIT_TIMEOUT: usize = 11;
-const FIELD_COUNT: usize = 12;
+const FIELD_MCP_READ_ONLY: usize = 10;
+const FIELD_MCP_ALLOWED_HOSTS: usize = 11;
+const FIELD_MCP_DLP_FILTER: usize = 12;
+const FIELD_MCP_LOG_FILE: usize = 13;
+const FIELD_AUDIT_TIMEOUT: usize = 14;
+const FIELD_COUNT: usize = 15;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -72,6 +75,18 @@ pub fn draw(f: &mut Frame, app: &App) {
         (
             "MCP Token",
             "bearer token for MCP auth (empty = no auth required)",
+        ),
+        (
+            "MCP Read-Only",
+            "block dangerous/destructive commands  [Space] toggle",
+        ),
+        (
+            "MCP Allowed Hosts",
+            "comma-separated host names or patterns (* = all)",
+        ),
+        (
+            "MCP DLP Filter",
+            "redact private keys/secrets in outputs  [Space] toggle",
         ),
         ("MCP Log File", "file path for MCP request/response logging"),
         (
@@ -171,6 +186,13 @@ fn apply_inputs_to_config(app: &mut App) {
     } else {
         Some(inputs[FIELD_MCP_TOKEN].trim().to_string())
     };
+    app.config.mcp_read_only = inputs[FIELD_MCP_READ_ONLY] == "yes";
+    app.config.mcp_allowed_hosts = if inputs[FIELD_MCP_ALLOWED_HOSTS].trim().is_empty() {
+        "*".to_string()
+    } else {
+        inputs[FIELD_MCP_ALLOWED_HOSTS].trim().to_string()
+    };
+    app.config.mcp_dlp_filter = inputs[FIELD_MCP_DLP_FILTER] == "yes";
     app.config.mcp_log_file = if inputs[FIELD_MCP_LOG_FILE].trim().is_empty() {
         None
     } else {
@@ -183,7 +205,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // Text fields get full line editing; Space stays a toggle on the two boolean-ish fields.
     let toggle_field = matches!(
         app.settings_focused_field,
-        FIELD_STRICT_HOST | FIELD_AUTO_SAVE
+        FIELD_STRICT_HOST | FIELD_AUTO_SAVE | FIELD_MCP_READ_ONLY | FIELD_MCP_DLP_FILTER
     );
     let is_toggle_space = toggle_field && key.code == KeyCode::Char(' ');
     let is_reveal_toggle = key.code == KeyCode::F(2);
@@ -250,6 +272,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 FIELD_AUTO_SAVE => {
                     app.settings_inputs[FIELD_AUTO_SAVE] =
                         if app.settings_inputs[FIELD_AUTO_SAVE] == "yes" {
+                            "no".to_string()
+                        } else {
+                            "yes".to_string()
+                        };
+                }
+                FIELD_MCP_READ_ONLY => {
+                    app.settings_inputs[FIELD_MCP_READ_ONLY] =
+                        if app.settings_inputs[FIELD_MCP_READ_ONLY] == "yes" {
+                            "no".to_string()
+                        } else {
+                            "yes".to_string()
+                        };
+                }
+                FIELD_MCP_DLP_FILTER => {
+                    app.settings_inputs[FIELD_MCP_DLP_FILTER] =
+                        if app.settings_inputs[FIELD_MCP_DLP_FILTER] == "yes" {
                             "no".to_string()
                         } else {
                             "yes".to_string()

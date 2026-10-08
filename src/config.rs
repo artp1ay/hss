@@ -91,6 +91,10 @@ fn default_mcp_port() -> u16 {
 fn default_audit_timeout() -> u16 {
     3
 }
+fn default_mcp_allowed_hosts() -> String {
+    "*".to_string()
+}
+
 fn default_strict_host_checking() -> String {
     "accept-new".to_string()
 }
@@ -129,6 +133,15 @@ pub struct AppConfig {
     /// Optional file path for logging MCP requests/responses.
     #[serde(default)]
     pub mcp_log_file: Option<String>,
+    /// Read-only mode for MCP: prohibits destructive commands (rm, dd, mkfs, sudo, etc.)
+    #[serde(default)]
+    pub mcp_read_only: bool,
+    /// Comma-separated list of hosts or glob patterns exposed to MCP clients ("*" = all)
+    #[serde(default = "default_mcp_allowed_hosts")]
+    pub mcp_allowed_hosts: String,
+    /// Data Loss Prevention: redact private keys and certificates in MCP command outputs
+    #[serde(default = "default_true")]
+    pub mcp_dlp_filter: bool,
     /// Timeout in seconds for connectivity and auth audit tests.
     #[serde(default = "default_audit_timeout")]
     pub audit_timeout: u16,
@@ -154,6 +167,9 @@ impl Default for AppConfig {
             mcp_token: None,
             allow_unauthenticated_execute: false,
             mcp_log_file: None,
+            mcp_read_only: false,
+            mcp_allowed_hosts: "*".to_string(),
+            mcp_dlp_filter: true,
             audit_timeout: 3,
             ssh_extra_args: String::new(),
             strict_host_checking: "accept-new".to_string(),

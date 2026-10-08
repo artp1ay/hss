@@ -422,6 +422,37 @@ fn make_response(
     }
 }
 
+/// Process JSON-RPC request body and return response JSON if any.
+pub fn process_json_rpc(body: &str) -> Option<Value> {
+    let log: Log = Arc::new(Mutex::new(LogState::default()));
+    let (_, resp) = handle_rpc(body, &log, Instant::now(), true);
+    resp
+}
+
+/// Run headless MCP server over stdio (JSON-RPC newline-delimited stream)
+pub fn run_stdio() -> Result<()> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+
+    let log: Log = Arc::new(Mutex::new(LogState::default()));
+    let started = Instant::now();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (_, resp) = handle_rpc(&line, &log, started, true);
+        if let Some(resp_val) = resp {
+            let json_str = serde_json::to_string(&resp_val)?;
+            writeln!(stdout, "{json_str}")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
 /// Returns (http status, optional JSON-RPC response body).
 fn handle_rpc(
     body: &str,
@@ -547,7 +578,102 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn tool_definitions() -> Value {
+/// Checks whether `host` is allowed by the MCP allowed_hosts pattern.
+/// Pattern can be comma-separated list of names/wildcards or "tag:xyz" or "*".
+pub fn is_host_allowed_for_mcp(pattern: &str, host: &crate::types::Host) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() || pattern == "*" {
+        return true;
+    }
+
+    for rule in pattern.split(',') {
+        let rule = rule.trim();
+        if rule.is_empty() {
+            continue;
+        }
+        if rule == "*" {
+            return true;
+        }
+        if let Some(tag_req) = rule.strip_prefix("tag:") {
+            if host.tags.iter().any(|t| t.eq_ignore_ascii_case(tag_req)) {
+                return true;
+            }
+        }
+        if let Some(prefix) = rule.strip_suffix('*') {
+            if host.name.starts_with(prefix) || host.ip.starts_with(prefix) {
+                return true;
+            }
+        } else if host.name.eq_ignore_ascii_case(rule) || host.ip.eq_ignore_ascii_case(rule) {
+            return true;
+        }
+    }
+    false
+}
+
+/// DLP filter: redacts private keys, certificates and sensitive tokens from command outputs.
+pub fn redact_sensitive_output(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_private_key = false;
+
+    for line in text.lines() {
+        if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
+            in_private_key = true;
+            out.push_str("[REDACTED: PRIVATE KEY DETECTED]\n");
+            continue;
+        }
+        if in_private_key {
+            if line.contains("-----END") && line.contains("PRIVATE KEY-----") {
+                in_private_key = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if text.ends_with('\n') || out.is_empty() {
+        out
+    } else {
+        out.pop();
+        out
+    }
+}
+
+/// Checks if command is destructive and prohibited under read-only mode.
+pub fn is_prohibited_command_in_read_only(cmd: &str) -> Option<&'static str> {
+    let trimmed = cmd.trim();
+    let lower = trimmed.to_lowercase();
+
+    let dangerous_tokens = [
+        ("rm ", "rm (file removal)"),
+        ("rmdir", "rmdir (directory removal)"),
+        ("mkfs", "mkfs (filesystem format)"),
+        ("dd ", "dd (raw write)"),
+        ("shutdown", "shutdown"),
+        ("reboot", "reboot"),
+        ("poweroff", "poweroff"),
+        ("init 0", "init 0"),
+        ("init 6", "init 6"),
+        ("sudo", "sudo (elevation of privileges)"),
+        ("su ", "su (user switch)"),
+        ("chmod -r", "chmod -R (recursive permission modification)"),
+        ("chown -r", "chown -R (recursive ownership modification)"),
+        ("> /dev/sd", "raw disk write redirection"),
+    ];
+
+    for (token, reason) in dangerous_tokens {
+        if lower.starts_with(token)
+            || lower.contains(&format!(" {token}"))
+            || lower.contains(&format!(";{token}"))
+            || lower.contains(&format!("|{token}"))
+        {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "list-servers",
@@ -590,19 +716,25 @@ fn call_tool(
                 "list-servers".into(),
                 vec![format!("request id {req_id} · no arguments")],
             );
+            let cfg = crate::config::load_config().unwrap_or_default();
             match crate::config::load_hosts() {
-                Ok(hosts) => {
-                    let groups: std::collections::BTreeSet<&str> = hosts
+                Ok(all_hosts) => {
+                    let allowed_hosts: Vec<_> = all_hosts
+                        .into_iter()
+                        .filter(|h| is_host_allowed_for_mcp(&cfg.mcp_allowed_hosts, h))
+                        .collect();
+                    let groups: std::collections::BTreeSet<&str> = allowed_hosts
                         .iter()
                         .map(|h| h.group.as_str())
                         .filter(|g| !g.is_empty())
                         .collect();
-                    let list: Vec<Value> = hosts
+                    let list: Vec<Value> = allowed_hosts
                         .iter()
                         .map(|h| {
+                            // Redact internal descriptions to prevent leaking stored secrets
                             json!({
                                 "name": h.name, "group": h.group, "host": h.ip, "port": h.port,
-                                "user": h.user, "tags": h.tags, "description": h.description,
+                                "user": h.user, "tags": h.tags
                             })
                         })
                         .collect();
@@ -614,7 +746,7 @@ fn call_tool(
                         "tool",
                         format!(
                             "list-servers → {} servers ({} ms)",
-                            hosts.len(),
+                            allowed_hosts.len(),
                             t0.elapsed().as_millis()
                         ),
                         vec![
@@ -678,6 +810,49 @@ fn call_tool(
                 );
                 return tool_text("Both 'host' and 'command' are required.".into(), true);
             }
+
+            let cfg = crate::config::load_config().unwrap_or_default();
+
+            // 1. Host Access Policy
+            if let Ok(hosts) = crate::config::load_hosts() {
+                if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
+                    if !is_host_allowed_for_mcp(&cfg.mcp_allowed_hosts, h) {
+                        log_line(
+                            log,
+                            started,
+                            Level::Err,
+                            "policy",
+                            format!("execute-command rejected: host '{host}' not permitted by mcp_allowed_hosts"),
+                            vec![format!("policy: {}", cfg.mcp_allowed_hosts)],
+                        );
+                        return tool_text(
+                            format!(
+                                "Access to host '{host}' is restricted by MCP security policy."
+                            ),
+                            true,
+                        );
+                    }
+                }
+            }
+
+            // 2. Read-Only Policy
+            if cfg.mcp_read_only {
+                if let Some(reason) = is_prohibited_command_in_read_only(command) {
+                    log_line(
+                        log,
+                        started,
+                        Level::Err,
+                        "policy",
+                        format!("execute-command rejected: destructive command '{command}' blocked by read-only policy"),
+                        vec![format!("matched rule: {reason}")],
+                    );
+                    return tool_text(
+                        format!("Command rejected by MCP read-only policy: {reason}"),
+                        true,
+                    );
+                }
+            }
+
             log_line(
                 log,
                 started,
@@ -730,6 +905,17 @@ fn call_tool(
                         format!("execute-command @ {host} finished (exit {code}, {ms} ms)"),
                         detail,
                     );
+                    let stdout = if cfg.mcp_dlp_filter {
+                        redact_sensitive_output(&stdout)
+                    } else {
+                        stdout.to_string()
+                    };
+                    let stderr = if cfg.mcp_dlp_filter {
+                        redact_sensitive_output(&stderr)
+                    } else {
+                        stderr.to_string()
+                    };
+
                     let mut text = format!("exit code: {code}\n");
                     const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024; // 128 KiB
                     if !stdout.is_empty() {
@@ -929,5 +1115,52 @@ mod tests {
             panic!("Expected 413 response");
         }
         server.stop();
+    }
+
+    #[test]
+    fn dlp_redacts_private_keys_from_output() {
+        let raw = "Some benign output\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----\nDone.";
+        let redacted = redact_sensitive_output(raw);
+        assert!(!redacted.contains("b3BlbnNzaC"));
+        assert!(redacted.contains("[REDACTED: PRIVATE KEY DETECTED]"));
+        assert!(redacted.contains("Some benign output"));
+        assert!(redacted.contains("Done."));
+    }
+
+    #[test]
+    fn read_only_prohibits_destructive_commands() {
+        assert!(is_prohibited_command_in_read_only("rm -rf /").is_some());
+        assert!(is_prohibited_command_in_read_only("sudo apt update").is_some());
+        assert!(is_prohibited_command_in_read_only("echo hi; rm file").is_some());
+        assert!(is_prohibited_command_in_read_only("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(is_prohibited_command_in_read_only("reboot").is_some());
+
+        assert!(is_prohibited_command_in_read_only("uptime").is_none());
+        assert!(is_prohibited_command_in_read_only("docker ps").is_none());
+        assert!(is_prohibited_command_in_read_only("ls -la /var/log").is_none());
+    }
+
+    #[test]
+    fn host_allowed_for_mcp_rules() {
+        let host = crate::types::Host {
+            id: "1".into(),
+            name: "prod-db".into(),
+            ip: "10.0.0.1".into(),
+            group: "prod".into(),
+            port: 22,
+            user: None,
+            tags: vec!["db".into(), "critical".into()],
+            description: None,
+            jump_host_id: None,
+        };
+
+        assert!(is_host_allowed_for_mcp("*", &host));
+        assert!(is_host_allowed_for_mcp("prod-*", &host));
+        assert!(is_host_allowed_for_mcp("prod-db", &host));
+        assert!(is_host_allowed_for_mcp("10.0.0.1", &host));
+        assert!(is_host_allowed_for_mcp("tag:db", &host));
+
+        assert!(!is_host_allowed_for_mcp("dev-*", &host));
+        assert!(!is_host_allowed_for_mcp("tag:web", &host));
     }
 }

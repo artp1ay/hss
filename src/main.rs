@@ -20,6 +20,9 @@ struct Cli {
     /// Run headless MCP server directly in terminal without TUI
     #[arg(long)]
     mcp: bool,
+    /// Run MCP server over stdio for agents (Zed, Claude Desktop, Cursor)
+    #[arg(long)]
+    mcp_stdio: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -49,6 +52,10 @@ fn main() -> anyhow::Result<()> {
             println!("{{}}");
         }
         return Ok(());
+    }
+
+    if cli.mcp_stdio {
+        return hss::mcp::run_stdio();
     }
 
     if cli.mcp {
