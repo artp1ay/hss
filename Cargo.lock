@@ -745,11 +745,13 @@ dependencies = [
  "keyring",
  "libc",
  "ratatui",
+ "semver",
  "serde",
  "serde_json",
  "skim",
  "tiny_http",
  "toml",
+ "unicode-width 0.2.0",
  "ureq",
  "uuid",
 ]

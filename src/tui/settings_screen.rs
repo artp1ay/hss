@@ -1,13 +1,13 @@
+use crate::tui::{App, Screen};
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    Frame,
 };
-use crossterm::event::{KeyCode, KeyEvent};
-use anyhow::Result;
-use crate::tui::{App, Screen};
 
 // Field indices
 const FIELD_DEFAULT_USER: usize = 0;
@@ -37,7 +37,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         ("Tab", "next"),
         ("BackTab", "prev"),
         ("Space", "toggle"),
-        ("Enter/Esc", "save & back"),
+        ("F2", "reveal/hide token"),
+        ("Enter", "save"),
+        ("Esc", "cancel"),
     ];
     let hotkey_lines = crate::tui::wrap_hotkey_lines(hotkey_pairs, inner.width);
     let hotkey_height = hotkey_lines.len() as u16;
@@ -45,60 +47,96 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // fields
+            Constraint::Min(0),                // fields
             Constraint::Length(hotkey_height), // hotkeys
         ])
         .split(inner);
 
     // Field definitions: (label, hint)
     let field_defs: &[(&str, &str)] = &[
-        ("Default User",      "fallback when host has no user set"),
-        ("Default Port",      "port when host has no port set"),
-        ("Default Group",     "default group for newly created hosts"),
-        ("Connect Timeout",   "seconds before SSH gives up"),
+        ("Default User", "fallback when host has no user set"),
+        ("Default Port", "port when host has no port set"),
+        ("Default Group", "default group for newly created hosts"),
+        ("Connect Timeout", "seconds before SSH gives up"),
         ("Strict Host Check", "accept-new / yes / no  [Space] cycle"),
-        ("SSH Extra Args",    "appended to all SSH commands"),
-        ("Auto-Save Creds",   "remember last-used credential per host  [Space] toggle"),
-        ("Exec Timeout",      "max seconds for MCP command (0=no limit, default 300)"),
-        ("MCP Port",          "HTTP port for MCP server (default 8822)"),
-        ("MCP Token",         "bearer token for MCP auth (empty = no auth required)"),
-        ("MCP Log File",      "file path for MCP request/response logging"),
-        ("Audit Timeout",     "seconds for ping & connection check (default 3)"),
+        ("SSH Extra Args", "appended to all SSH commands"),
+        (
+            "Auto-Save Creds",
+            "remember last-used credential per host  [Space] toggle",
+        ),
+        (
+            "Exec Timeout",
+            "max seconds for MCP command (0=no limit, default 300)",
+        ),
+        ("MCP Port", "HTTP port for MCP server (default 8822)"),
+        (
+            "MCP Token",
+            "bearer token for MCP auth (empty = no auth required)",
+        ),
+        ("MCP Log File", "file path for MCP request/response logging"),
+        (
+            "Audit Timeout",
+            "seconds for ping & connection check (default 3)",
+        ),
     ];
 
-    let rows: Vec<Row> = field_defs.iter().enumerate().map(|(i, (label, hint))| {
-        let focused = app.settings_focused_field == i;
-        let value = app.settings_inputs.get(i).map(|s| s.as_str()).unwrap_or("");
-        let label_style = if focused {
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let value_style = if focused {
-            Style::default().fg(Color::White)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let value_cell = if focused {
-            Cell::from(Line::from(crate::tui::input::spans(value, app.settings_cursor, value_style)))
-        } else {
-            Cell::from(Span::styled(value.to_string(), value_style))
-        };
-        Row::new(vec![
-            Cell::from(Span::styled(*label, label_style)),
-            value_cell,
-            Cell::from(Span::styled(*hint, Style::default().fg(Color::DarkGray))),
-        ])
-    }).collect();
+    let rows: Vec<Row> = field_defs
+        .iter()
+        .enumerate()
+        .map(|(i, (label, hint))| {
+            let focused = app.settings_focused_field == i;
+            let value = app.settings_inputs.get(i).map(|s| s.as_str()).unwrap_or("");
+            let label_style = if focused {
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let value_style = if focused {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let is_token_field = i == FIELD_MCP_TOKEN;
+            let display_value = if is_token_field && !app.settings_reveal_token {
+                if value.is_empty() {
+                    "".to_string()
+                } else {
+                    "•".repeat(value.chars().count())
+                }
+            } else {
+                value.to_string()
+            };
+
+            let value_cell = if focused {
+                Cell::from(Line::from(crate::tui::input::spans(
+                    &display_value,
+                    app.settings_cursor,
+                    value_style,
+                )))
+            } else {
+                Cell::from(Span::styled(display_value, value_style))
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(*label, label_style)),
+                value_cell,
+                Cell::from(Span::styled(*hint, Style::default().fg(Color::DarkGray))),
+            ])
+        })
+        .collect();
 
     let focused_idx = app.settings_focused_field;
     let mut state = TableState::default().with_selected(Some(focused_idx));
 
-    let table = Table::new(rows, [
-        Constraint::Length(20),
-        Constraint::Length(24),
-        Constraint::Min(0),
-    ])
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(20),
+            Constraint::Length(24),
+            Constraint::Min(0),
+        ],
+    )
     .row_highlight_style(Style::default().bg(Color::Rgb(20, 30, 45)));
 
     f.render_stateful_widget(table, chunks[0], &mut state);
@@ -108,7 +146,9 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn apply_inputs_to_config(app: &mut App) {
     let inputs = &app.settings_inputs;
-    if inputs.len() != FIELD_COUNT { return; }
+    if inputs.len() != FIELD_COUNT {
+        return;
+    }
     app.config.default_user = if inputs[FIELD_DEFAULT_USER].trim().is_empty() {
         None
     } else {
@@ -141,10 +181,18 @@ fn apply_inputs_to_config(app: &mut App) {
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // Text fields get full line editing; Space stays a toggle on the two boolean-ish fields.
-    let toggle_field = matches!(app.settings_focused_field, FIELD_STRICT_HOST | FIELD_AUTO_SAVE);
+    let toggle_field = matches!(
+        app.settings_focused_field,
+        FIELD_STRICT_HOST | FIELD_AUTO_SAVE
+    );
     let is_toggle_space = toggle_field && key.code == KeyCode::Char(' ');
+    let is_reveal_toggle = key.code == KeyCode::F(2);
     if !is_toggle_space
-        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab)
+        && !is_reveal_toggle
+        && !matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab
+        )
     {
         if let Some(field) = app.settings_inputs.get_mut(app.settings_focused_field) {
             let mut cursor = app.settings_cursor;
@@ -159,11 +207,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 
     match key.code {
-        KeyCode::Esc | KeyCode::Enter => {
+        KeyCode::Enter => {
             apply_inputs_to_config(app);
             crate::config::save_config(&app.config)?;
             app.settings_inputs.clear();
             app.settings_focused_field = 0;
+            app.status_message = Some(crate::types::StatusMessage::success("Settings saved."));
+            app.screen = Screen::Main;
+        }
+        KeyCode::Esc => {
+            // Discard changes without saving
+            app.settings_inputs.clear();
+            app.settings_focused_field = 0;
+            app.status_message = Some(crate::types::StatusMessage::info("Settings discarded."));
             app.screen = Screen::Main;
         }
         KeyCode::Tab => {
@@ -171,26 +227,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.settings_cursor = focused_len(app);
         }
         KeyCode::BackTab => {
-            app.settings_focused_field = app.settings_focused_field
+            app.settings_focused_field = app
+                .settings_focused_field
                 .checked_sub(1)
                 .unwrap_or(FIELD_COUNT - 1);
             app.settings_cursor = focused_len(app);
         }
+        KeyCode::F(2) => {
+            app.settings_reveal_token = !app.settings_reveal_token;
+        }
         KeyCode::Char(' ') => {
             match app.settings_focused_field {
                 FIELD_STRICT_HOST => {
-                    app.settings_inputs[FIELD_STRICT_HOST] = match app.settings_inputs[FIELD_STRICT_HOST].as_str() {
-                        "accept-new" => "yes",
-                        "yes" => "no",
-                        _ => "accept-new",
-                    }.to_string();
+                    app.settings_inputs[FIELD_STRICT_HOST] =
+                        match app.settings_inputs[FIELD_STRICT_HOST].as_str() {
+                            "accept-new" => "yes",
+                            "yes" => "no",
+                            _ => "accept-new",
+                        }
+                        .to_string();
                 }
                 FIELD_AUTO_SAVE => {
-                    app.settings_inputs[FIELD_AUTO_SAVE] = if app.settings_inputs[FIELD_AUTO_SAVE] == "yes" {
-                        "no".to_string()
-                    } else {
-                        "yes".to_string()
-                    };
+                    app.settings_inputs[FIELD_AUTO_SAVE] =
+                        if app.settings_inputs[FIELD_AUTO_SAVE] == "yes" {
+                            "no".to_string()
+                        } else {
+                            "yes".to_string()
+                        };
                 }
                 _ => {}
             }

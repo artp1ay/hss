@@ -59,12 +59,15 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 |---|---|
 | `↑↓` / `j k` | Navigate |
 | `Enter` | Connect |
-| `/` | Search |
+| `/` | Search (Esc to clear, Esc again to exit) |
 | `N` | Add host |
 | `E` | Edit selected host |
 | `D` | Delete (with confirmation) |
-| `I` | Import / Export Ansible INI |
+| `A` | Connectivity & auth audit |
+| `P` | Copy public keys (`ssh-copy-id`) |
+| `I` | Import / Export Ansible INI / SSH config |
 | `R` | Switch credential for selected host |
+| `M` | Start/view local MCP server |
 | `C` | Manage credentials |
 | `S` | Settings |
 | `Q` | Quit |
@@ -76,7 +79,7 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 | Linux | `~/.config/hss/` |
 | macOS | `~/Library/Application Support/hss/` |
 
-`config.toml` — settings · `hosts.toml` — server list · `records.toml` — last-used credentials
+`config.toml` — settings · `hosts.toml` — server list · `servers.toml` — last-used credentials
 
 Passwords are stored in the system keychain, not in any config file.
 

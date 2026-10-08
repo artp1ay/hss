@@ -1,9 +1,9 @@
-use anyhow::{bail, Result};
-use skim::prelude::*;
-use std::io::Cursor;
 use crate::config;
 use crate::ssh;
 use crate::types::CredentialKind;
+use anyhow::{bail, Result};
+use skim::prelude::*;
+use std::io::Cursor;
 
 pub fn run() -> Result<()> {
     let cfg = config::load_config()?;
@@ -15,18 +15,36 @@ pub fn run() -> Result<()> {
     }
     let records = config::migrate_server_records(config::load_server_records()?, &hosts);
 
-    let lines: Vec<String> = hosts.iter()
-        .map(|h| format!("{:<20} {:<14} {}:{}", h.name, h.group, h.ip, h.port))
+    let lines: Vec<String> = hosts
+        .iter()
+        .map(|h| {
+            format!(
+                "{:<24} {:<14} {}:{} \x00{}",
+                h.name, h.group, h.ip, h.port, h.id
+            )
+        })
         .collect();
 
     let selected_line = pick_one(&lines, "ssh> ")?;
-    let Some(line) = selected_line else { return Ok(()) };
+    let Some(line) = selected_line else {
+        return Ok(());
+    };
 
-    let picked_name: String = line.chars().take(20).collect::<String>().trim_end().to_string();
-    let host = hosts.iter().find(|h| h.name == picked_name)
-        .ok_or_else(|| anyhow::anyhow!("Host not found: {picked_name}"))?;
+    let host = if let Some((_, id)) = line.split_once('\x00') {
+        hosts.iter().find(|h| h.id == id.trim())
+    } else {
+        let picked_name: String = line
+            .chars()
+            .take(24)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        hosts.iter().find(|h| h.name == picked_name)
+    }
+    .ok_or_else(|| anyhow::anyhow!("Host not found for selection: {line}"))?;
 
-    let last_cred_id = records.iter()
+    let last_cred_id = records
+        .iter()
         .find(|r| r.host_id == host.id)
         .and_then(|r| r.last_credential_id.clone());
 
@@ -38,25 +56,33 @@ pub fn run() -> Result<()> {
         bail!("No credentials configured. Run `hss` to set up credentials.");
     } else {
         // Need to pick credential
-        let cred_pairs: Vec<(&crate::types::Credential, String)> = creds.iter()
+        let cred_pairs: Vec<(&crate::types::Credential, String)> = creds
+            .iter()
             .map(|c| {
-                let kind = if c.kind == CredentialKind::Key { "key" } else { "password" };
+                let kind = if c.kind == CredentialKind::Key {
+                    "key"
+                } else {
+                    "password"
+                };
                 (c, format!("{:<20} {:<10} {}", c.name, kind, c.username))
             })
             .collect();
         let cred_lines: Vec<String> = cred_pairs.iter().map(|(_, s)| s.clone()).collect();
 
         let selected_cred = pick_one(&cred_lines, "credential> ")?;
-        let Some(cred_line) = selected_cred else { return Ok(()) };
-        cred_pairs.iter()
+        let Some(cred_line) = selected_cred else {
+            return Ok(());
+        };
+        cred_pairs
+            .iter()
             .find(|(_, s)| s == &cred_line)
             .map(|(c, _)| (*c).clone())
             .ok_or_else(|| anyhow::anyhow!("Credential not found"))?
     };
 
-    let jump = ssh::jump_spec(&hosts, host);
+    let jump = ssh::resolve_jump_spec(&hosts, host)?;
     let status = ssh::spawn_ssh(&host.ip, host.port, &cred, &cfg, jump.as_deref())?;
-    if status.success() {
+    if status.success() && cfg.auto_save_credential {
         // Save last credential
         let mut records = config::migrate_server_records(config::load_server_records()?, &hosts);
         if let Some(r) = records.iter_mut().find(|r| r.host_id == host.id) {
@@ -86,7 +112,13 @@ fn pick_one(items: &[String], prompt: &str) -> Result<Option<String>> {
 
     let output = Skim::run_with(&options, Some(items_arc));
     let Some(out) = output else { return Ok(None) };
-    if out.is_abort { return Ok(None); }
+    if out.is_abort {
+        return Ok(None);
+    }
 
-    Ok(out.selected_items.into_iter().next().map(|i| i.output().to_string()))
+    Ok(out
+        .selected_items
+        .into_iter()
+        .next()
+        .map(|i| i.output().to_string()))
 }

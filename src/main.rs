@@ -36,7 +36,11 @@ fn main() -> anyhow::Result<()> {
         let records = hss::config::load_server_records()?;
         let cfg = hss::config::load_config()?;
         let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
-        if let Some(hostvars) = inv.get("_meta").and_then(|m| m.get("hostvars")).and_then(|hv| hv.get(target)) {
+        if let Some(hostvars) = inv
+            .get("_meta")
+            .and_then(|m| m.get("hostvars"))
+            .and_then(|hv| hv.get(target))
+        {
             println!("{}", serde_json::to_string_pretty(hostvars)?);
         } else {
             println!("{{}}");

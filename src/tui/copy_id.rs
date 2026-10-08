@@ -1,19 +1,25 @@
+use crate::tui::{App, Screen, Term};
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
 };
-use crossterm::event::{KeyCode, KeyEvent};
-use anyhow::Result;
-use crate::tui::{App, Screen, Term};
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let Some(form) = &app.copy_id_form else { return };
-    let host_name = app.hosts.get(form.host_idx).map(|h| h.name.as_str()).unwrap_or("?");
+    let Some(form) = &app.copy_id_form else {
+        return;
+    };
+    let host_name = app
+        .hosts
+        .get(form.host_idx)
+        .map(|h| h.name.as_str())
+        .unwrap_or("?");
 
-    let area = centered_rect(64, 70, f.area());
+    let area = crate::tui::adaptive_centered_rect(64, 70, 64, 18, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -27,60 +33,89 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),          // keys label
-            Constraint::Length(key_rows),   // key list
-            Constraint::Length(1),          // spacer
-            Constraint::Length(1),          // user
-            Constraint::Length(1),          // password
+            Constraint::Length(1),        // keys label
+            Constraint::Length(key_rows), // key list
+            Constraint::Length(1),        // spacer
+            Constraint::Length(1),        // user
+            Constraint::Length(1),        // password
+            Constraint::Length(1),        // error line
             Constraint::Min(0),
-            Constraint::Length(1),          // hotkeys
+            Constraint::Length(1), // hotkeys
         ])
         .margin(1)
         .split(inner);
 
     let keys_label_style = if form.focused == 0 {
-        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled("Keys to copy (Space to toggle):", keys_label_style))),
+        Paragraph::new(Line::from(Span::styled(
+            "Keys to copy (Space to toggle):",
+            keys_label_style,
+        ))),
         chunks[0],
     );
 
     if form.keys.is_empty() {
         f.render_widget(
-            Paragraph::new(Span::styled("No public keys found in ~/.ssh", Style::default().fg(Color::Red))),
+            Paragraph::new(Span::styled(
+                "No public keys found in ~/.ssh",
+                Style::default().fg(Color::Red),
+            )),
             chunks[1],
         );
     } else {
-        let home = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
-        let lines: Vec<Line> = form.keys.iter().enumerate().map(|(i, (path, selected))| {
-            let cursor = form.focused == 0 && i == form.key_cursor;
-            let mark = if *selected { "[x]" } else { "[ ]" };
-            let display_path = path.strip_prefix(&home).map(|p| format!("~{p}")).unwrap_or_else(|| path.clone());
-            let style = if cursor {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-            } else if *selected {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            Line::from(Span::styled(
-                format!("{} {mark} {display_path}", if cursor { "▶" } else { " " }),
-                style,
-            ))
-        }).collect();
+        let home = dirs::home_dir()
+            .map(|h| h.display().to_string())
+            .unwrap_or_default();
+        let lines: Vec<Line> = form
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(i, (path, selected))| {
+                let cursor = form.focused == 0 && i == form.key_cursor;
+                let mark = if *selected { "[x]" } else { "[ ]" };
+                let display_path = path
+                    .strip_prefix(&home)
+                    .map(|p| format!("~{p}"))
+                    .unwrap_or_else(|| path.clone());
+                let style = if cursor {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else if *selected {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                Line::from(Span::styled(
+                    format!("{} {mark} {display_path}", if cursor { "▶" } else { " " }),
+                    style,
+                ))
+            })
+            .collect();
         f.render_widget(Paragraph::new(lines), chunks[1]);
     }
 
     for (idx, chunk, label, value, mask) in [
         (1usize, chunks[3], "User:    ", form.user.clone(), false),
-        (2, chunks[4], "Password:", "•".repeat(form.password.chars().count()), true),
+        (
+            2,
+            chunks[4],
+            "Password:",
+            "•".repeat(form.password.chars().count()),
+            true,
+        ),
     ] {
         let focused = form.focused == idx;
         let label_style = if focused {
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -91,12 +126,33 @@ pub fn draw(f: &mut Frame, app: &App) {
         };
         let mut spans = vec![Span::styled(format!("{label} "), label_style)];
         if focused {
-            spans.extend(crate::tui::input::spans(&value, form.cursor, Style::default().fg(Color::White)));
+            spans.extend(crate::tui::input::spans(
+                &value,
+                form.cursor,
+                Style::default().fg(Color::White),
+            ));
         } else {
             spans.push(Span::styled(value, Style::default().fg(Color::White)));
         }
         spans.push(Span::styled(hint, Style::default().fg(Color::DarkGray)));
         f.render_widget(Paragraph::new(Line::from(spans)), chunk);
+    }
+
+    if let Some(ref progress) = form.progress_status {
+        let prog_line = Line::from(vec![
+            Span::styled("⏳ ", Style::default().fg(Color::Yellow)),
+            Span::styled(progress, Style::default().fg(Color::Yellow)),
+        ]);
+        f.render_widget(Paragraph::new(prog_line), chunks[5]);
+    } else if let Some(ref err) = form.error_message {
+        let err_line = Line::from(vec![
+            Span::styled(
+                "✗ ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(err, Style::default().fg(Color::Red)),
+        ]);
+        f.render_widget(Paragraph::new(err_line), chunks[5]);
     }
 
     let hotkeys = Line::from(vec![
@@ -109,19 +165,34 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::styled("[Esc]", Style::default().fg(Color::Blue)),
         Span::styled(" cancel", Style::default().fg(Color::DarkGray)),
     ]);
-    f.render_widget(Paragraph::new(hotkeys), chunks[6]);
+    f.render_widget(Paragraph::new(hotkeys), chunks[7]);
 }
 
 pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
-    let Some(form) = app.copy_id_form.as_mut() else { return Ok(()) };
+    let Some(form) = app.copy_id_form.as_mut() else {
+        return Ok(());
+    };
 
     // Text fields (1=user, 2=password) get full line editing; field 0 is the key list.
-    if form.focused > 0 && !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter) {
-        let field = if form.focused == 1 { &mut form.user } else { &mut form.password };
+    if form.focused > 0
+        && !matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter
+        )
+    {
+        let field = if form.focused == 1 {
+            &mut form.user
+        } else {
+            &mut form.password
+        };
         let mut cursor = form.cursor;
         let mut buf = std::mem::take(field);
         let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
-        *(if form.focused == 1 { &mut form.user } else { &mut form.password }) = buf;
+        *(if form.focused == 1 {
+            &mut form.user
+        } else {
+            &mut form.password
+        }) = buf;
         form.cursor = cursor;
         if consumed {
             return Ok(());
@@ -163,65 +234,108 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
 }
 
 fn run_copy(app: &mut App) -> Result<()> {
-    let Some(form) = app.copy_id_form.clone() else { return Ok(()) };
-    let Some(host) = app.hosts.get(form.host_idx).cloned() else { return Ok(()) };
+    let Some(form) = app.copy_id_form.clone() else {
+        return Ok(());
+    };
+    let Some(host) = app.hosts.get(form.host_idx).cloned() else {
+        return Ok(());
+    };
 
-    let selected: Vec<&String> = form.keys.iter().filter(|(_, s)| *s).map(|(p, _)| p).collect();
+    let selected: Vec<&String> = form
+        .keys
+        .iter()
+        .filter(|(_, s)| *s)
+        .map(|(p, _)| p)
+        .collect();
     if selected.is_empty() {
-        app.status_message = Some("Select at least one key (Space).".into());
+        if let Some(ref mut f) = app.copy_id_form {
+            f.error_message = Some("Select at least one key (Space).".into());
+            f.focused = 0;
+        }
+        app.status_message = Some(crate::types::StatusMessage::warning(
+            "Select at least one key (Space).",
+        ));
         return Ok(());
     }
     let user = form.user.trim();
     if user.is_empty() {
-        app.status_message = Some("User is required.".into());
+        if let Some(ref mut f) = app.copy_id_form {
+            f.error_message = Some("User is required.".into());
+            f.focused = 1;
+        }
+        app.status_message = Some(crate::types::StatusMessage::warning("User is required."));
         return Ok(());
     }
-    let password = if form.password.is_empty() { None } else { Some(form.password.as_str()) };
-
-    let mut copied = 0;
-    let mut errors: Vec<String> = Vec::new();
-    for key in &selected {
-        match crate::ssh::copy_id(&host.ip, host.port, user, key, password, &app.config) {
-            Ok(out) if out.status.success() => copied += 1,
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("failed");
-                errors.push(format!("{}: {last}", short_name(key)));
-            }
-            Err(e) => errors.push(format!("{}: {e}", short_name(key))),
+    if let Err(e) = crate::ssh::validate_username(user) {
+        if let Some(ref mut f) = app.copy_id_form {
+            f.error_message = Some(format!("Invalid Username: {e}"));
+            f.focused = 1;
         }
+        app.status_message = Some(crate::types::StatusMessage::error(format!(
+            "Invalid Username: {e}"
+        )));
+        return Ok(());
+    }
+    let user = user.to_string();
+    let password = if form.password.is_empty() {
+        None
+    } else {
+        Some(form.password.clone())
+    };
+
+    let selected_keys: Vec<String> = selected.into_iter().cloned().collect();
+    let total = selected_keys.len();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.copy_id_rx = Some(rx);
+    if let Some(ref mut f) = app.copy_id_form {
+        f.in_progress = true;
+        f.error_message = None;
+        f.progress_status = Some(format!("Copying 1 of {total} key(s)..."));
     }
 
-    if errors.is_empty() {
-        app.status_message = Some(format!("Copied {copied} key(s) to {}@{}.", user, host.name));
-        app.copy_id_form = None;
-        app.screen = Screen::Main;
-    } else {
-        // Keep the form open so the user can fix the password and retry
-        app.status_message = Some(format!("Copied {copied}, failed {}: {}", errors.len(), errors.join("; ")));
-    }
+    let cfg = app.config.clone();
+    std::thread::spawn(move || {
+        let mut copied = 0;
+        let mut errors: Vec<String> = Vec::new();
+        for (idx, key) in selected_keys.iter().enumerate() {
+            let _ = tx.send(crate::tui::CopyIdEvent::Progress(format!(
+                "Copying {} of {} key(s)...",
+                idx + 1,
+                total
+            )));
+            match crate::ssh::copy_id(&host.ip, host.port, &user, key, password.as_deref(), &cfg) {
+                Ok(out) if out.status.success() => copied += 1,
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let last = stderr
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("failed");
+                    errors.push(format!("{}: {last}", short_name(key)));
+                }
+                Err(e) => errors.push(format!("{}: {e}", short_name(key))),
+            }
+        }
+
+        if errors.is_empty() {
+            let _ = tx.send(crate::tui::CopyIdEvent::Success(format!(
+                "Copied {copied} key(s) to {}@{}.",
+                user, host.name
+            )));
+        } else {
+            let _ = tx.send(crate::tui::CopyIdEvent::Failure(format!(
+                "Copied {copied}, failed {}: {}",
+                errors.len(),
+                errors.join("; ")
+            )));
+        }
+    });
+
     Ok(())
 }
 
 fn short_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(v[1])[1]
 }

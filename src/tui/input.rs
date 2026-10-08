@@ -2,10 +2,17 @@
 //! Cursor is a char index (not a byte offset), so UTF-8 input is safe.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{style::{Modifier, Style}, text::Span};
+use ratatui::{
+    style::{Modifier, Style},
+    text::Span,
+};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 fn byte_idx(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }
 
 /// Apply an editing key to `(buf, cursor)`. Returns true when the key was consumed.
@@ -78,13 +85,32 @@ pub fn spans(value: &str, cursor: usize, style: Style) -> Vec<Span<'static>> {
     let chars: Vec<char> = value.chars().collect();
     let c = cursor.min(chars.len());
     let before: String = chars[..c].iter().collect();
-    let at: String = chars.get(c).map(|ch| ch.to_string()).unwrap_or_else(|| " ".into());
-    let after: String = chars.get(c + 1..).map(|s| s.iter().collect()).unwrap_or_default();
+    let at: String = chars
+        .get(c)
+        .map(|ch| ch.to_string())
+        .unwrap_or_else(|| " ".into());
+    let after: String = chars
+        .get(c + 1..)
+        .map(|s| s.iter().collect())
+        .unwrap_or_default();
     vec![
         Span::styled(before, style),
         Span::styled(at, style.add_modifier(Modifier::REVERSED)),
         Span::styled(after, style),
     ]
+}
+
+/// Visual terminal width of a string.
+pub fn str_width(s: &str) -> usize {
+    s.width()
+}
+
+/// Visual terminal width up to character index `char_idx`.
+pub fn char_idx_to_display_col(s: &str, char_idx: usize) -> usize {
+    s.chars()
+        .take(char_idx)
+        .map(|c| c.width().unwrap_or(0))
+        .sum()
 }
 
 /// Char length helper for placing the cursor at the end of a field.
@@ -150,5 +176,14 @@ mod tests {
         assert!(!handle(&mut buf, &mut cur, k(KeyCode::Tab)));
         assert!(!handle(&mut buf, &mut cur, k(KeyCode::Enter)));
         assert!(!handle(&mut buf, &mut cur, k(KeyCode::Up)));
+    }
+
+    #[test]
+    fn unicode_display_widths() {
+        assert_eq!(str_width("hello"), 5);
+        // "你好" has 2 chars, each width 2 -> total width 4
+        assert_eq!(str_width("你好"), 4);
+        assert_eq!(char_idx_to_display_col("你好world", 2), 4);
+        assert_eq!(char_idx_to_display_col("你好world", 4), 6);
     }
 }

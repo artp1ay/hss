@@ -1,19 +1,21 @@
+use crate::tui::{App, Term};
+use crate::types::DeleteKind;
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
 };
-use crossterm::event::{KeyCode, KeyEvent};
-use anyhow::Result;
-use crate::tui::{App, Term};
-use crate::types::DeleteKind;
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let Some(popup) = &app.delete_popup else { return };
+    let Some(popup) = &app.delete_popup else {
+        return;
+    };
 
-    let area = centered_rect(50, 40, f.area());
+    let area = crate::tui::adaptive_centered_rect(50, 40, 50, 10, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -43,7 +45,12 @@ pub fn draw(f: &mut Frame, app: &App) {
             Span::styled("Delete ", Style::default().fg(Color::White)),
             Span::styled(kind_str, Style::default().fg(Color::DarkGray)),
             Span::styled(" '", Style::default().fg(Color::White)),
-            Span::styled(&popup.name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &popup.name,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("'?", Style::default().fg(Color::White)),
         ])),
         chunks[0],
@@ -53,7 +60,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(check, Style::default().fg(Color::Blue)),
-            Span::styled(" don't ask again this session", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                " don't ask again this session",
+                Style::default().fg(Color::DarkGray),
+            ),
         ])),
         chunks[1],
     );
@@ -98,10 +108,20 @@ fn do_delete(app: &mut App, popup: &crate::types::DeletePopup) -> Result<()> {
     match popup.kind {
         DeleteKind::Host => {
             if popup.idx < app.hosts.len() {
+                let deleted_id = app.hosts[popup.idx].id.clone();
+                // Clear any jump references pointing to this deleted host so configs stay valid
+                for h in &mut app.hosts {
+                    if h.jump_host_id.as_deref() == Some(&deleted_id) {
+                        h.jump_host_id = None;
+                    }
+                }
                 app.hosts.remove(popup.idx);
                 app.save_hosts()?;
                 app.selected_row = app.selected_row.min(app.hosts.len().saturating_sub(1));
-                app.status_message = Some(format!("Host '{}' deleted.", popup.name));
+                app.status_message = Some(crate::types::StatusMessage::info(format!(
+                    "Host '{}' deleted.",
+                    popup.name
+                )));
             }
         }
         DeleteKind::Credential => {
@@ -114,28 +134,12 @@ fn do_delete(app: &mut App, popup: &crate::types::DeletePopup) -> Result<()> {
                 }
                 app.reload_credentials()?;
                 app.cred_selected = app.cred_selected.saturating_sub(1);
-                app.status_message = Some(format!("Credential '{}' deleted.", popup.name));
+                app.status_message = Some(crate::types::StatusMessage::info(format!(
+                    "Credential '{}' deleted.",
+                    popup.name
+                )));
             }
         }
     }
     Ok(())
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(v[1])[1]
 }

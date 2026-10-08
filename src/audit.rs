@@ -1,7 +1,7 @@
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -100,8 +100,21 @@ impl AuditState {
         let cfg_arc = Arc::new(cfg);
 
         thread::spawn(move || {
-            let mut handles = Vec::new();
+            // Cap concurrent audit threads to 16 to avoid OS process/socket exhaustion.
+            const MAX_CONCURRENT_AUDIT_WORKERS: usize = 16;
+            let worker_count = hosts_arc.len().clamp(1, MAX_CONCURRENT_AUDIT_WORKERS);
+
+            let (work_tx, work_rx) = mpsc::channel();
             for i in 0..hosts_arc.len() {
+                let _ = work_tx.send(i);
+            }
+            drop(work_tx); // Close channel so workers terminate when queue is empty
+
+            let work_rx = Arc::new(Mutex::new(work_rx));
+            let mut handles = Vec::new();
+
+            for _ in 0..worker_count {
+                let rx_c = Arc::clone(&work_rx);
                 let tx_c = tx.clone();
                 let hosts_c = Arc::clone(&hosts_arc);
                 let creds_c = Arc::clone(&creds_arc);
@@ -109,10 +122,16 @@ impl AuditState {
                 let cfg_c = Arc::clone(&cfg_arc);
 
                 let handle = thread::spawn(move || {
-                    let host = &hosts_c[i];
-                    let _ = tx_c.send(AuditEvent::HostStarted(host.id.clone()));
-                    let result = check_single_host(host, &hosts_c, &creds_c, &records_c, &cfg_c);
-                    let _ = tx_c.send(AuditEvent::HostFinished(result));
+                    while let Ok(i) = {
+                        let lock = rx_c.lock().unwrap();
+                        lock.recv()
+                    } {
+                        let host = &hosts_c[i];
+                        let _ = tx_c.send(AuditEvent::HostStarted(host.id.clone()));
+                        let result =
+                            check_single_host(host, &hosts_c, &creds_c, &records_c, &cfg_c);
+                        let _ = tx_c.send(AuditEvent::HostFinished(result));
+                    }
                 });
                 handles.push(handle);
             }
@@ -163,7 +182,8 @@ impl AuditState {
                         }
                     }
                     AuditEvent::HostFinished(res) => {
-                        if let Some(r) = self.results.iter_mut().find(|r| r.host_id == res.host_id) {
+                        if let Some(r) = self.results.iter_mut().find(|r| r.host_id == res.host_id)
+                        {
                             *r = res;
                             self.completed += 1;
                         }
@@ -195,7 +215,9 @@ pub fn check_single_host(
         .iter()
         .find(|r| r.host_id == host.id)
         .and_then(|r| r.last_credential_id.as_deref());
-    let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_id).ok().flatten();
+    let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_id)
+        .ok()
+        .flatten();
     let cred_name = resolved_cred.map(|c| c.name.clone());
 
     // 1. Connectivity test: TCP port probe (when direct)
@@ -283,7 +305,9 @@ fn ping_tcp(host: &str, port: u16, timeout: Duration) -> (Result<(), String>, Op
         Err(e) => {
             let msg = match e.kind() {
                 std::io::ErrorKind::TimedOut => "Connection timed out".to_string(),
-                std::io::ErrorKind::ConnectionRefused => "Connection refused (port closed)".to_string(),
+                std::io::ErrorKind::ConnectionRefused => {
+                    "Connection refused (port closed)".to_string()
+                }
                 std::io::ErrorKind::HostUnreachable => "Host unreachable".to_string(),
                 std::io::ErrorKind::NetworkUnreachable => "Network unreachable".to_string(),
                 _ => format!("{e}"),
@@ -307,17 +331,54 @@ fn check_ssh_auth(
         None
     };
 
+    if let Err(e) = crate::ssh::validate_host(&host.ip) {
+        return (
+            HostStatus::Unreachable(format!("Invalid host: {e}")),
+            format!("Invalid host: {e}"),
+            None,
+        );
+    }
+    if let Err(e) = crate::ssh::validate_port(host.port) {
+        return (
+            HostStatus::Unreachable(format!("Invalid port: {e}")),
+            format!("Invalid port: {e}"),
+            None,
+        );
+    }
+    if let Err(e) = crate::ssh::validate_username(&cred.username) {
+        return (
+            HostStatus::AuthFailed(format!("Invalid username: {e}")),
+            format!("Invalid username: {e}"),
+            None,
+        );
+    }
+    if let Some(j) = jump {
+        if let Err(e) = crate::ssh::validate_jump_spec(j) {
+            return (
+                HostStatus::Unreachable(format!("Invalid jump spec: {e}")),
+                format!("Invalid jump spec: {e}"),
+                None,
+            );
+        }
+    }
+
     let timeout_secs = timeout.as_secs().max(1).to_string();
     let mut args: Vec<String> = vec![
-        "-o".into(), format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
-        "-o".into(), format!("ConnectTimeout={timeout_secs}"),
-        "-o".into(), "NumberOfPasswordPrompts=1".into(),
-        "-p".into(), host.port.to_string(),
-        "-l".into(), cred.username.clone(),
+        "-o".into(),
+        format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        "-o".into(),
+        format!("ConnectTimeout={timeout_secs}"),
+        "-o".into(),
+        "NumberOfPasswordPrompts=1".into(),
+        "-p".into(),
+        host.port.to_string(),
+        "-l".into(),
+        cred.username.clone(),
     ];
 
     if let Some(ref key) = cred.key_path {
         args.extend_from_slice(&["-i".into(), key.clone()]);
+        args.extend_from_slice(&["-o".into(), "IdentitiesOnly=yes".into()]);
     }
     if let Some(j) = jump {
         args.extend_from_slice(&["-J".into(), j.to_string()]);
@@ -325,6 +386,7 @@ fn check_ssh_auth(
     if password.is_none() {
         args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
     }
+    args.push("--".into());
     args.push(host.ip.clone());
     args.push("exit 0".into());
 
@@ -385,28 +447,62 @@ fn check_ssh_auth(
     match result {
         Ok((status, stderr)) => {
             if status.success() {
-                (HostStatus::Ok, "Connection and authentication successful".into(), Some(elapsed_ms))
+                (
+                    HostStatus::Ok,
+                    "Connection and authentication successful".into(),
+                    Some(elapsed_ms),
+                )
             } else {
                 let err_line = stderr
                     .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .last()
-                    .unwrap_or("Auth failed")
+                    .rfind(|l| !l.trim().is_empty())
+                    .unwrap_or("Connection failed")
                     .trim()
                     .to_string();
 
-                if err_line.contains("Permission denied") {
-                    (HostStatus::AuthFailed("Permission denied (invalid key or password)".into()), err_line, Some(elapsed_ms))
-                } else if err_line.contains("Host key verification failed") {
-                    (HostStatus::AuthFailed("Host key verification failed".into()), err_line, Some(elapsed_ms))
-                } else if err_line.contains("Connection timed out") || err_line.contains("Operation timed out") {
-                    (HostStatus::Unreachable("Connection timed out".into()), err_line, None)
-                } else if err_line.contains("Connection refused") {
-                    (HostStatus::PortClosed("Connection refused".into()), err_line, None)
-                } else if err_line.contains("No route to host") {
-                    (HostStatus::Unreachable("No route to host".into()), err_line, None)
-                } else {
-                    (HostStatus::AuthFailed(err_line.clone()), err_line, Some(elapsed_ms))
+                let classified = crate::ssh::classify_ssh_error(&stderr);
+                match classified {
+                    crate::ssh::SshErrorKind::AuthFailed => (
+                        HostStatus::AuthFailed(
+                            "Permission denied (invalid key or password)".into(),
+                        ),
+                        err_line,
+                        Some(elapsed_ms),
+                    ),
+                    crate::ssh::SshErrorKind::HostKeyMismatch => (
+                        HostStatus::AuthFailed("Host key verification failed".into()),
+                        err_line,
+                        Some(elapsed_ms),
+                    ),
+                    crate::ssh::SshErrorKind::ConnectionTimeout => (
+                        HostStatus::Unreachable("Connection timed out".into()),
+                        err_line,
+                        None,
+                    ),
+                    crate::ssh::SshErrorKind::ConnectionRefused => (
+                        HostStatus::PortClosed("Connection refused".into()),
+                        err_line,
+                        None,
+                    ),
+                    crate::ssh::SshErrorKind::DnsError => (
+                        HostStatus::Unreachable("DNS lookup failed".into()),
+                        err_line,
+                        None,
+                    ),
+                    crate::ssh::SshErrorKind::NoRoute => (
+                        HostStatus::Unreachable("No route to host".into()),
+                        err_line,
+                        None,
+                    ),
+                    crate::ssh::SshErrorKind::Unknown(msg) => (
+                        HostStatus::Unreachable(if msg.is_empty() {
+                            "SSH failed".into()
+                        } else {
+                            msg.clone()
+                        }),
+                        err_line,
+                        Some(elapsed_ms),
+                    ),
                 }
             }
         }

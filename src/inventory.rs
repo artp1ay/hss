@@ -1,5 +1,5 @@
-use uuid::Uuid;
 use crate::types::Host;
+use uuid::Uuid;
 
 pub fn parse_inventory(content: &str) -> Vec<Host> {
     let mut hosts = Vec::new();
@@ -30,11 +30,20 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
 
         if let Some(vars) = parts.next() {
             for token in vars.split_whitespace() {
-                if let Some(v) = token.strip_prefix("ansible_host=").or_else(|| token.strip_prefix("ansible_ssh_host=")) {
+                if let Some(v) = token
+                    .strip_prefix("ansible_host=")
+                    .or_else(|| token.strip_prefix("ansible_ssh_host="))
+                {
                     ip = v.to_string();
-                } else if let Some(v) = token.strip_prefix("ansible_port=").or_else(|| token.strip_prefix("ansible_ssh_port=")) {
+                } else if let Some(v) = token
+                    .strip_prefix("ansible_port=")
+                    .or_else(|| token.strip_prefix("ansible_ssh_port="))
+                {
                     port = v.parse().unwrap_or(22);
-                } else if let Some(v) = token.strip_prefix("ansible_user=").or_else(|| token.strip_prefix("ansible_ssh_user=")) {
+                } else if let Some(v) = token
+                    .strip_prefix("ansible_user=")
+                    .or_else(|| token.strip_prefix("ansible_ssh_user="))
+                {
                     user = Some(v.to_string());
                 }
             }
@@ -82,7 +91,12 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
         let ini_tags: Vec<String> = comment_part
             .trim()
             .strip_prefix("tags=")
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .map(|t| {
+                t.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut parts = vars_part.splitn(2, ' ');
@@ -91,27 +105,43 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
             _ => continue,
         };
 
-        let mut ip = name.clone();
-        let mut port = 22u16;
-        let mut user: Option<String> = None;
+        let mut explicit_ip: Option<String> = None;
+        let mut explicit_port: Option<u16> = None;
+        let mut explicit_user: Option<String> = None;
 
         if let Some(vars) = parts.next() {
             for token in vars.split_whitespace() {
-                if let Some(v) = token.strip_prefix("ansible_host=").or_else(|| token.strip_prefix("ansible_ssh_host=")) {
-                    ip = v.to_string();
-                } else if let Some(v) = token.strip_prefix("ansible_port=").or_else(|| token.strip_prefix("ansible_ssh_port=")) {
-                    port = v.parse().unwrap_or(22);
-                } else if let Some(v) = token.strip_prefix("ansible_user=").or_else(|| token.strip_prefix("ansible_ssh_user=")) {
-                    user = Some(v.to_string());
+                if let Some(v) = token
+                    .strip_prefix("ansible_host=")
+                    .or_else(|| token.strip_prefix("ansible_ssh_host="))
+                {
+                    explicit_ip = Some(v.to_string());
+                } else if let Some(v) = token
+                    .strip_prefix("ansible_port=")
+                    .or_else(|| token.strip_prefix("ansible_ssh_port="))
+                {
+                    if let Ok(p) = v.parse::<u16>() {
+                        explicit_port = Some(p);
+                    }
+                } else if let Some(v) = token
+                    .strip_prefix("ansible_user=")
+                    .or_else(|| token.strip_prefix("ansible_ssh_user="))
+                {
+                    explicit_user = Some(v.to_string());
                 }
             }
         }
 
         if let Some(existing) = hosts.iter_mut().find(|h| h.name == name) {
-            existing.ip = ip;
-            existing.port = port;
-            if user.is_some() {
-                existing.user = user;
+            // Partially merge: update ONLY fields that were explicitly present
+            if let Some(ip) = explicit_ip {
+                existing.ip = ip;
+            }
+            if let Some(port) = explicit_port {
+                existing.port = port;
+            }
+            if explicit_user.is_some() {
+                existing.user = explicit_user;
             }
             for tag in ini_tags {
                 if !existing.tags.contains(&tag) {
@@ -119,13 +149,14 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
                 }
             }
         } else {
+            // New host: apply defaults (ip = name, port = 22)
             hosts.push(Host {
                 id: Uuid::new_v4().to_string(),
-                name,
-                ip,
+                name: name.clone(),
+                ip: explicit_ip.unwrap_or_else(|| name.clone()),
                 group: current_group.clone(),
-                port,
-                user,
+                port: explicit_port.unwrap_or(22),
+                user: explicit_user,
                 tags: ini_tags,
                 description: None,
                 jump_host_id: None,
@@ -185,7 +216,10 @@ pub fn export_to_ini(hosts: &[Host]) -> String {
         let mut group_hosts: Vec<&Host> = hosts.iter().filter(|h| &h.group == group).collect();
         group_hosts.sort_by(|a, b| a.name.cmp(&b.name));
         for host in group_hosts {
-            let mut line = format!("{} ansible_host={} ansible_port={}", host.name, host.ip, host.port);
+            let mut line = format!(
+                "{} ansible_host={} ansible_port={}",
+                host.name, host.ip, host.port
+            );
             if let Some(u) = &host.user {
                 line.push_str(&format!(" ansible_user={}", u));
             }
@@ -203,9 +237,9 @@ pub fn generate_ansible_inventory(
     records: &[crate::types::ServerRecord],
     cfg: &crate::config::AppConfig,
 ) -> serde_json::Value {
-    use std::collections::{BTreeMap, BTreeSet};
-    use serde_json::json;
     use crate::types::CredentialKind;
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
 
     let mut hostvars = serde_json::Map::new();
     let mut groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -217,7 +251,9 @@ pub fn generate_ansible_inventory(
             .find(|r| r.host_id == host.id)
             .and_then(|r| r.last_credential_id.as_deref());
 
-        let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_cred_id).ok().flatten();
+        let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_cred_id)
+            .ok()
+            .flatten();
 
         let mut vars = serde_json::Map::new();
         vars.insert("ansible_host".into(), json!(host.ip));
@@ -256,7 +292,10 @@ pub fn generate_ansible_inventory(
             ssh_args.push(format!("-o ProxyJump={jump}"));
         }
         if !cfg.strict_host_checking.is_empty() {
-            ssh_args.push(format!("-o StrictHostKeyChecking={}", cfg.strict_host_checking));
+            ssh_args.push(format!(
+                "-o StrictHostKeyChecking={}",
+                cfg.strict_host_checking
+            ));
         }
         if !cfg.ssh_extra_args.is_empty() {
             ssh_args.push(cfg.ssh_extra_args.clone());
@@ -271,7 +310,15 @@ pub fn generate_ansible_inventory(
             vars.insert("hss_description".into(), json!(desc));
         }
 
-        let group_name = if host.group.is_empty() { "ungrouped" } else { &host.group };
+        let group_name = if host.group.is_empty() {
+            "ungrouped"
+        } else if host.group.eq_ignore_ascii_case("all") || host.group.eq_ignore_ascii_case("_meta")
+        {
+            // Namespace reserved group names so they do not collide with top-level Ansible keys
+            "grp_reserved"
+        } else {
+            &host.group
+        };
         groups
             .entry(group_name.to_string())
             .or_default()
@@ -309,16 +356,21 @@ pub fn generate_ansible_inventory(
 
     for (group_name, members) in groups {
         let mut grp = serde_json::Map::new();
-        grp.insert("hosts".into(), json!(members.into_iter().collect::<Vec<_>>()));
+        grp.insert(
+            "hosts".into(),
+            json!(members.into_iter().collect::<Vec<_>>()),
+        );
         inventory.insert(group_name, serde_json::Value::Object(grp));
     }
 
     for (tag_name, members) in tag_groups {
         let mut grp = serde_json::Map::new();
-        grp.insert("hosts".into(), json!(members.into_iter().collect::<Vec<_>>()));
+        grp.insert(
+            "hosts".into(),
+            json!(members.into_iter().collect::<Vec<_>>()),
+        );
         inventory.insert(tag_name, serde_json::Value::Object(grp));
     }
 
     serde_json::Value::Object(inventory)
 }
-
