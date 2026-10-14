@@ -13,6 +13,8 @@ pub struct Host {
     pub description: Option<String>,
     #[serde(default)]
     pub jump_host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -47,11 +49,13 @@ pub struct CredentialForm {
     pub key_path: String,
     pub focused: usize, // 0=type toggle, 1=name, 2=username, 3=secret
     pub cursor: usize,  // char index inside the focused field
+    pub error_message: Option<String>,
+    pub confirm_kind_change: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CopyIdForm {
-    pub host_idx: usize,
+    pub host_id: String,
     pub keys: Vec<(String, bool)>, // (path, selected)
     pub key_cursor: usize,
     pub user: String,
@@ -88,7 +92,8 @@ pub struct HostForm {
     pub tags: String, // comma-separated
     pub description: String,
     pub jump_host_id: Option<String>, // selected from existing hosts, cycled with ←/→
-    pub focused: usize, // 0=name 1=ip 2=group 3=port 4=user 5=tags 6=description 7=jump host
+    pub credential_id: Option<String>, // explicit choice; None keeps automatic resolution
+    pub focused: usize, // 0=name 1=ip 2=group 3=port 4=user 5=tags 6=description 7=jump host 8=credentials
     pub cursor: usize,  // char index inside the focused field
     pub error_message: Option<String>,
 }
@@ -142,11 +147,11 @@ impl StatusMessage {
     }
 
     pub fn is_expired(&self) -> bool {
-        // Success and info auto-expire after 4 seconds; errors/warnings persist longer (10s)
-        let ttl = match self.kind {
-            StatusKind::Success | StatusKind::Info => std::time::Duration::from_secs(4),
-            StatusKind::Warning | StatusKind::Error => std::time::Duration::from_secs(10),
-        };
-        self.created_at.elapsed() > ttl
+        match self.kind {
+            StatusKind::Success | StatusKind::Info => {
+                self.created_at.elapsed() > std::time::Duration::from_secs(4)
+            }
+            StatusKind::Warning | StatusKind::Error => false,
+        }
     }
 }

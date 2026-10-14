@@ -22,6 +22,7 @@ fn test_hosts_roundtrip() {
         tags: vec!["production".into(), "nginx".into()],
         description: Some("Primary web server".into()),
         jump_host_id: None,
+        credential_id: Some("credential-1".into()),
     }];
     let s = hss::config::serialize_hosts(&hosts).unwrap();
     let parsed = hss::config::parse_hosts(&s).unwrap();
@@ -30,6 +31,25 @@ fn test_hosts_roundtrip() {
     assert_eq!(parsed[0].port, 2222);
     assert_eq!(parsed[0].tags, vec!["production", "nginx"]);
     assert_eq!(parsed[0].description, Some("Primary web server".into()));
+    assert_eq!(parsed[0].credential_id.as_deref(), Some("credential-1"));
+    assert!(s.contains("credential_id = \"credential-1\""));
+}
+
+#[test]
+fn test_legacy_host_automatic_omits_credential_id() {
+    let legacy = r#"
+[[host]]
+id = "legacy"
+name = "legacy"
+ip = "192.0.2.1"
+group = "test"
+port = 22
+"#;
+    let parsed = hss::config::parse_hosts(legacy).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert!(parsed[0].credential_id.is_none());
+    let serialized = hss::config::serialize_hosts(&parsed).unwrap();
+    assert!(!serialized.contains("credential_id"));
 }
 
 #[test]
@@ -83,6 +103,7 @@ fn test_migrate_server_records_rewrites_name_keyed_entries() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        credential_id: None,
     }];
     let records = vec![
         // Old-style entry: host_id happens to equal the host's name

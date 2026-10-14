@@ -58,6 +58,7 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 | Key | Action |
 |---|---|
 | `↑↓` / `j k` | Navigate |
+| `PgUp` / `PgDn`, `Home` / `End` | Page, first / last host |
 | `Enter` | Connect |
 | `/` | Search (Esc to clear, Esc again to exit) |
 | `N` | Add host |
@@ -66,21 +67,50 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 | `A` | Connectivity & auth audit |
 | `P` | Copy public keys (`ssh-copy-id`) |
 | `I` | Import / Export Ansible INI / SSH config |
-| `R` | Switch credential for selected host |
+| `R` | Connect as another credential for selected host |
 | `M` | Start/view local MCP server |
 | `C` | Manage credentials |
 | `S` | Settings |
 | `Q` | Quit |
+| `?` / `F1` | Keyboard help (`F1` works in forms too) |
+| `Ctrl+L` | Dismiss the current notification |
+
+The table adapts to terminal width; selected-host details show the resolved SSH username, credential and jump route. Long fields scroll horizontally to keep the cursor visible. Forms support `Tab` / `Shift+Tab`, `Home` / `End`, and `Ctrl+A` / `Ctrl+E` / `Ctrl+U` editing.
+
+- **Errors:** warnings and errors stay visible until dismissed or replaced; `F1` shows their full text. SSH exit `255` is a connection failure, not necessarily a bad password.
+- **Settings:** changes remain a draft until validated and saved. Leaving a changed draft offers Save / Discard / Continue. Token reveal is limited to the focused field.
+- **Delete:** only `Y` confirms; `Enter`, `N` and `Esc` cancel. Skip-confirmation choices apply separately to hosts and credentials, for the current session. Bastions with dependent hosts cannot be deleted until jump routes are reassigned.
+- **Export:** existing files require explicit overwrite confirmation. Export uses a same-directory staging file and atomic installation; symlinks and non-regular destinations are refused.
+- **Copy ID:** duplicate starts and editing while running are blocked. `Esc` returns to the list **without stopping**; `P` reopens progress. `Ctrl+C` in Copy ID stops its local process tree. Quitting also stops it. Installed keys cannot be undone, and an interrupted key may already be installed.
+- **Host User:** used for Copy ID defaults, jump hosts and static INI/SSH-config export. Normal connections use the selected credential's username; the details panel shows that actual identity. Dynamic inventory uses that username for an explicit host credential; Automatic retains the existing User hint behavior.
+
+### Per-host credentials
+
+Add/Edit Host has a **Credentials** selector immediately after **Jump host**. Use `Tab` / `Shift+Tab` to reach it, `←` / `→` to cycle saved credentials (shown as name and username), and `Backspace` to reset to **Automatic**. Selection hints appear only on the focused selector; Port and Tags hints appear only when those fields are empty.
+
+The explicit choice is stored as optional `credential_id` in `hosts.toml`, separately from the last-used credential in `servers.toml`. Existing hosts without this field remain Automatic. Resolution for normal TUI connections, direct connect, fzf, audit checks, MCP command execution and dynamic inventory is:
+
+1. Explicit host credential.
+2. Remembered last-used credential.
+3. Global default credential.
+4. The only saved credential.
+5. Credential picker where available (TUI/fzf); otherwise unresolved.
+
+`R` remains a deliberate **Connect as** override for that connection; it does not change the saved host selection. Even if another credential is remembered after a successful connection, the explicit host choice takes priority next time. Automatic removes the explicit choice, not the remembered credential.
+
+A removed/missing explicit credential never silently falls back to another identity. The form shows the missing ID and refuses to save until it is replaced or reset to Automatic. Normal connections and MCP report an error; audit reports No Credential with the reason. Dynamic inventory omits that host from hostvars and groups and warns on stderr, rather than letting Ansible use an agent/default identity. Static INI/SSH-config export does not encode credential bindings.
 
 ## MCP Server (Model Context Protocol)
 
 `hss` can serve as an MCP server for LLM agents (Claude Desktop, Zed, Cursor, OpenCode):
 
 - **Tools exposed:** `list-servers`, `execute-command`.
-- **Zero-knowledge security:** private keys and passwords never leave `hss`; commands are executed locally through SSH sessions.
-- **DLP Protection:** automatic redaction of detected private keys and certificates in command outputs.
-- **Read-Only guard:** optional blocking of destructive commands (`rm`, `sudo`, `dd`, `shutdown`).
+- **Local credential handling:** MCP does not expose stored passwords or keys as tool fields; SSH authentication happens locally. Remote command output can still contain secrets.
+- **PEM filtering:** detected private-key and certificate blocks are redacted from command output by default. Logs always redact detected PEM blocks, even when key output is enabled. This is not a general-purpose secret detector.
+- **Read-Only guard:** a best-effort command filter for destructive commands (`rm`, `sudo`, `dd`, `shutdown`), **not a security sandbox**.
 - **Host scoping:** restrict MCP access to specific server globs or tags (e.g. `tag:mcp`).
+
+Stopping the TUI HTTP server blocks new requests but does **not** cancel active SSH commands. The eight-tool concurrency limit applies across stop/restart cycles. HTTP request workers are also bounded; stalled clients can occupy those slots until they disconnect (tiny_http does not expose request socket timeouts).
 
 Run over Stdio (recommended for Zed / Claude Desktop config):
 ```sh

@@ -48,7 +48,7 @@ pub fn run() -> Result<()> {
         .find(|r| r.host_id == host.id)
         .and_then(|r| r.last_credential_id.clone());
 
-    let cred = ssh::resolve_credential(&creds, &cfg, last_cred_id.as_deref())?;
+    let cred = ssh::resolve_host_credential(host, &creds, &cfg, last_cred_id.as_deref())?;
 
     let cred = if let Some(c) = cred {
         c.clone()

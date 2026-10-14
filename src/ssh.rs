@@ -3,8 +3,11 @@ use crate::credentials;
 use crate::types::{Credential, CredentialKind, Host};
 use anyhow::Result;
 use libc;
-use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Build the ssh -J destination ("user@ip:port") for a host's jump host, if any.
 ///
@@ -309,6 +312,34 @@ pub fn validate_jump_spec(jump: &str) -> Result<()> {
     Ok(())
 }
 
+/// An explicit host choice must never silently fall back to another identity.
+pub fn resolve_host_credential<'a>(
+    host: &Host,
+    creds: &'a [Credential],
+    cfg: &AppConfig,
+    last_id: Option<&str>,
+) -> Result<Option<&'a Credential>> {
+    resolve_credential_with_override(creds, cfg, last_id, host.credential_id.as_deref())
+        .map_err(|error| anyhow::anyhow!("Host '{}': {error}", host.name))
+}
+
+fn resolve_credential_with_override<'a>(
+    creds: &'a [Credential],
+    cfg: &AppConfig,
+    last_id: Option<&str>,
+    explicit_id: Option<&str>,
+) -> Result<Option<&'a Credential>> {
+    if let Some(id) = explicit_id {
+        let credential = creds.iter().find(|c| c.id == id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Selected credential '{id}' is missing. Edit the host to select another credential or Automatic."
+            )
+        })?;
+        return Ok(Some(credential));
+    }
+    resolve_credential(creds, cfg, last_id)
+}
+
 pub fn resolve_credential<'a>(
     creds: &'a [Credential],
     cfg: &AppConfig,
@@ -429,7 +460,7 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
         .iter()
         .find(|r| r.host_id == h.id)
         .and_then(|r| r.last_credential_id.clone());
-    let cred = resolve_credential(&creds, &cfg, last_id.as_deref())?
+    let cred = resolve_host_credential(h, &creds, &cfg, last_id.as_deref())?
         .ok_or_else(|| anyhow::anyhow!("No credential resolved for host '{}'", h.name))?;
 
     validate_host(&h.ip)?;
@@ -612,9 +643,34 @@ pub fn copy_id(
     password: Option<&str>,
     cfg: &AppConfig,
 ) -> Result<std::process::Output> {
+    copy_id_cancellable(
+        ip,
+        port,
+        user,
+        pub_key_path,
+        password,
+        cfg,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Cancel the local process tree, not keys already installed on the remote host.
+/// Cancellation is reported as an Interrupted I/O error.
+pub fn copy_id_cancellable(
+    ip: &str,
+    port: u16,
+    user: &str,
+    pub_key_path: &str,
+    password: Option<&str>,
+    cfg: &AppConfig,
+    cancel: &AtomicBool,
+) -> Result<std::process::Output> {
     validate_host(ip)?;
     validate_port(port)?;
     validate_username(user)?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(copy_id_cancelled().into());
+    }
 
     let mut args: Vec<String> = vec![
         "-i".into(),
@@ -634,23 +690,145 @@ pub fn copy_id(
     let mut cmd = Command::new("ssh-copy-id");
     cmd.args(&args).stdin(std::process::Stdio::null());
 
-    let askpass_path = if let Some(pw) = password {
-        let path = write_askpass_helper()?;
+    let askpass = if let Some(pw) = password {
+        let helper = AskpassHelper(write_askpass_helper()?);
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-        cmd.env("SSH_ASKPASS", &path)
+        cmd.env("SSH_ASKPASS", &helper.0)
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", display)
             .env("HSS_PASSWORD", pw);
-        Some(path)
+        Some(helper)
     } else {
         None
     };
 
-    let out = cmd.output();
-    if let Some(ref path) = askpass_path {
-        let _ = std::fs::remove_file(path);
+    Ok(run_copy_id_process(&mut cmd, cancel, askpass)?)
+}
+
+struct AskpassHelper(std::path::PathBuf);
+
+impl Drop for AskpassHelper {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    Ok(out?)
+}
+
+fn copy_id_cancelled() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "Copy ID cancelled")
+}
+
+struct CopyIdProcess {
+    child: Child,
+    finished: bool,
+}
+
+impl CopyIdProcess {
+    fn terminate(&mut self) {
+        // process_group(0) makes the child's PID its PGID; SSH and askpass inherit it.
+        unsafe {
+            libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.finished = true;
+    }
+}
+
+impl Drop for CopyIdProcess {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.terminate();
+        }
+    }
+}
+
+const COPY_ID_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+fn drain_copy_id_output(mut pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(output),
+            Ok(count) => {
+                let keep = count.min(COPY_ID_OUTPUT_LIMIT.saturating_sub(output.len()));
+                output.extend_from_slice(&buffer[..keep]);
+                // Keep draining even after the capture limit: closing a full pipe
+                // early can deadlock or SIGPIPE ssh-copy-id before it finishes.
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn run_copy_id_process(
+    cmd: &mut Command,
+    cancel: &AtomicBool,
+    _askpass: Option<AskpassHelper>,
+) -> std::io::Result<std::process::Output> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(copy_id_cancelled());
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut process = CopyIdProcess {
+        child: cmd.spawn()?,
+        finished: false,
+    };
+    let stdout = process.child.stdout.take().expect("piped stdout");
+    let stderr = process.child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::Builder::new()
+        .name("hss-copy-id-stdout".into())
+        .spawn(move || drain_copy_id_output(stdout))?;
+    let stderr_reader = match std::thread::Builder::new()
+        .name("hss-copy-id-stderr".into())
+        .spawn(move || drain_copy_id_output(stderr))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            process.terminate();
+            let _ = stdout_reader.join();
+            return Err(error);
+        }
+    };
+
+    let mut status = None;
+    let result = loop {
+        if cancel.load(Ordering::Acquire) {
+            process.terminate();
+            break Err(copy_id_cancelled());
+        }
+        if status.is_none() {
+            match process.child.try_wait() {
+                Ok(value) => status = value,
+                Err(error) => {
+                    process.terminate();
+                    break Err(error);
+                }
+            }
+        }
+        // A shell may exit before descendants close its pipes. Keep checking
+        // cancellation until both readers finish, even after the shell is reaped.
+        if let Some(status) = status {
+            if stdout_reader.is_finished() && stderr_reader.is_finished() {
+                process.finished = true;
+                break Ok(status);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = stdout_reader.join();
+    let stderr = stderr_reader.join();
+    let status = result?;
+    let reader_error = || std::io::Error::other("Copy ID output reader panicked");
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.map_err(|_| reader_error())??,
+        stderr: stderr.map_err(|_| reader_error())??,
+    })
 }
 
 pub fn write_askpass_helper() -> Result<std::path::PathBuf> {
@@ -670,8 +848,18 @@ pub fn write_askpass_helper() -> Result<std::path::PathBuf> {
         u64::from_ne_bytes(buf)
     };
     let path = std::env::temp_dir().join(format!("hss-askpass-{:016x}", rand));
-    std::fs::write(&path, "#!/bin/sh\necho \"$HSS_PASSWORD\"\n")?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)?;
+    if let Err(error) = file
+        .write_all(b"#!/bin/sh\necho \"$HSS_PASSWORD\"\n")
+        .and_then(|_| file.set_permissions(std::fs::Permissions::from_mode(0o700)))
+    {
+        let _ = std::fs::remove_file(&path);
+        return Err(error.into());
+    }
     Ok(path)
 }
 
@@ -682,20 +870,26 @@ pub fn connect_direct(host: &str) -> Result<()> {
     let hosts = config::load_hosts()?;
 
     let records = config::migrate_server_records(records, &hosts);
-    let (ssh_host, port, last_cred_id, jump) =
+    let (ssh_host, port, last_cred_id, explicit_cred_id, jump) =
         if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
             let last_id = records
                 .iter()
                 .find(|r| r.host_id == h.id)
                 .and_then(|r| r.last_credential_id.clone());
             let jump = resolve_jump_spec(&hosts, h)?;
-            (h.ip.clone(), h.port, last_id, jump)
+            (h.ip.clone(), h.port, last_id, h.credential_id.clone(), jump)
         } else {
-            (host.to_string(), 22, None, None)
+            (host.to_string(), 22, None, None, None)
         };
 
-    let cred = resolve_credential(&creds, &cfg, last_cred_id.as_deref())?.ok_or_else(|| {
-        anyhow::anyhow!("No credentials configured. Run `hss` to set up credentials.")
+    let cred = resolve_credential_with_override(
+        &creds,
+        &cfg,
+        last_cred_id.as_deref(),
+        explicit_cred_id.as_deref(),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!("No credential resolved. Run `hss` to select or set up credentials.")
     })?;
 
     spawn_ssh(&ssh_host, port, cred, &cfg, jump.as_deref())?;
@@ -706,6 +900,124 @@ pub fn connect_direct(host: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::types::{Credential, CredentialKind};
+
+    #[test]
+    fn copy_id_process_drains_both_streams_beyond_capture_limit() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(
+            "dd if=/dev/zero bs=1048576 count=3 2>/dev/null; (dd if=/dev/zero bs=1048576 count=3 2>/dev/null) >&2",
+        );
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(run_copy_id_process(&mut cmd, &worker_cancel, None));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        cancel.store(true, Ordering::Release);
+        worker.join().unwrap();
+        let output = result.expect("pipe draining must not deadlock").unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), COPY_ID_OUTPUT_LIMIT);
+        assert_eq!(output.stderr.len(), COPY_ID_OUTPUT_LIMIT);
+    }
+
+    fn assert_copy_id_cancels_descendants(shell_exits: bool) {
+        let ready =
+            std::env::temp_dir().join(format!("hss-copy-id-ready-{}", uuid::Uuid::new_v4()));
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(if shell_exits {
+                "parent=$$; (while kill -0 \"$parent\" 2>/dev/null; do sleep 0.01; done; printf ready > \"$1\"; sleep 30) & exit 0"
+            } else {
+                "sleep 30 & printf ready > \"$1\"; wait"
+            })
+            .arg("hss-copy-id-test")
+            .arg(&ready);
+        let askpass = AskpassHelper(write_askpass_helper().unwrap());
+        let askpass_path = askpass.0.clone();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(run_copy_id_process(&mut cmd, &worker_cancel, Some(askpass)));
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let started = ready.exists();
+        cancel.store(true, Ordering::Release);
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // If a regression leaves descendants alive, fail promptly rather than
+        // blocking the test on their inherited stdout/stderr for 30 seconds.
+        if result.is_ok() {
+            worker.join().unwrap();
+        }
+        let _ = std::fs::remove_file(ready);
+        assert!(started, "local child never reached its readiness marker");
+        let error = result
+            .expect("descendants must close their pipes on cancellation")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(!askpass_path.exists());
+    }
+
+    #[test]
+    fn copy_id_process_cancels_running_shell_and_descendants() {
+        assert_copy_id_cancels_descendants(false);
+    }
+
+    #[test]
+    fn copy_id_process_cancels_descendants_after_shell_exit() {
+        assert_copy_id_cancels_descendants(true);
+    }
+
+    #[test]
+    fn copy_id_process_cleans_askpass_on_spawn_error() {
+        let helper = AskpassHelper(write_askpass_helper().unwrap());
+        let path = helper.0.clone();
+        let missing = std::env::temp_dir().join(format!("hss-no-command-{}", uuid::Uuid::new_v4()));
+        let error = run_copy_id_process(
+            &mut Command::new(missing),
+            &AtomicBool::new(false),
+            Some(helper),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn copy_id_process_pre_cancelled_does_not_spawn_and_cleans_askpass() {
+        let marker =
+            std::env::temp_dir().join(format!("hss-copy-id-marker-{}", uuid::Uuid::new_v4()));
+        let helper = AskpassHelper(write_askpass_helper().unwrap());
+        let path = helper.0.clone();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("printf started > \"$1\"")
+            .arg("test")
+            .arg(&marker);
+        let error =
+            run_copy_id_process(&mut cmd, &AtomicBool::new(true), Some(helper)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(!marker.exists());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn copy_id_process_preserves_exit_status_and_cleans_askpass() {
+        let helper = AskpassHelper(write_askpass_helper().unwrap());
+        let path = helper.0.clone();
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("printf out; printf err >&2; exit 7");
+        let output = run_copy_id_process(&mut cmd, &AtomicBool::new(false), Some(helper)).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+        assert!(!path.exists());
+    }
 
     fn key_cred(id: &str) -> Credential {
         Credential {
@@ -728,6 +1040,7 @@ mod tests {
             tags: vec![],
             description: None,
             jump_host_id: jump.map(Into::into),
+            credential_id: None,
         }
     }
 
@@ -786,6 +1099,79 @@ mod tests {
         assert!(jump_spec(&hosts, &hosts[1]).is_none());
         assert!(resolve_jump_spec(&hosts, &hosts[0]).is_err());
         assert!(resolve_jump_spec(&hosts, &hosts[1]).is_err());
+    }
+
+    #[test]
+    fn resolve_host_explicit_wins_over_last_and_default() {
+        let creds = vec![key_cred("explicit"), key_cred("last"), key_cred("default")];
+        let cfg = AppConfig {
+            default_credential_id: Some("default".into()),
+            ..Default::default()
+        };
+        let mut selected = host("target", None, Some("host-hint"), 22);
+        selected.credential_id = Some("explicit".into());
+        let result = resolve_host_credential(&selected, &creds, &cfg, Some("last")).unwrap();
+        assert_eq!(result.unwrap().id, "explicit");
+        // A one-off picker connection may remember a different identity, not change the pin.
+        assert_eq!(selected.credential_id.as_deref(), Some("explicit"));
+        selected.credential_id = None;
+        assert_eq!(
+            resolve_host_credential(&selected, &creds, &cfg, Some("last"))
+                .unwrap()
+                .unwrap()
+                .id,
+            "last"
+        );
+        assert_eq!(
+            resolve_host_credential(&selected, &creds, &cfg, None)
+                .unwrap()
+                .unwrap()
+                .id,
+            "default"
+        );
+    }
+
+    #[test]
+    fn resolve_host_missing_explicit_never_falls_back() {
+        let mut selected = host("target", None, None, 22);
+        selected.credential_id = Some("deleted".into());
+        let cfg = AppConfig {
+            default_credential_id: Some("fallback".into()),
+            ..Default::default()
+        };
+        for creds in [
+            vec![],
+            vec![key_cred("fallback")],
+            vec![key_cred("fallback"), key_cred("other")],
+        ] {
+            let error =
+                resolve_host_credential(&selected, &creds, &cfg, Some("fallback")).unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains("target"));
+            assert!(text.contains("deleted"));
+            assert!(text.contains("Automatic"));
+        }
+    }
+
+    #[test]
+    fn resolve_host_automatic_single_empty_and_picker() {
+        let selected = host("target", None, None, 22);
+        let cfg = AppConfig::default();
+        assert!(resolve_host_credential(&selected, &[], &cfg, None)
+            .unwrap()
+            .is_none());
+        let creds = vec![key_cred("only")];
+        assert_eq!(
+            resolve_host_credential(&selected, &creds, &cfg, None)
+                .unwrap()
+                .unwrap()
+                .id,
+            "only"
+        );
+        let creds = vec![key_cred("one"), key_cred("two")];
+        assert!(resolve_host_credential(&selected, &creds, &cfg, None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

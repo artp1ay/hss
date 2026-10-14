@@ -13,12 +13,14 @@ pub mod audit_screen;
 pub mod copy_id;
 pub mod credentials_screen;
 pub mod delete_popup;
+pub mod help;
 pub mod host_form;
 pub mod input;
 pub mod main_screen;
 pub mod mcp_screen;
 pub mod popup;
 pub mod settings_screen;
+pub mod theme;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -43,6 +45,7 @@ pub enum CopyIdEvent {
     Progress(String),
     Success(String),
     Failure(String),
+    Cancelled(String),
 }
 
 pub struct App {
@@ -62,10 +65,12 @@ pub struct App {
     pub cred_selected: usize,
     pub cred_form: Option<CredentialForm>,
     // Settings screen state
-    pub settings_inputs: Vec<String>, // 6 strings for the editable settings fields
+    pub settings_inputs: Vec<String>, // draft values for editable settings fields
     pub settings_focused_field: usize,
     pub settings_cursor: usize, // char index inside the focused settings field
     pub settings_reveal_token: bool,
+    pub settings_error: Option<String>,
+    pub settings_confirm_discard: bool,
     // Popup state
     pub popup_selected: usize,
     // Host form / import state
@@ -73,15 +78,22 @@ pub struct App {
     pub import_path_input: String,
     pub import_cursor: usize,
     pub import_export_mode: usize, // 0 = import INI, 1 = export INI, 2 = export ssh_config
-    // MCP server (Some while running; screen is modal)
+    pub import_error: Option<String>,
+    pub export_confirm_overwrite: bool,
+    // MCP server (Some while accepting requests; active calls may outlive stop)
     pub mcp: Option<crate::mcp::McpServer>,
     pub mcp_scroll_offset: usize,
     // ssh-copy-id overlay state
     pub copy_id_form: Option<crate::types::CopyIdForm>,
     pub copy_id_rx: Option<std::sync::mpsc::Receiver<CopyIdEvent>>,
+    pub copy_id_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub copy_id_worker: Option<std::thread::JoinHandle<()>>,
     // Delete confirmation popup
     pub delete_popup: Option<DeletePopup>,
-    pub skip_delete_confirm: bool,
+    pub skip_host_delete_confirm: bool,
+    pub skip_credential_delete_confirm: bool,
+    pub help_open: bool,
+    pub help_scroll: u16,
     // Global
     pub should_quit: bool,
     pub status_message: Option<crate::types::StatusMessage>,
@@ -111,17 +123,26 @@ impl App {
             settings_focused_field: 0,
             settings_cursor: 0,
             settings_reveal_token: false,
+            settings_error: None,
+            settings_confirm_discard: false,
             popup_selected: 0,
             host_form: None,
             import_path_input: String::new(),
             import_cursor: 0,
             import_export_mode: 0,
+            import_error: None,
+            export_confirm_overwrite: false,
             mcp: None,
             mcp_scroll_offset: 0,
             copy_id_form: None,
             copy_id_rx: None,
+            copy_id_cancel: None,
+            copy_id_worker: None,
             delete_popup: None,
-            skip_delete_confirm: false,
+            skip_host_delete_confirm: false,
+            skip_credential_delete_confirm: false,
+            help_open: false,
+            help_scroll: 0,
             should_quit: false,
             status_message: None,
         }
@@ -181,6 +202,13 @@ impl App {
     }
 
     pub fn start_audit(&mut self) {
+        if self
+            .audit_state
+            .as_ref()
+            .is_some_and(|state| state.is_running)
+        {
+            return;
+        }
         let mut state = crate::audit::AuditState::new(&self.hosts);
         state.start_all(
             self.hosts.clone(),
@@ -198,34 +226,57 @@ impl App {
     }
 
     pub fn poll_copy_id(&mut self) {
-        if let Some(ref rx) = self.copy_id_rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    CopyIdEvent::Progress(msg) => {
-                        if let Some(ref mut form) = self.copy_id_form {
-                            form.progress_status = Some(msg);
-                        }
+        use std::sync::mpsc::TryRecvError;
+        loop {
+            let event = match self.copy_id_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(event)) => event,
+                Some(Err(TryRecvError::Disconnected)) => CopyIdEvent::Failure(
+                    "Copy ID worker stopped unexpectedly; check the host before retrying.".into(),
+                ),
+                _ => return,
+            };
+            match event {
+                CopyIdEvent::Progress(msg) => {
+                    if let Some(form) = self.copy_id_form.as_mut() {
+                        form.progress_status = Some(msg);
                     }
-                    CopyIdEvent::Success(msg) => {
-                        self.status_message = Some(crate::types::StatusMessage::success(msg));
-                        self.copy_id_form = None;
-                        self.copy_id_rx = None;
+                }
+                CopyIdEvent::Success(msg) => {
+                    self.status_message = Some(crate::types::StatusMessage::success(msg));
+                    self.copy_id_form = None;
+                    if self.screen == Screen::CopyId {
                         self.screen = Screen::Main;
-                        return;
                     }
-                    CopyIdEvent::Failure(msg) => {
-                        if let Some(ref mut form) = self.copy_id_form {
-                            form.in_progress = false;
-                            form.progress_status = None;
-                            form.error_message = Some(msg.clone());
-                        }
-                        self.status_message = Some(crate::types::StatusMessage::error(msg));
-                        self.copy_id_rx = None;
-                        return;
+                    self.finish_copy_id();
+                    return;
+                }
+                CopyIdEvent::Failure(msg) | CopyIdEvent::Cancelled(msg) => {
+                    if let Some(form) = self.copy_id_form.as_mut() {
+                        form.in_progress = false;
+                        form.progress_status = None;
+                        form.error_message = Some(msg.clone());
                     }
+                    self.status_message = Some(crate::types::StatusMessage::error(msg));
+                    self.finish_copy_id();
+                    return;
                 }
             }
         }
+    }
+
+    fn finish_copy_id(&mut self) {
+        self.copy_id_rx = None;
+        self.copy_id_cancel = None;
+        if let Some(worker) = self.copy_id_worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn stop_copy_id(&mut self) {
+        if let Some(cancel) = &self.copy_id_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.finish_copy_id();
     }
 }
 
@@ -339,10 +390,10 @@ pub fn wrap_hotkey_lines<'a>(
     pairs: &[(&'a str, &'a str)],
     max_width: u16,
 ) -> Vec<ratatui::text::Line<'a>> {
-    use ratatui::style::{Color, Style};
+    use ratatui::style::Style;
     use ratatui::text::{Line, Span};
 
-    let width = (max_width as usize).max(20);
+    let width = usize::from(max_width).max(1);
     let mut lines = Vec::new();
     let mut current_spans = Vec::new();
     let mut current_len = 0;
@@ -365,11 +416,11 @@ pub fn wrap_hotkey_lines<'a>(
 
         current_spans.push(Span::styled(
             format!("[{key}]"),
-            Style::default().fg(Color::Blue),
+            Style::default().fg(theme::FOCUS),
         ));
         current_spans.push(Span::styled(
             format!(" {label}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ));
         current_len += item_len;
     }
@@ -385,7 +436,7 @@ pub fn wrap_hotkey_lines<'a>(
     lines
 }
 
-/// Tear down TUI, run SSH, re-init TUI. Saves credential on success; shows picker on auth failure.
+/// Tear down TUI, run SSH, re-init TUI. Exit 255 is not specific to authentication.
 pub fn do_connect(
     terminal: &mut Term,
     app: &mut App,
@@ -420,17 +471,9 @@ pub fn do_connect(
         }
         app.status_message = None;
     } else if status.code() == Some(255) {
-        if let Some(idx) = host
-            .as_ref()
-            .and_then(|h| app.hosts.iter().position(|x| x.id == h.id))
-        {
-            app.screen = Screen::CredentialPicker {
-                host_idx: idx,
-                after_failure: true,
-            };
-        }
+        app.screen = Screen::Main;
         app.status_message = Some(crate::types::StatusMessage::error(
-            "Authentication failed. Choose different credentials.",
+            "SSH connection failed (255): network, host key or authentication. Enter retry · R connect as · E edit.",
         ));
     }
     Ok(())
@@ -449,6 +492,7 @@ pub fn run() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::new(hosts, credentials, cfg, records);
     let result = run_loop(&mut terminal, &mut app);
+    app.stop_copy_id();
     if let Some(mcp) = app.mcp.take() {
         mcp.stop();
     }
@@ -516,9 +560,39 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     if app.delete_popup.is_some() {
         delete_popup::draw(f, app);
     }
+    help::draw_status(f, app);
+    if app.help_open {
+        help::draw(f, app);
+    }
+}
+
+fn handle_global_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if app.help_open {
+        help::handle_key(app, key);
+        return true;
+    }
+    if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.status_message = None;
+        return true;
+    }
+    if key.code == KeyCode::F(1)
+        || (key.code == KeyCode::Char('?')
+            && app.screen == Screen::Main
+            && !app.search_focused
+            && app.delete_popup.is_none())
+    {
+        app.help_open = true;
+        app.help_scroll = 0;
+        return true;
+    }
+    false
 }
 
 fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
+    if handle_global_key(app, key) {
+        return Ok(());
+    }
     if app.delete_popup.is_some() {
         return delete_popup::handle_key(terminal, app, key);
     }
@@ -536,5 +610,197 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
         Screen::ImportHosts => host_form::handle_import_key(terminal, app, key),
         Screen::McpServer => mcp_screen::handle_key(terminal, app, key),
         Screen::CopyId => copy_id::handle_key(terminal, app, key),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+
+    fn app() -> App {
+        App::new(vec![], vec![], AppConfig::default(), vec![])
+    }
+
+    #[test]
+    fn late_copy_success_does_not_steal_focus_and_reaps_worker() {
+        let mut app = app();
+        app.screen = Screen::Settings;
+        app.copy_id_form = Some(crate::types::CopyIdForm {
+            in_progress: true,
+            ..Default::default()
+        });
+        let (tx, rx) = mpsc::channel();
+        app.copy_id_rx = Some(rx);
+        app.copy_id_worker = Some(std::thread::spawn(move || {
+            tx.send(CopyIdEvent::Progress("Copying".into())).unwrap();
+            tx.send(CopyIdEvent::Success("Copied".into())).unwrap();
+        }));
+        while app.copy_id_rx.is_some() {
+            app.poll_copy_id();
+            std::thread::yield_now();
+        }
+        assert_eq!(app.screen, Screen::Settings);
+        assert!(app.copy_id_form.is_none());
+        assert!(app.copy_id_worker.is_none());
+        assert_eq!(app.status_message.unwrap().text, "Copied");
+    }
+
+    #[test]
+    fn cancelled_and_disconnected_copy_recovers_form_for_retry() {
+        for cancelled in [true, false] {
+            let mut app = app();
+            app.screen = Screen::CopyId;
+            app.copy_id_form = Some(crate::types::CopyIdForm {
+                in_progress: true,
+                ..Default::default()
+            });
+            let (tx, rx) = mpsc::channel();
+            app.copy_id_rx = Some(rx);
+            if cancelled {
+                tx.send(CopyIdEvent::Cancelled(
+                    "Installed keys cannot be undone".into(),
+                ))
+                .unwrap();
+            }
+            drop(tx);
+            app.poll_copy_id();
+            let form = app.copy_id_form.unwrap();
+            assert!(!form.in_progress);
+            assert!(form.error_message.is_some());
+            assert!(app.copy_id_rx.is_none());
+            assert_eq!(app.screen, Screen::CopyId);
+        }
+    }
+
+    #[test]
+    fn shutdown_requests_copy_cancellation_and_waits_for_worker() {
+        let mut app = app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        app.copy_id_cancel = Some(cancel.clone());
+        app.copy_id_worker = Some(std::thread::spawn(move || {
+            while !worker_cancel.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }));
+        app.stop_copy_id();
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(app.copy_id_worker.is_none());
+        assert!(app.copy_id_cancel.is_none());
+    }
+
+    #[test]
+    fn help_respects_text_input_focus_and_dismissal_is_global() {
+        let mut app = app();
+        let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        app.search_focused = true;
+        assert!(!handle_global_key(&mut app, question));
+        app.screen = Screen::HostForm;
+        assert!(!handle_global_key(&mut app, question));
+        assert!(handle_global_key(
+            &mut app,
+            KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)
+        ));
+        assert!(app.help_open);
+        assert!(handle_global_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        ));
+        assert!(!app.help_open);
+        assert_eq!(app.screen, Screen::HostForm);
+        app.status_message = Some(crate::types::StatusMessage::error("Visible"));
+        assert!(handle_global_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
+        ));
+        assert!(app.status_message.is_none());
+    }
+
+    #[test]
+    fn screens_render_with_persistent_notification_at_supported_sizes() {
+        let mut app = app();
+        app.hosts.push(Host {
+            id: "host".into(),
+            name: "сервер-你好".into(),
+            ip: "example.com".into(),
+            group: "prod".into(),
+            port: 22,
+            user: None,
+            tags: vec!["web".into()],
+            description: None,
+            jump_host_id: None,
+        });
+        app.host_form = Some(HostForm {
+            focused: 6,
+            ..Default::default()
+        });
+        app.cred_form = Some(CredentialForm {
+            focused: 3,
+            ..Default::default()
+        });
+        app.copy_id_form = Some(crate::types::CopyIdForm {
+            host_id: "host".into(),
+            ..Default::default()
+        });
+        app.settings_inputs = vec![String::new(); 15];
+        app.status_message = Some(crate::types::StatusMessage::error(
+            "Failed to save. Retry or inspect full details with F1.",
+        ));
+        for screen in [
+            Screen::Main,
+            Screen::Credentials,
+            Screen::Settings,
+            Screen::Audit,
+            Screen::HostForm,
+            Screen::ImportHosts,
+            Screen::CopyId,
+            Screen::CredentialPicker {
+                host_idx: 0,
+                after_failure: false,
+            },
+        ] {
+            app.screen = screen;
+            for (width, height) in [(60, 20), (80, 24), (100, 30), (160, 40)] {
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &app)).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(
+                    text.contains("Failed to save"),
+                    "{:?} at {width}x{height}",
+                    app.screen
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_success_and_info_notifications_expire() {
+        for mut status in [
+            crate::types::StatusMessage::success("ok"),
+            crate::types::StatusMessage::info("info"),
+            crate::types::StatusMessage::warning("warning"),
+            crate::types::StatusMessage::error("error"),
+        ] {
+            status.created_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            assert_eq!(
+                status.is_expired(),
+                matches!(
+                    status.kind,
+                    crate::types::StatusKind::Success | crate::types::StatusKind::Info
+                )
+            );
+        }
     }
 }

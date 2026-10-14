@@ -8,8 +8,9 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const MCP_PORT: u16 = 8822;
 
@@ -49,6 +50,7 @@ pub struct LogState {
     pub entries: Vec<LogEntry>,
     pub requests: u64,
     pub tool_calls: u64,
+    pub active_calls: usize,
     pub errors: u64,
     pub client: Option<String>,
     pub log_file: Option<std::path::PathBuf>,
@@ -59,6 +61,7 @@ pub type Log = Arc<Mutex<LogState>>;
 pub struct McpServer {
     server: Arc<tiny_http::Server>,
     thread: Option<std::thread::JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
     pub log: Log,
     pub started: Instant,
     pub port: u16,
@@ -77,8 +80,26 @@ impl McpServer {
         } else {
             MCP_PORT
         };
-        let server = tiny_http::Server::http(("127.0.0.1", port))
-            .map_err(|e| anyhow::anyhow!("MCP server failed to bind 127.0.0.1:{port}: {e}"))?;
+        // tiny_http drops its listening socket on a detached accept thread. Allow
+        // that thread to exit when restarting immediately after stop().
+        let binding_started = Instant::now();
+        let server = loop {
+            match tiny_http::Server::http(("127.0.0.1", port)) {
+                Ok(server) => break server,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+                        && binding_started.elapsed() < Duration::from_millis(250) =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "MCP server failed to bind 127.0.0.1:{port}: {e}"
+                    ));
+                }
+            }
+        };
         let actual_port = server
             .server_addr()
             .to_ip()
@@ -123,12 +144,15 @@ impl McpServer {
             ],
         );
 
-        let (srv, lg) = (server.clone(), log.clone());
-        let thread =
-            std::thread::spawn(move || serve_loop(srv, lg, started, token, allow_unauthenticated));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let (srv, lg, stop) = (server.clone(), log.clone(), stopping.clone());
+        let thread = std::thread::spawn(move || {
+            serve_loop(srv, lg, started, token, allow_unauthenticated, stop)
+        });
         Ok(Self {
             server,
             thread: Some(thread),
+            stopping,
             log,
             started,
             port: actual_port,
@@ -147,11 +171,26 @@ impl McpServer {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// Disable new requests without cancelling or waiting for active SSH calls.
     pub fn stop(mut self) {
-        self.server.unblock();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        // Synchronize with tool admission: calls admitted before this point continue;
+        // none can be admitted after stop returns.
+        {
+            let _log = self.log.lock().unwrap();
+            self.stopping.store(true, Ordering::SeqCst);
         }
+        self.server.unblock();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        log_line(
+            &self.log,
+            self.started,
+            Level::Info,
+            "server",
+            "Stopped accepting requests; active calls continue.".into(),
+            vec![],
+        );
     }
 }
 
@@ -163,6 +202,13 @@ fn log_line(
     msg: String,
     detail: Vec<String>,
 ) {
+    // Sanitize before persistence as well as before storing entries for the TUI.
+    let tag = redact_sensitive_output(tag);
+    let msg = redact_sensitive_output(&msg);
+    let detail = redact_sensitive_output(&detail.join("\n"))
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let mut l = log.lock().unwrap();
     if level == Level::Err {
         l.errors += 1;
@@ -204,7 +250,7 @@ fn log_line(
 
 /// Shorten a value for single-line display.
 fn clip(s: &str, max: usize) -> String {
-    let one_line = s.replace('\n', "⏎");
+    let one_line = redact_sensitive_output(s).replace('\n', "⏎");
     if one_line.chars().count() <= max {
         return one_line;
     }
@@ -248,124 +294,170 @@ fn serve_loop(
     started: Instant,
     token: Option<String>,
     allow_unauthenticated_execute: bool,
+    stopping: Arc<AtomicBool>,
 ) {
-    for mut request in server.incoming_requests() {
-        let method = request.method().clone();
-        let url = request.url().to_string();
-
-        // Path check: only / or /mcp endpoint
-        if url != "/" && url != "/mcp" {
-            let _ = request.respond(make_response(404, Some(json!({"error": "not found"}))));
+    while !stopping.load(Ordering::SeqCst) {
+        // Reserve capacity before receiving: even Request::drop can block while
+        // draining a body. Never handle or discard a Request on this thread.
+        let Some(slot) = HttpRequestSlot::admit() else {
+            std::thread::sleep(Duration::from_millis(10));
             continue;
-        }
-
-        // Auth check (applies to all methods when a token is configured)
-        let is_authed = check_auth(&request, &token);
-        if token.is_some() && !is_authed {
-            log_line(
-                &log,
+        };
+        let request = match server.recv() {
+            Ok(request) => request,
+            Err(_) => break,
+        };
+        let (log, token, stopping) = (log.clone(), token.clone(), stopping.clone());
+        std::thread::spawn(move || {
+            let _slot = slot;
+            handle_http_request(
+                request,
+                log,
                 started,
-                Level::Err,
-                "auth",
-                "rejected: invalid or missing Bearer token".into(),
-                vec![format!("{} {}", method, request.url())],
+                token,
+                allow_unauthenticated_execute,
+                stopping,
             );
-            let _ = request.respond(make_response(401, Some(json!({"error": "unauthorized"}))));
-            continue;
-        }
-
-        // Fast path: non-POST requests are answered inline.
-        if method != tiny_http::Method::Post {
-            let (status, body) = match method {
-                tiny_http::Method::Delete => {
-                    log_line(
-                        &log,
-                        started,
-                        Level::Info,
-                        "http",
-                        "session closed by client (DELETE)".into(),
-                        vec![],
-                    );
-                    (200, None)
-                }
-                other => {
-                    log_line(
-                        &log,
-                        started,
-                        Level::Err,
-                        "http",
-                        format!("rejected {other} {}", request.url()),
-                        vec!["only POST (JSON-RPC) and DELETE are supported".into()],
-                    );
-                    (405, None)
-                }
-            };
-            let _ = request.respond(make_response(status, body));
-            continue;
-        }
-
-        // Content-Type validation: require application/json for POST
-        let has_json_ct = request.headers().iter().any(|h| {
-            h.field.equiv("Content-Type") && h.value.as_str().starts_with("application/json")
         });
-        if !has_json_ct {
-            let _ = request.respond(make_response(
-                415,
-                Some(json!({"error": "Unsupported Media Type: application/json required"})),
-            ));
-            continue;
-        }
+    }
+}
 
-        // Content-Length check if present
-        const MAX_BODY_BYTES: u64 = 1024 * 1024; // 1 MiB
-        let content_length = request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Content-Length"))
-            .and_then(|h| h.value.as_str().parse::<u64>().ok());
+fn handle_http_request(
+    mut request: tiny_http::Request,
+    log: Log,
+    started: Instant,
+    token: Option<String>,
+    allow_unauthenticated_execute: bool,
+    stopping: Arc<AtomicBool>,
+) {
+    if stopping.load(Ordering::SeqCst) {
+        let _ = request.respond(make_response(503, Some(json!({"error": "server stopped"}))));
+        return;
+    }
+    let method = request.method().clone();
+    let url = request.url().to_string();
 
-        if let Some(cl) = content_length {
-            if cl > MAX_BODY_BYTES {
-                let _ = request.respond(make_response(
-                    413,
-                    Some(json!({"error": "Payload Too Large: maximum body size is 1 MiB"})),
-                ));
-                continue;
-            }
-        }
+    // Path check: only / or /mcp endpoint
+    if url != "/" && url != "/mcp" {
+        let _ = request.respond(make_response(404, Some(json!({"error": "not found"}))));
+        return;
+    }
 
-        // Read the body in the accept thread (bounded to 1 MiB + 1 byte to detect overflow).
-        let mut buf = String::new();
-        let read_res = std::io::Read::read_to_string(
-            &mut std::io::Read::take(request.as_reader(), MAX_BODY_BYTES + 1),
-            &mut buf,
+    // Auth check (applies to all methods when a token is configured)
+    let is_authed = check_auth(&request, &token);
+    if token.is_some() && !is_authed {
+        log_line(
+            &log,
+            started,
+            Level::Err,
+            "auth",
+            "rejected: invalid or missing Bearer token".into(),
+            vec![format!("{} {}", method, request.url())],
         );
-        if read_res.is_err() || buf.len() > MAX_BODY_BYTES as usize {
+        let _ = request.respond(make_response(401, Some(json!({"error": "unauthorized"}))));
+        return;
+    }
+
+    // Non-POST requests do not require a body read.
+    if method != tiny_http::Method::Post {
+        let (status, body) = match method {
+            tiny_http::Method::Delete => {
+                log_line(
+                    &log,
+                    started,
+                    Level::Info,
+                    "http",
+                    "session closed by client (DELETE)".into(),
+                    vec![],
+                );
+                (200, None)
+            }
+            other => {
+                log_line(
+                    &log,
+                    started,
+                    Level::Err,
+                    "http",
+                    format!("rejected {other} {}", request.url()),
+                    vec!["only POST (JSON-RPC) and DELETE are supported".into()],
+                );
+                (405, None)
+            }
+        };
+        let _ = request.respond(make_response(status, body));
+        return;
+    }
+
+    // Content-Type validation: require application/json for POST
+    let has_json_ct = request
+        .headers()
+        .iter()
+        .any(|h| h.field.equiv("Content-Type") && h.value.as_str().starts_with("application/json"));
+    if !has_json_ct {
+        let _ = request.respond(make_response(
+            415,
+            Some(json!({"error": "Unsupported Media Type: application/json required"})),
+        ));
+        return;
+    }
+
+    // Content-Length check if present
+    const MAX_BODY_BYTES: u64 = 1024 * 1024; // 1 MiB
+    let content_length = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Length"))
+        .and_then(|h| h.value.as_str().parse::<u64>().ok());
+
+    if let Some(cl) = content_length {
+        if cl > MAX_BODY_BYTES {
             let _ = request.respond(make_response(
                 413,
                 Some(json!({"error": "Payload Too Large: maximum body size is 1 MiB"})),
             ));
-            continue;
+            return;
         }
+    }
 
-        // Peek at the method to decide sync vs async.
-        let rpc_method = serde_json::from_str::<Value>(&buf)
-            .ok()
-            .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from));
+    // Byte-bounded read runs on a worker, never on the listener-owning thread.
+    let mut buf = String::new();
+    let read_res = std::io::Read::read_to_string(
+        &mut std::io::Read::take(request.as_reader(), MAX_BODY_BYTES + 1),
+        &mut buf,
+    );
+    if read_res.is_err() || buf.len() > MAX_BODY_BYTES as usize {
+        let _ = request.respond(make_response(
+            413,
+            Some(json!({"error": "Payload Too Large: maximum body size is 1 MiB"})),
+        ));
+        return;
+    }
 
-        let is_tool_call = rpc_method.as_deref() == Some("tools/call");
+    if stopping.load(Ordering::SeqCst) {
+        let _ = request.respond(make_response(503, Some(json!({"error": "server stopped"}))));
+        return;
+    }
 
-        let auth_for_exec = is_authed || allow_unauthenticated_execute;
+    // Tool admission is separate from HTTP worker admission.
+    let rpc_method = serde_json::from_str::<Value>(&buf)
+        .ok()
+        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from));
 
-        if is_tool_call {
-            // Tool calls may run SSH commands that take minutes.
-            // Bounded concurrency: cap parallel background tool calls to 8 to avoid thread exhaustion.
-            const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
-            static ACTIVE_TOOL_CALLS: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+    let is_tool_call = rpc_method.as_deref() == Some("tools/call");
 
-            let current = ACTIVE_TOOL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
-            if current >= MAX_CONCURRENT_TOOL_CALLS {
+    let auth_for_exec = is_authed || allow_unauthenticated_execute;
+
+    if is_tool_call {
+        // Tool calls may run SSH commands that take minutes. Admission remains
+        // process-wide even when a stopped generation still has active calls.
+        let active = match ActiveCall::admit(&log, &stopping) {
+            Ok(active) => active,
+            Err(503) => {
+                let _ =
+                    request.respond(make_response(503, Some(json!({"error": "server stopped"}))));
+                return;
+            }
+            Err(_) => {
                 let _ = request.respond(make_response(
                     429,
                     Some(json!({
@@ -376,21 +468,73 @@ fn serve_loop(
                         }
                     })),
                 ));
-                continue;
+                return;
             }
+        };
 
-            ACTIVE_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let lg = log.clone();
-            std::thread::spawn(move || {
-                let (status, body) = handle_rpc(&buf, &lg, started, auth_for_exec);
-                let _ = request.respond(make_response(status, body));
-                ACTIVE_TOOL_CALLS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            });
-        } else {
-            // Fast RPC: ping, initialize, tools/list, notifications.
-            let (status, body) = handle_rpc(&buf, &log, started, auth_for_exec);
-            let _ = request.respond(make_response(status, body));
+        let _active = active;
+        let (status, body) = handle_rpc(&buf, &log, started, auth_for_exec);
+        let _ = request.respond(make_response(status, body));
+    } else {
+        // Fast RPC: ping, initialize, tools/list, notifications.
+        let (status, body) = handle_rpc(&buf, &log, started, auth_for_exec);
+        let _ = request.respond(make_response(status, body));
+    }
+}
+
+// Process-wide limits survive stop/restart while old workers are still running.
+const MAX_HTTP_REQUESTS: usize = 16;
+static ACTIVE_HTTP_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn reserve_slot(counter: &AtomicUsize, limit: usize) -> bool {
+    let mut active = counter.load(Ordering::SeqCst);
+    while active < limit {
+        match counter.compare_exchange_weak(active, active + 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return true,
+            Err(current) => active = current,
         }
+    }
+    false
+}
+
+struct HttpRequestSlot;
+
+impl HttpRequestSlot {
+    fn admit() -> Option<Self> {
+        reserve_slot(&ACTIVE_HTTP_REQUESTS, MAX_HTTP_REQUESTS).then(|| Self)
+    }
+}
+
+impl Drop for HttpRequestSlot {
+    fn drop(&mut self) {
+        ACTIVE_HTTP_REQUESTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ActiveCall(Log);
+
+impl ActiveCall {
+    fn admit(log: &Log, stopping: &AtomicBool) -> Result<Self, u16> {
+        const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
+        let mut state = log.lock().unwrap();
+        if stopping.load(Ordering::SeqCst) {
+            return Err(503);
+        }
+        if !reserve_slot(&ACTIVE_TOOL_CALLS, MAX_CONCURRENT_TOOL_CALLS) {
+            return Err(429);
+        }
+        state.active_calls += 1;
+        Ok(Self(log.clone()))
+    }
+}
+
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        let mut log = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        log.active_calls = log.active_calls.saturating_sub(1);
+        ACTIVE_TOOL_CALLS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -504,7 +648,8 @@ fn handle_rpc(
                 .pointer("/params/clientInfo/version")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            log.lock().unwrap().client = Some(format!("{client} {client_ver}"));
+            log.lock().unwrap().client =
+                Some(redact_sensitive_output(&format!("{client} {client_ver}")));
             log_line(
                 log,
                 started,
@@ -610,33 +755,33 @@ pub fn is_host_allowed_for_mcp(pattern: &str, host: &crate::types::Host) -> bool
     false
 }
 
-/// DLP filter: redacts private keys, certificates and sensitive tokens from command outputs.
+/// DLP filter: redact PEM blocks, including keys and certificates, before sampling.
 pub fn redact_sensitive_output(text: &str) -> String {
     let mut out = String::new();
-    let mut in_private_key = false;
-
-    for line in text.lines() {
-        if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
-            in_private_key = true;
-            out.push_str("[REDACTED: PRIVATE KEY DETECTED]\n");
-            continue;
-        }
-        if in_private_key {
-            if line.contains("-----END") && line.contains("PRIVATE KEY-----") {
-                in_private_key = false;
-            }
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
+    let mut rest = text;
+    while let Some(begin) = rest.find("-----BEGIN ") {
+        out.push_str(&rest[..begin]);
+        let block = &rest[begin + "-----BEGIN ".len()..];
+        let Some(label_end) = block.find("-----") else {
+            out.push_str("[REDACTED: PEM DETECTED]");
+            return out;
+        };
+        let label = &block[..label_end];
+        out.push_str(if label.contains("PRIVATE KEY") {
+            "[REDACTED: PRIVATE KEY DETECTED]"
+        } else {
+            "[REDACTED: PEM DETECTED]"
+        });
+        let end_marker = format!("-----END {label}-----");
+        let payload = &block[label_end + 5..];
+        let Some(end) = payload.find(&end_marker) else {
+            // Fail closed on incomplete blocks, including output truncated by SSH.
+            return out;
+        };
+        rest = &payload[end + end_marker.len()..];
     }
-
-    if text.ends_with('\n') || out.is_empty() {
-        out
-    } else {
-        out.pop();
-        out
-    }
+    out.push_str(rest);
+    out
 }
 
 /// Checks if command is destructive and prohibited under read-only mode.
@@ -687,7 +832,8 @@ pub fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "host": { "type": "string", "description": "Server name or IP as configured in hss" },
-                    "command": { "type": "string", "description": "Shell command to execute" }
+                    "command": { "type": "string", "description": "Shell command to execute" },
+                    "allow_key_output": { "type": "boolean", "default": false, "description": "Allow sensitive PEM in this response only; activity logs are always redacted" }
                 },
                 "required": ["host", "command"]
             }
@@ -879,7 +1025,9 @@ fn call_tool(
                             stdout.lines().count()
                         ),
                     ];
-                    if let Some(first) = stdout.lines().find(|l| !l.trim().is_empty()) {
+                    let log_stdout = redact_sensitive_output(&stdout);
+                    let log_stderr = redact_sensitive_output(&stderr);
+                    if let Some(first) = log_stdout.lines().find(|l| !l.trim().is_empty()) {
                         detail.push(format!("stdout sample: {}", clip(first, 120)));
                     }
                     if !stderr.is_empty() {
@@ -888,7 +1036,7 @@ fn call_tool(
                             stderr.len(),
                             stderr.lines().count()
                         ));
-                        if let Some(err) = stderr.lines().find(|l| !l.trim().is_empty()) {
+                        if let Some(err) = log_stderr.lines().find(|l| !l.trim().is_empty()) {
                             detail.push(format!("stderr sample: {}", clip(err, 120)));
                         }
                     }
@@ -905,23 +1053,19 @@ fn call_tool(
                         format!("execute-command @ {host} finished (exit {code}, {ms} ms)"),
                         detail,
                     );
-                    let stdout = if cfg.mcp_dlp_filter {
-                        redact_sensitive_output(&stdout)
-                    } else {
-                        stdout.to_string()
-                    };
-                    let stderr = if cfg.mcp_dlp_filter {
-                        redact_sensitive_output(&stderr)
-                    } else {
-                        stderr.to_string()
-                    };
+                    let allow_key_output = args
+                        .get("allow_key_output")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let stdout = response_output(&stdout, cfg.mcp_dlp_filter, allow_key_output);
+                    let stderr = response_output(&stderr, cfg.mcp_dlp_filter, allow_key_output);
 
                     let mut text = format!("exit code: {code}\n");
                     const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024; // 128 KiB
                     if !stdout.is_empty() {
                         text.push_str("stdout:\n");
                         if stdout.len() > MAX_TOOL_OUTPUT_BYTES {
-                            text.push_str(&stdout[..MAX_TOOL_OUTPUT_BYTES]);
+                            text.push_str(utf8_prefix(&stdout, MAX_TOOL_OUTPUT_BYTES));
                             text.push_str("\n[TRUNCATED: output exceeded 128 KiB]\n");
                         } else {
                             text.push_str(&stdout);
@@ -930,7 +1074,7 @@ fn call_tool(
                     if !stderr.is_empty() {
                         text.push_str("stderr:\n");
                         if stderr.len() > MAX_TOOL_OUTPUT_BYTES {
-                            text.push_str(&stderr[..MAX_TOOL_OUTPUT_BYTES]);
+                            text.push_str(utf8_prefix(&stderr, MAX_TOOL_OUTPUT_BYTES));
                             text.push_str("\n[TRUNCATED: output exceeded 128 KiB]\n");
                         } else {
                             text.push_str(&stderr);
@@ -950,7 +1094,18 @@ fn call_tool(
                         ),
                         vec![format!("error: {e}")],
                     );
-                    tool_text(format!("Error: {e}"), true)
+                    let allow_key_output = args
+                        .get("allow_key_output")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    tool_text(
+                        response_output(
+                            &format!("Error: {e}"),
+                            cfg.mcp_dlp_filter,
+                            allow_key_output,
+                        ),
+                        true,
+                    )
                 }
             }
         }
@@ -968,6 +1123,22 @@ fn call_tool(
     }
 }
 
+fn response_output(text: &str, dlp: bool, allow_key_output: bool) -> String {
+    if dlp && !allow_key_output {
+        redact_sensitive_output(text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn tool_text(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
@@ -975,6 +1146,17 @@ fn tool_text(text: String, is_error: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Tests that fill the process-wide admission limit must not race each other.
+    static ADMISSION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn socket_test_config() -> crate::config::AppConfig {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        crate::config::AppConfig {
+            mcp_port: listener.local_addr().unwrap().port(),
+            ..Default::default()
+        }
+    }
 
     fn rpc(body: &str) -> (u16, Option<Value>) {
         handle_rpc(
@@ -1070,6 +1252,7 @@ mod tests {
 
     #[test]
     fn server_starts_serves_and_stops() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
         let cfg = crate::config::AppConfig {
             mcp_port: 0,
             ..Default::default()
@@ -1092,7 +1275,69 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_post_does_not_block_stop_or_same_port_restart() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        let cfg = socket_test_config();
+        let server = McpServer::start_with_config(&cfg).unwrap();
+        let mut client = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let auth = resolve_mcp_token()
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        write!(
+            client,
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: 2048\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n{{"
+        )
+        .unwrap();
+        // 100 Continue proves the request reached as_reader(), not just tiny_http's
+        // internal header parser. Keep the incomplete body socket open during stop.
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.starts_with("HTTP/1.1 100 "), "{line:?}");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            server.stop();
+            done_tx.send(()).unwrap();
+        });
+        let stopped = done_rx.recv_timeout(Duration::from_secs(2));
+        if stopped.is_err() {
+            reader.get_ref().shutdown(Shutdown::Both).unwrap();
+            stopper.join().unwrap();
+            panic!("stop waited for an incomplete POST body");
+        }
+        stopper.join().unwrap();
+
+        // The old Request still exists and its client socket is still open.
+        let restarted = McpServer::start_with_config(&cfg).unwrap();
+        let mut ping = TcpStream::connect(("127.0.0.1", restarted.port)).unwrap();
+        ping.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        write!(
+            ping,
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        BufReader::new(ping).read_line(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response:?}");
+        restarted.stop();
+        reader.get_ref().shutdown(Shutdown::Both).unwrap();
+    }
+
+    #[test]
     fn payload_too_large_returns_413() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
         let cfg = crate::config::AppConfig {
             mcp_port: 0,
             ..Default::default()
@@ -1131,6 +1376,220 @@ mod tests {
     }
 
     #[test]
+    fn pem_redaction_handles_inline_certificates_multiple_and_incomplete_blocks() {
+        for label in [
+            "PRIVATE KEY",
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+            "CERTIFICATE",
+            "PUBLIC KEY",
+        ] {
+            let raw = format!(
+                "before -----BEGIN {label}----- secret-payload -----END {label}----- after"
+            );
+            let redacted = redact_sensitive_output(&raw);
+            assert!(!redacted.contains("secret-payload"));
+            assert!(!redacted.contains("-----BEGIN"));
+            assert!(redacted.contains("before"));
+            assert!(redacted.contains("after"));
+            let incomplete = format!("before -----BEGIN {label}-----\nsecret-payload");
+            assert!(!redact_sensitive_output(&incomplete).contains("secret-payload"));
+        }
+        assert_eq!(redact_sensitive_output("plain\ntext\n"), "plain\ntext\n");
+        let multiple = "-----BEGIN CERTIFICATE----- cert -----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY----- key -----END PRIVATE KEY-----";
+        assert_eq!(
+            redact_sensitive_output(multiple)
+                .matches("[REDACTED:")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn logs_and_samples_never_contain_pem_even_when_response_allows_it() {
+        let path = std::env::temp_dir().join(format!("hss-mcp-log-{}", uuid::Uuid::new_v4()));
+        let log = Arc::new(Mutex::new(LogState {
+            log_file: Some(path.clone()),
+            ..Default::default()
+        }));
+        let raw =
+            "prefix -----BEGIN PRIVATE KEY-----\nsecret-payload\n-----END PRIVATE KEY----- suffix";
+        assert_eq!(response_output(raw, true, true), raw);
+        assert_eq!(response_output(raw, false, false), raw);
+        assert!(!response_output(raw, true, false).contains("secret-payload"));
+        assert!(!clip(raw, 120).contains("secret-payload"));
+        for stream in ["stdout", "stderr"] {
+            log_line(
+                &log,
+                Instant::now(),
+                Level::Ok,
+                "tool",
+                raw.into(),
+                vec![format!("{stream}: {raw}")],
+            );
+        }
+        // Redact a block split over detail lines as one unit.
+        log_line(
+            &log,
+            Instant::now(),
+            Level::Info,
+            "tool",
+            "output".into(),
+            vec![
+                "-----BEGIN CERTIFICATE-----".into(),
+                "certificate-payload".into(),
+                "-----END CERTIFICATE-----".into(),
+            ],
+        );
+        let disk = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let memory = format!("{:?}", log.lock().unwrap().entries);
+        for output in [disk, memory] {
+            assert!(!output.contains("secret-payload"));
+            assert!(!output.contains("certificate-payload"));
+            assert!(!output.contains("-----BEGIN"));
+            assert!(output.contains("[REDACTED:"));
+        }
+    }
+
+    #[test]
+    fn active_calls_are_scoped_and_stop_does_not_cancel_them() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
+        let cfg = crate::config::AppConfig {
+            mcp_port: 0,
+            ..Default::default()
+        };
+        let server = match McpServer::start_with_config(&cfg) {
+            Ok(server) => server,
+            Err(e) => {
+                eprintln!("Skipping socket test: {e}");
+                return;
+            }
+        };
+        let log = server.log.clone();
+        let active = ActiveCall::admit(&log, &server.stopping).unwrap();
+        let stopped = server.stopping.clone();
+        server.stop();
+        assert!(stopped.load(Ordering::SeqCst));
+        assert_eq!(log.lock().unwrap().active_calls, 1);
+        assert!(matches!(ActiveCall::admit(&log, &stopped), Err(503)));
+        drop(active);
+        assert_eq!(log.lock().unwrap().active_calls, 0);
+    }
+
+    #[test]
+    fn active_call_limit_releases_capacity() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
+        let log = Arc::new(Mutex::new(LogState::default()));
+        let stopping = AtomicBool::new(false);
+        let mut calls: Vec<_> = (0..8)
+            .map(|_| ActiveCall::admit(&log, &stopping).unwrap())
+            .collect();
+        assert!(matches!(ActiveCall::admit(&log, &stopping), Err(429)));
+        calls.pop();
+        let replacement = ActiveCall::admit(&log, &stopping).unwrap();
+        assert_eq!(log.lock().unwrap().active_calls, 8);
+        drop(calls);
+        drop(replacement);
+        assert_eq!(log.lock().unwrap().active_calls, 0);
+    }
+
+    #[test]
+    fn http_worker_admission_is_bounded_and_releases_capacity() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
+        let started = Instant::now();
+        let mut slots = Vec::new();
+        while slots.len() < MAX_HTTP_REQUESTS {
+            if let Some(slot) = HttpRequestSlot::admit() {
+                slots.push(slot);
+            } else {
+                // A stopped socket test may still have a worker draining its body.
+                assert!(started.elapsed() < Duration::from_secs(2));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(HttpRequestSlot::admit().is_none());
+        assert_eq!(
+            ACTIVE_HTTP_REQUESTS.load(Ordering::SeqCst),
+            MAX_HTTP_REQUESTS
+        );
+        slots.pop();
+        let replacement = HttpRequestSlot::admit().unwrap();
+        assert!(HttpRequestSlot::admit().is_none());
+        drop(slots);
+        drop(replacement);
+        assert_eq!(ACTIVE_HTTP_REQUESTS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn admission_slots_are_atomic_and_release_on_unwind() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..32)
+            .map(|_| {
+                let counter = counter.clone();
+                std::thread::spawn(move || reserve_slot(&counter, 8))
+            })
+            .collect();
+        let admitted = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(admitted, 8);
+        assert_eq!(counter.load(Ordering::SeqCst), 8);
+
+        let log = Arc::new(Mutex::new(LogState::default()));
+        let result = std::panic::catch_unwind(|| {
+            let _active = ActiveCall::admit(&log, &AtomicBool::new(false)).unwrap();
+            panic!("simulate a worker panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(log.lock().unwrap().active_calls, 0);
+        assert_eq!(ACTIVE_TOOL_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn active_call_limit_survives_server_restart() {
+        let _serial = ADMISSION_TEST_LOCK.lock().unwrap();
+        let cfg = socket_test_config();
+        let server = McpServer::start_with_config(&cfg).unwrap();
+        let old_log = server.log.clone();
+        let mut old_calls: Vec<_> = (0..8)
+            .map(|_| ActiveCall::admit(&old_log, &server.stopping).unwrap())
+            .collect();
+        server.stop();
+
+        let restarted = McpServer::start_with_config(&cfg).unwrap();
+        assert_eq!(restarted.log.lock().unwrap().active_calls, 0);
+        assert_eq!(old_log.lock().unwrap().active_calls, 8);
+        assert!(matches!(
+            ActiveCall::admit(&restarted.log, &restarted.stopping),
+            Err(429)
+        ));
+        old_calls.pop();
+        let replacement = ActiveCall::admit(&restarted.log, &restarted.stopping).unwrap();
+        assert_eq!(restarted.log.lock().unwrap().active_calls, 1);
+        assert_eq!(old_log.lock().unwrap().active_calls, 7);
+        assert!(matches!(
+            ActiveCall::admit(&old_log, &AtomicBool::new(false)),
+            Err(429)
+        ));
+        drop(old_calls);
+        drop(replacement);
+        assert_eq!(old_log.lock().unwrap().active_calls, 0);
+        assert_eq!(restarted.log.lock().unwrap().active_calls, 0);
+        restarted.stop();
+    }
+
+    #[test]
+    fn truncation_preserves_utf8_boundaries() {
+        assert_eq!(utf8_prefix("a€b", 3), "a");
+        assert_eq!(utf8_prefix("a€b", 4), "a€");
+    }
+
+    #[test]
     fn read_only_prohibits_destructive_commands() {
         assert!(is_prohibited_command_in_read_only("rm -rf /").is_some());
         assert!(is_prohibited_command_in_read_only("sudo apt update").is_some());
@@ -1155,6 +1614,7 @@ mod tests {
             tags: vec!["db".into(), "critical".into()],
             description: None,
             jump_host_id: None,
+            credential_id: None,
         };
 
         assert!(is_host_allowed_for_mcp("*", &host));

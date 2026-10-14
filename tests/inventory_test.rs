@@ -69,6 +69,7 @@ fn test_import_adds_new_hosts() {
     assert_eq!(hosts[0].ip, "10.0.0.1");
     assert_eq!(hosts[0].user, Some("deploy".into()));
     assert_eq!(hosts[0].group, "webservers");
+    assert!(hosts[0].credential_id.is_none());
 }
 
 #[test]
@@ -83,6 +84,7 @@ fn test_import_updates_existing_host() {
         tags: vec!["custom-tag".into()],
         description: Some("My server".into()),
         jump_host_id: None,
+        credential_id: Some("pinned".into()),
     };
     let mut hosts = vec![existing];
     let ini = "[webservers]\nweb1 ansible_host=10.0.0.1 ansible_user=deploy\n";
@@ -92,6 +94,7 @@ fn test_import_updates_existing_host() {
     assert_eq!(hosts[0].ip, "10.0.0.1");
     assert_eq!(hosts[0].user, Some("deploy".into()));
     assert_eq!(hosts[0].description, Some("My server".into()));
+    assert_eq!(hosts[0].credential_id.as_deref(), Some("pinned"));
     assert!(hosts[0].tags.contains(&"custom-tag".to_string()));
 }
 
@@ -107,6 +110,7 @@ fn test_import_merges_tags() {
         tags: vec!["existing-tag".into()],
         description: None,
         jump_host_id: None,
+        credential_id: None,
     };
     let mut hosts = vec![existing];
     let ini = "[web]\nweb1 ansible_host=10.0.0.1 # tags=new-tag,existing-tag\n";
@@ -128,6 +132,7 @@ fn test_import_partial_merge_does_not_overwrite_with_defaults() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        credential_id: None,
     };
     let mut hosts = vec![existing];
 
@@ -153,6 +158,7 @@ fn test_generate_ansible_inventory_handles_reserved_group_names() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        credential_id: None,
     }];
     let creds = vec![];
     let records = vec![];
@@ -178,6 +184,7 @@ fn test_export_to_ssh_config() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            credential_id: None,
         },
         Host {
             id: "w".into(),
@@ -189,6 +196,7 @@ fn test_export_to_ssh_config() {
             tags: vec!["web".into(), "prod".into()],
             description: Some("Main server".into()),
             jump_host_id: Some("b".into()),
+            credential_id: None,
         },
     ];
     let cfg = hss::inventory::export_to_ssh_config(&hosts);
@@ -217,6 +225,7 @@ fn test_export_to_ini_basic() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            credential_id: None,
         },
         Host {
             id: "2".into(),
@@ -228,6 +237,7 @@ fn test_export_to_ini_basic() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            credential_id: None,
         },
     ];
     let ini = hss::inventory::export_to_ini(&hosts);
@@ -236,6 +246,52 @@ fn test_export_to_ini_basic() {
     assert!(ini.contains("web1 ansible_host=10.0.0.1 ansible_port=22 ansible_user=deploy"));
     assert!(ini.contains("db1 ansible_host=10.0.0.2 ansible_port=5432"));
     assert!(!ini.contains("ansible_user=postgres") && !ini.contains("ansible_user=\n"));
+}
+
+#[test]
+fn test_inventory_explicit_identity_and_missing_credential_fail_closed() {
+    use hss::types::{Credential, CredentialKind, ServerRecord};
+    let mut hosts = hss::inventory::parse_inventory(
+        "[web]\napp ansible_host=192.0.2.1 ansible_user=host-hint\n",
+    );
+    hosts[0].tags = vec!["prod".into()];
+    hosts[0].credential_id = Some("explicit".into());
+    let creds: Vec<Credential> = ["explicit", "last", "default"]
+        .into_iter()
+        .map(|id| Credential {
+            id: id.into(),
+            name: id.into(),
+            username: format!("{id}-user"),
+            kind: CredentialKind::Key,
+            key_path: Some(format!("/keys/{id}")),
+        })
+        .collect();
+    let cfg = hss::config::AppConfig {
+        default_credential_id: Some("default".into()),
+        default_user: Some("global-user".into()),
+        ..Default::default()
+    };
+    let records = vec![ServerRecord {
+        host_id: hosts[0].id.clone(),
+        last_credential_id: Some("last".into()),
+    }];
+    let inventory = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
+    let vars = &inventory["_meta"]["hostvars"]["app"];
+    assert_eq!(vars["ansible_user"], "explicit-user");
+    assert_eq!(vars["ansible_ssh_private_key_file"], "/keys/explicit");
+
+    hosts[0].credential_id = Some("deleted".into());
+    let inventory = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
+    assert!(inventory["_meta"]["hostvars"].get("app").is_none());
+    assert!(inventory.get("web").is_none());
+    assert!(inventory.get("tag_prod").is_none());
+    assert_eq!(inventory["all"]["children"], serde_json::json!([]));
+
+    hosts[0].credential_id = None;
+    let inventory = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
+    let vars = &inventory["_meta"]["hostvars"]["app"];
+    assert_eq!(vars["ansible_user"], "host-hint");
+    assert_eq!(vars["ansible_ssh_private_key_file"], "/keys/last");
 }
 
 #[test]
@@ -254,6 +310,7 @@ fn test_generate_ansible_inventory_structure() {
             tags: vec!["edge".into()],
             description: None,
             jump_host_id: None,
+            credential_id: None,
         },
         Host {
             id: "app-id".into(),
@@ -265,6 +322,7 @@ fn test_generate_ansible_inventory_structure() {
             tags: vec!["prod".into(), "k8s".into()],
             description: Some("Production node".into()),
             jump_host_id: Some("bastion-id".into()),
+            credential_id: None,
         },
     ];
 

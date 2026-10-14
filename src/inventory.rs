@@ -59,6 +59,7 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            credential_id: None,
         });
     }
     hosts
@@ -160,6 +161,7 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
                 tags: ini_tags,
                 description: None,
                 jump_host_id: None,
+                credential_id: None,
             });
             added += 1;
         }
@@ -251,19 +253,29 @@ pub fn generate_ansible_inventory(
             .find(|r| r.host_id == host.id)
             .and_then(|r| r.last_credential_id.as_deref());
 
-        let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_cred_id)
-            .ok()
-            .flatten();
+        let resolved_cred =
+            match crate::ssh::resolve_host_credential(host, creds, cfg, last_cred_id) {
+                Ok(credential) => credential,
+                Err(error) => {
+                    // Without a credential Ansible could silently use the agent/default identity.
+                    eprintln!("hss inventory: skipping host: {error}");
+                    continue;
+                }
+            };
 
         let mut vars = serde_json::Map::new();
         vars.insert("ansible_host".into(), json!(host.ip));
         vars.insert("ansible_port".into(), json!(host.port));
 
-        let user = host
-            .user
-            .clone()
-            .or_else(|| resolved_cred.map(|c| c.username.clone()))
-            .or_else(|| cfg.default_user.clone());
+        let user = if host.credential_id.is_some() {
+            resolved_cred.map(|c| c.username.clone())
+        } else {
+            // Preserve the legacy inventory-only User hint in Automatic mode.
+            host.user
+                .clone()
+                .or_else(|| resolved_cred.map(|c| c.username.clone()))
+                .or_else(|| cfg.default_user.clone())
+        };
         if let Some(ref u) = user {
             vars.insert("ansible_user".into(), json!(u));
         }

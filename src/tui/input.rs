@@ -100,6 +100,53 @@ pub fn spans(value: &str, cursor: usize, style: Style) -> Vec<Span<'static>> {
     ]
 }
 
+/// Keep the block cursor visible in a horizontally scrolled, cell-bounded field.
+pub fn spans_with_width(
+    value: &str,
+    cursor: usize,
+    style: Style,
+    width: usize,
+) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let at = chars.get(cursor).copied().unwrap_or(' ');
+    let at_width = at.width().unwrap_or(0).max(1);
+    let mut start = cursor;
+    let mut used = at_width.min(width);
+    while start > 0 {
+        let next_width = chars[start - 1].width().unwrap_or(0);
+        if used + next_width > width {
+            break;
+        }
+        start -= 1;
+        used += next_width;
+    }
+    let before: String = chars[start..cursor].iter().collect();
+    // A wide glyph cannot fit in a one-cell field; still show a visible cursor.
+    let cursor_text = if at_width > width || at.width() == Some(0) {
+        " ".to_string()
+    } else {
+        at.to_string()
+    };
+    let mut after = String::new();
+    for ch in chars.iter().skip(cursor + 1) {
+        let next_width = ch.width().unwrap_or(0);
+        if used + next_width > width {
+            break;
+        }
+        after.push(*ch);
+        used += next_width;
+    }
+    vec![
+        Span::styled(before, style),
+        Span::styled(cursor_text, style.add_modifier(Modifier::REVERSED)),
+        Span::styled(after, style),
+    ]
+}
+
 /// Visual terminal width of a string.
 pub fn str_width(s: &str) -> usize {
     s.width()
@@ -176,6 +223,28 @@ mod tests {
         assert!(!handle(&mut buf, &mut cur, k(KeyCode::Tab)));
         assert!(!handle(&mut buf, &mut cur, k(KeyCode::Enter)));
         assert!(!handle(&mut buf, &mut cur, k(KeyCode::Up)));
+    }
+
+    #[test]
+    fn viewport_keeps_cursor_visible_and_respects_cell_width() {
+        for value in ["abcdefghijklmnopqrstuvwxyz", "привет你好世界", "e\u{301}界"] {
+            for cursor in 0..=value.chars().count() + 1 {
+                for width in 0..=8 {
+                    let spans = spans_with_width(value, cursor, Style::default(), width);
+                    assert!(spans.iter().map(Span::width).sum::<usize>() <= width);
+                    if width > 0 {
+                        assert!(spans[1].style.add_modifier.contains(Modifier::REVERSED));
+                        assert!(!spans[1].content.is_empty());
+                    }
+                }
+            }
+        }
+        let spans = spans_with_width("abcdef", 6, Style::default(), 4);
+        assert_eq!(spans[0].content, "def");
+        assert_eq!(spans[1].content, " ");
+        let spans = spans_with_width("abcdef", 0, Style::default(), 4);
+        assert_eq!(spans[1].content, "a");
+        assert_eq!(spans[2].content, "bcd");
     }
 
     #[test]

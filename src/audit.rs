@@ -1,7 +1,7 @@
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,36 +43,27 @@ pub struct AuditState {
     pub results: Vec<HostAuditResult>,
     pub selected: usize,
     pub is_running: bool,
-    pub rx: Option<Receiver<AuditEvent>>,
     pub total: usize,
     pub completed: usize,
+    run: Option<Arc<Mutex<AuditRun>>>,
+}
+
+// App::start_audit recreates the screen state. Keep the receiver and its snapshot
+// in the run so re-entering the screen cannot orphan workers or start a second scan.
+static ACTIVE_AUDIT: Mutex<Weak<Mutex<AuditRun>>> = Mutex::new(Weak::new());
+
+struct AuditRun {
+    results: Vec<HostAuditResult>,
+    rx: Receiver<AuditEvent>,
+    remaining: std::collections::HashSet<String>,
+    total: usize,
+    completed: usize,
+    running: bool,
 }
 
 impl AuditState {
     pub fn new(hosts: &[Host]) -> Self {
-        let results = hosts
-            .iter()
-            .map(|h| HostAuditResult {
-                host_id: h.id.clone(),
-                host_name: h.name.clone(),
-                ip: h.ip.clone(),
-                port: h.port,
-                group: h.group.clone(),
-                status: HostStatus::Pending,
-                latency_ms: None,
-                credential_name: None,
-                detail: "Pending scan...".into(),
-            })
-            .collect();
-
-        Self {
-            results,
-            selected: 0,
-            is_running: false,
-            rx: None,
-            total: hosts.len(),
-            completed: 0,
-        }
+        Self::idle(hosts)
     }
 
     pub fn start_all(
@@ -82,24 +73,29 @@ impl AuditState {
         records: Vec<ServerRecord>,
         cfg: AppConfig,
     ) {
-        let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
-        self.is_running = true;
-        self.total = hosts.len();
-        self.completed = 0;
-
-        for r in &mut self.results {
-            r.status = HostStatus::Pending;
-            r.detail = "Queued...".into();
-            r.latency_ms = None;
+        let mut active = ACTIVE_AUDIT.lock().unwrap();
+        if self.attach_active(&active) {
+            return;
         }
+        let selected = self.selected;
+        *self = Self::idle(&hosts);
+        self.selected = selected.min(hosts.len().saturating_sub(1));
+        let (tx, rx) = mpsc::channel();
+        self.begin_run(
+            rx,
+            hosts.iter().map(|h| h.id.clone()).collect(),
+            &mut active,
+        );
+        drop(active);
 
         let hosts_arc = Arc::new(hosts);
         let creds_arc = Arc::new(creds);
         let records_arc = Arc::new(records);
         let cfg_arc = Arc::new(cfg);
 
+        let run = self.run.clone();
         thread::spawn(move || {
+            let _run = run;
             // Cap concurrent audit threads to 16 to avoid OS process/socket exhaustion.
             const MAX_CONCURRENT_AUDIT_WORKERS: usize = 16;
             let worker_count = hosts_arc.len().clamp(1, MAX_CONCURRENT_AUDIT_WORKERS);
@@ -151,17 +147,25 @@ impl AuditState {
         records: Vec<ServerRecord>,
         cfg: AppConfig,
     ) {
-        if idx >= self.results.len() {
+        let mut active = ACTIVE_AUDIT.lock().unwrap();
+        if self.attach_active(&active) || idx >= self.results.len() {
+            return;
+        }
+        let host_id = self.results[idx].host_id.clone();
+        if !hosts.iter().any(|h| h.id == host_id) {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        self.rx = Some(rx);
-        self.is_running = true;
-        let host_id = self.results[idx].host_id.clone();
         self.results[idx].status = HostStatus::Checking;
         self.results[idx].detail = "Checking...".into();
+        self.results[idx].latency_ms = None;
+        self.results[idx].credential_name = None;
+        self.begin_run(rx, [host_id.clone()].into_iter().collect(), &mut active);
+        drop(active);
 
+        let run = self.run.clone();
         thread::spawn(move || {
+            let _run = run;
             if let Some(host) = hosts.iter().find(|h| h.id == host_id) {
                 let _ = tx.send(AuditEvent::HostStarted(host.id.clone()));
                 let result = check_single_host(host, &hosts, &creds, &records, &cfg);
@@ -171,32 +175,107 @@ impl AuditState {
         });
     }
 
+    fn idle(hosts: &[Host]) -> Self {
+        // Avoid consulting ACTIVE_AUDIT while its admission lock is held.
+        Self {
+            results: hosts
+                .iter()
+                .map(|h| HostAuditResult {
+                    host_id: h.id.clone(),
+                    host_name: h.name.clone(),
+                    ip: h.ip.clone(),
+                    port: h.port,
+                    group: h.group.clone(),
+                    status: HostStatus::Pending,
+                    latency_ms: None,
+                    credential_name: None,
+                    detail: "Queued...".into(),
+                })
+                .collect(),
+            selected: 0,
+            is_running: false,
+            total: hosts.len(),
+            completed: 0,
+            run: None,
+        }
+    }
+
+    fn attach_active(&mut self, active: &Weak<Mutex<AuditRun>>) -> bool {
+        if let Some(run) = active.upgrade() {
+            let snapshot = run.lock().unwrap();
+            if snapshot.running {
+                self.results = snapshot.results.clone();
+                self.total = snapshot.total;
+                self.completed = snapshot.completed;
+                self.is_running = true;
+                self.run = Some(run.clone());
+                return true;
+            }
+        }
+        false
+    }
+
+    fn begin_run(
+        &mut self,
+        rx: Receiver<AuditEvent>,
+        remaining: std::collections::HashSet<String>,
+        active: &mut Weak<Mutex<AuditRun>>,
+    ) {
+        self.total = remaining.len();
+        self.completed = 0;
+        self.is_running = true;
+        let run = Arc::new(Mutex::new(AuditRun {
+            results: self.results.clone(),
+            rx,
+            remaining,
+            total: self.total,
+            completed: 0,
+            running: true,
+        }));
+        *active = Arc::downgrade(&run);
+        self.run = Some(run);
+    }
+
     pub fn poll(&mut self) {
-        if let Some(ref rx) = self.rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    AuditEvent::HostStarted(id) => {
-                        if let Some(r) = self.results.iter_mut().find(|r| r.host_id == id) {
+        let Some(run) = self.run.clone() else { return };
+        let mut run = run.lock().unwrap();
+        while run.running {
+            match run.rx.try_recv() {
+                Ok(AuditEvent::HostStarted(id)) => {
+                    if run.remaining.contains(&id) {
+                        if let Some(r) = run.results.iter_mut().find(|r| r.host_id == id) {
                             r.status = HostStatus::Checking;
                             r.detail = "Testing connection & auth...".into();
                         }
                     }
-                    AuditEvent::HostFinished(res) => {
-                        if let Some(r) = self.results.iter_mut().find(|r| r.host_id == res.host_id)
-                        {
+                }
+                Ok(AuditEvent::HostFinished(res)) => {
+                    if run.remaining.remove(&res.host_id) {
+                        if let Some(r) = run.results.iter_mut().find(|r| r.host_id == res.host_id) {
                             *r = res;
-                            self.completed += 1;
+                            run.completed += 1;
                         }
                     }
-                    AuditEvent::AllFinished => {
-                        self.is_running = false;
-                    }
                 }
+                Ok(AuditEvent::AllFinished) | Err(TryRecvError::Disconnected) => {
+                    run.running = false;
+                    let remaining = run.remaining.clone();
+                    for r in &mut run.results {
+                        if remaining.contains(&r.host_id) {
+                            r.status = HostStatus::Error("Audit ended without a result".into());
+                            r.detail = "Audit ended without a result; retry this host.".into();
+                        }
+                    }
+                    run.completed += remaining.len();
+                    run.remaining.clear();
+                }
+                Err(TryRecvError::Empty) => break,
             }
         }
-        if !self.is_running {
-            self.rx = None;
-        }
+        self.results = run.results.clone();
+        self.total = run.total;
+        self.completed = run.completed;
+        self.is_running = run.running;
     }
 }
 
@@ -215,9 +294,22 @@ pub fn check_single_host(
         .iter()
         .find(|r| r.host_id == host.id)
         .and_then(|r| r.last_credential_id.as_deref());
-    let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_id)
-        .ok()
-        .flatten();
+    let resolved_cred = match crate::ssh::resolve_host_credential(host, creds, cfg, last_id) {
+        Ok(credential) => credential,
+        Err(error) => {
+            return HostAuditResult {
+                host_id: host.id.clone(),
+                host_name: host.name.clone(),
+                ip: host.ip.clone(),
+                port: host.port,
+                group: host.group.clone(),
+                status: HostStatus::NoCredential,
+                latency_ms: None,
+                credential_name: None,
+                detail: error.to_string(),
+            };
+        }
+    };
     let cred_name = resolved_cred.map(|c| c.name.clone());
 
     // 1. Connectivity test: TCP port probe (when direct)
@@ -507,5 +599,130 @@ fn check_ssh_auth(
             }
         }
         Err(e) => (HostStatus::Unreachable(e.clone()), e, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host() -> Host {
+        Host {
+            id: "audit-test".into(),
+            name: "test".into(),
+            ip: "127.0.0.1".into(),
+            port: 22,
+            group: "test".into(),
+            user: None,
+            tags: vec![],
+            description: None,
+            jump_host_id: None,
+            credential_id: None,
+        }
+    }
+
+    #[test]
+    fn missing_explicit_credential_reports_error_without_probing_or_fallback() {
+        let mut selected = host();
+        selected.ip = "invalid address!".into();
+        selected.credential_id = Some("deleted".into());
+        let creds = vec![Credential {
+            id: "fallback".into(),
+            name: "fallback".into(),
+            username: "other-user".into(),
+            kind: CredentialKind::Key,
+            key_path: None,
+        }];
+        let cfg = AppConfig {
+            default_credential_id: Some("fallback".into()),
+            ..Default::default()
+        };
+        let result = check_single_host(&selected, &[selected.clone()], &creds, &[], &cfg);
+        assert_eq!(result.status, HostStatus::NoCredential);
+        assert!(result.detail.contains("deleted"));
+        assert!(result.detail.contains("Automatic"));
+        assert!(result.credential_name.is_none());
+        assert!(result.latency_ms.is_none());
+    }
+
+    #[test]
+    fn completion_is_unique_and_single_retry_resets_progress() {
+        let hosts = vec![host()];
+        let mut state = AuditState::new(&hosts);
+        for _ in 0..3 {
+            let (tx, rx) = mpsc::channel();
+            state.results[0].status = HostStatus::Checking;
+            state.begin_run(
+                rx,
+                [hosts[0].id.clone()].into_iter().collect(),
+                &mut Weak::new(),
+            );
+            assert_eq!((state.completed, state.total), (0, 1));
+            let mut result = state.results[0].clone();
+            result.status = HostStatus::Ok;
+            tx.send(AuditEvent::HostFinished(result.clone())).unwrap();
+            tx.send(AuditEvent::HostFinished(result)).unwrap();
+            tx.send(AuditEvent::HostStarted(hosts[0].id.clone()))
+                .unwrap();
+            tx.send(AuditEvent::AllFinished).unwrap();
+            state.poll();
+            assert_eq!((state.completed, state.total), (1, 1));
+            assert_eq!(state.results[0].status, HostStatus::Ok);
+            assert!(!state.is_running);
+        }
+    }
+
+    #[test]
+    fn overlapping_full_single_and_reentry_keep_the_same_receiver() {
+        let mut hosts = vec![host()];
+        let mut state = AuditState::new(&hosts);
+        let (tx, rx) = mpsc::channel();
+        state.begin_run(
+            rx,
+            [hosts[0].id.clone()].into_iter().collect(),
+            &mut ACTIVE_AUDIT.lock().unwrap(),
+        );
+        let run = state.run.clone().unwrap();
+        state.start_all(vec![], vec![], vec![], AppConfig::default());
+        state.start_single(0, hosts.clone(), vec![], vec![], AppConfig::default());
+        assert!(Arc::ptr_eq(&run, state.run.as_ref().unwrap()));
+        let mut reentered = AuditState::new(&hosts);
+        reentered.start_all(hosts.clone(), vec![], vec![], AppConfig::default());
+        assert!(Arc::ptr_eq(&run, reentered.run.as_ref().unwrap()));
+        let mut result = state.results[0].clone();
+        result.status = HostStatus::Ok;
+        tx.send(AuditEvent::HostFinished(result)).unwrap();
+        tx.send(AuditEvent::AllFinished).unwrap();
+        reentered.poll();
+        state.poll();
+        assert_eq!(reentered.completed, 1);
+        assert_eq!(state.completed, 1);
+
+        // Invalid address fails immediately without starting SSH or using the network.
+        hosts[0].ip = "invalid address!".into();
+        for _ in 0..3 {
+            state.start_single(0, hosts.clone(), vec![], vec![], AppConfig::default());
+            assert_eq!((state.completed, state.total), (0, 1));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while state.is_running && Instant::now() < deadline {
+                state.poll();
+                assert!(state.completed <= state.total);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!state.is_running, "single-host audit did not finish");
+            assert_eq!((state.completed, state.total), (1, 1));
+        }
+    }
+
+    #[test]
+    fn disconnected_worker_reports_failure_and_unlocks_run() {
+        let mut state = AuditState::new(&[host()]);
+        let (tx, rx) = mpsc::channel();
+        state.begin_run(rx, [host().id].into_iter().collect(), &mut Weak::new());
+        drop(tx);
+        state.poll();
+        assert!(!state.is_running);
+        assert_eq!((state.completed, state.total), (1, 1));
+        assert!(matches!(state.results[0].status, HostStatus::Error(_)));
     }
 }
