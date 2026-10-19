@@ -5,6 +5,7 @@ ignore = [
     "RUSTSEC-2026-0370", # zvariant: unmaintained (transitive via dbus-secret-service)
     "RUSTSEC-2026-0372", # zvariant_derive: unmaintained (transitive via dbus-secret-service)
     "RUSTSEC-2021-0145", # atty: potential unaligned read (transitive via skim)
+    "RUSTSEC-2024-0375", # atty: unmaintained (transitive via skim)
     "RUSTSEC-2026-0253", # lru: panic safety in LruCache::pop() (transitive via ratatui)
     "RUSTSEC-2026-0002", # lru: IterMut stacked borrows (transitive via ratatui)
 ]

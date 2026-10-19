@@ -34,18 +34,39 @@ pub fn resolve_repo() -> String {
     GITHUB_REPO.to_string()
 }
 
+pub fn resolve_update_url(repo: &str) -> String {
+    if repo.starts_with("http://") || repo.starts_with("https://") {
+        if repo.ends_with("/releases/latest") {
+            repo.to_string()
+        } else {
+            format!("{}/releases/latest", repo.trim_end_matches('/'))
+        }
+    } else {
+        format!("https://api.github.com/repos/{repo}/releases/latest")
+    }
+}
+
 pub fn run() -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let repo = resolve_repo();
     println!("hss v{current} — checking for updates from {repo}...");
 
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let release: Release = ureq::get(&url)
+    let url = resolve_update_url(&repo);
+
+    let resp = ureq::get(&url)
         .set("User-Agent", &format!("hss/{current}"))
-        .call()
-        .map_err(|e| anyhow!("Cannot reach GitHub API: {e}"))?
-        .into_json()
-        .map_err(|e| anyhow!("Unexpected API response: {e}"))?;
+        .call();
+
+    let release: Release = match resp {
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| anyhow!("Unexpected API response: {e}"))?,
+        Err(ureq::Error::Status(404, _)) => {
+            println!("No published releases found for {repo}.");
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow!("Cannot reach update API: {e}")),
+    };
 
     let tag = &release.tag_name;
     let latest = tag.trim_start_matches('v');
@@ -229,6 +250,22 @@ mod tests {
     #[test]
     fn resolve_repo_fallback_or_custom() {
         assert!(!resolve_repo().is_empty());
+    }
+
+    #[test]
+    fn update_url_github_and_custom() {
+        assert_eq!(
+            resolve_update_url("artp1ay/hss"),
+            "https://api.github.com/repos/artp1ay/hss/releases/latest"
+        );
+        assert_eq!(
+            resolve_update_url("https://git.freakware.ru/api/v1/repos/max/hss"),
+            "https://git.freakware.ru/api/v1/repos/max/hss/releases/latest"
+        );
+        assert_eq!(
+            resolve_update_url("https://git.freakware.ru/api/v1/repos/max/hss/releases/latest"),
+            "https://git.freakware.ru/api/v1/repos/max/hss/releases/latest"
+        );
     }
 
     #[test]
