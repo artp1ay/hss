@@ -95,6 +95,10 @@ fn default_mcp_allowed_hosts() -> String {
     "*".to_string()
 }
 
+fn default_update_repo() -> String {
+    "artp1ay/hss".to_string()
+}
+
 fn default_strict_host_checking() -> String {
     "accept-new".to_string()
 }
@@ -142,6 +146,9 @@ pub struct AppConfig {
     /// Data Loss Prevention: redact private keys and certificates in MCP command outputs
     #[serde(default = "default_true")]
     pub mcp_dlp_filter: bool,
+    /// GitHub repository (owner/repo) used for self-updates and release checks.
+    #[serde(default = "default_update_repo")]
+    pub update_repo: String,
     /// Timeout in seconds for connectivity and auth audit tests.
     #[serde(default = "default_audit_timeout")]
     pub audit_timeout: u16,
@@ -170,6 +177,7 @@ impl Default for AppConfig {
             mcp_read_only: false,
             mcp_allowed_hosts: "*".to_string(),
             mcp_dlp_filter: true,
+            update_repo: default_update_repo(),
             audit_timeout: 3,
             ssh_extra_args: String::new(),
             strict_host_checking: "accept-new".to_string(),

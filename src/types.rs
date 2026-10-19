@@ -45,7 +45,7 @@ pub struct CredentialForm {
     pub username: String,
     pub password: String,
     pub key_path: String,
-    pub focused: usize, // 0=type toggle, 1=name, 2=username, 3=secret
+    pub focused: usize, // 0=тип, 1=имя, 2=пользователь, 3=пароль/путь, 4=пароль ключа
     pub cursor: usize,  // char index inside the focused field
 }
 

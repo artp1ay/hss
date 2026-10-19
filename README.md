@@ -1,11 +1,15 @@
 # hss
 
+[![CI](https://github.com/artp1ay/hss/actions/workflows/ci.yml/badge.svg)](https://github.com/artp1ay/hss/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/artp1ay/hss)](https://github.com/artp1ay/hss/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Terminal SSH server manager. Browse servers, manage credentials, and connect — all from the keyboard.
 
 ## Features
 
 - **TUI** — searchable server list, keyboard-driven
-- **Credential store** — passwords and SSH keys in the system keychain (macOS Keychain / Linux keyutils), never stored on disk
+- **Credential store** — passwords and SSH key passphrases in macOS Keychain / Linux Secret Service, never in plaintext config files; private keys stay in their existing files
 - **Ansible INI** — import and export inventory files
 - **Quick connect** — `hss hostname` bypasses the TUI
 - **Fuzzy picker** — `hss --fzf` for skim-powered selection
@@ -72,6 +76,23 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 | `S` | Settings |
 | `Q` | Quit |
 
+## Credentials
+
+Open **Manage credentials** with `C`; press `*` on a credential to make it the default.
+
+- **Automatic selection:** the configured default takes priority over the host's last-used credential. If the configured default is not found, hss tries the last-used credential, then the only saved credential if there is exactly one.
+- **Password:** requires a non-empty password.
+- **Key:** uses an SSH private key file and supports an optional saved passphrase. The private key itself is not copied into the secret store.
+- **Editing:** leaving the password/passphrase blank preserves the saved secret only when the credential type stays the same. When switching types, the old secret is not reused: Password requires a new password; Key accepts an optional passphrase.
+
+Secrets are stored persistently in **macOS Keychain** or **Linux Secret Service**, not in hss config files. Secret-store failures are reported; there is no plaintext config fallback.
+
+On Linux, hss needs a running **session D-Bus** and a Secret Service provider (such as GNOME Keyring) with an accessible, unlocked persistent collection. Configure an encrypted collection: encryption at rest depends on the provider and its settings. hss encrypts secret transfers over D-Bus. Headless/SSH sessions need access to the session bus and an unlocked collection too; the release binary's bundled libdbus does not provide these services.
+
+**Upgrading from Linux keyutils:** old secrets are not migrated automatically. Re-enter and save each password/passphrase in Credentials, even if its metadata still appears. The old kernel-backed store does not survive a reboot.
+
+On macOS, Keychain persists across reboots, but unlocking or access approval may be required, particularly in headless/SSH sessions.
+
 ## MCP Server (Model Context Protocol)
 
 `hss` can serve as an MCP server for LLM agents (Claude Desktop, Zed, Cursor, OpenCode):
@@ -103,8 +124,28 @@ hss --mcp
 
 Passwords are stored in the system keychain, not in any config file.
 
-## Development
+To configure a custom GitHub repository for self-updates (`hss --update`), set `update_repo` in `config.toml`:
 
-PRs target `main`. The release workflow on every push to `main` tags a release (`v1.0.XXXX`), builds binaries for all four platforms, and publishes a GitHub release with a changelog generated from commit messages.
+```toml
+update_repo = "owner/repo"
+```
 
-To protect `main`: **Settings → Branches → Add rule** — require PR, require status checks (`ci / test`), no direct push.
+Or set the environment variable `HSS_UPDATE_REPO="owner/repo"`.
+
+## Development & Releases
+
+- **CI**: Runs format check, clippy with `-D warnings`, tests, and release build on pull requests and pushes to `main`, `master`, and `dev`.
+- **Release**: Released manually on demand. You control the version and changelog notes:
+  - Via release script:
+    ```sh
+    ./scripts/release.sh 1.0.0 "Initial public release"
+    # or from file
+    ./scripts/release.sh 1.0.0 @docs/release-notes.md
+    ```
+  - Via GitHub Actions UI (`workflow_dispatch` on the `release` workflow) specifying the tag and custom notes.
+  - Or manually pushing an annotated tag:
+    ```sh
+    git tag -a v1.0.0 -m "Release description"
+    git push origin v1.0.0
+    ```
+- **Artifacts**: GitHub Actions builds binaries for all 4 platforms (`hss-linux-x86_64`, `hss-linux-aarch64`, `hss-macos-x86_64`, `hss-macos-aarch64`) and computes `SHA256SUMS` and `MD5SUMS`.

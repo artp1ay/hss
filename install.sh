@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="artp1ay/hss"
+REPO="${HSS_REPO:-artp1ay/hss}"
 BIN="hss"
 INSTALL_DIR="${HOME}/.local/bin"
 

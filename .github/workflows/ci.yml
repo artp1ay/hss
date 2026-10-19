@@ -1,12 +1,18 @@
-name: CI
+name: ci
 
 on:
+  push:
+    branches: [main, master, dev]
   pull_request:
-    branches: [main]
+    branches: [main, master, dev]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    name: test
+  lint-and-audit:
+    name: checks (fmt, clippy, audit)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,7 +23,37 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features --locked -- --nocapture
-      - run: cargo build --release --locked
+      - name: Rustfmt check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Cargo audit (RustSec)
+        run: cargo audit
+
+  tests:
+    name: tests ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Cargo test
+        run: RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features --locked -- --nocapture
+
+      - name: Cargo build (release check)
+        run: cargo build --release --locked

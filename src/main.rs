@@ -1,29 +1,5 @@
 use clap::Parser;
-
-#[derive(Parser)]
-#[command(name = "hss", about = "SSH manager — connect to your servers", version)]
-struct Cli {
-    /// Quick fzf picker mode
-    #[arg(long)]
-    fzf: bool,
-    /// Check for a newer release and replace this binary automatically
-    #[arg(long)]
-    update: bool,
-    /// Output dynamic Ansible inventory JSON
-    #[arg(long, alias = "list")]
-    ansible_inventory: bool,
-    /// Ansible inventory host query (accepted for compatibility with Ansible inventory scripts)
-    #[arg(long)]
-    host: Option<String>,
-    /// Connect directly to host by name or IP
-    direct_host: Option<String>,
-    /// Run headless MCP server directly in terminal without TUI
-    #[arg(long)]
-    mcp: bool,
-    /// Run MCP server over stdio for agents (Zed, Claude Desktop, Cursor)
-    #[arg(long)]
-    mcp_stdio: bool,
-}
+use hss::cli::Cli;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();

@@ -1,12 +1,12 @@
 use crate::tui::{App, Screen, Term};
-use crate::types::{CredentialForm, CredentialKind};
+use crate::types::{CredentialForm, CredentialKind, StatusKind, StatusMessage};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
@@ -27,6 +27,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(0),
+            Constraint::Length(if app.status_message.is_some() { 2 } else { 0 }),
             Constraint::Length(hotkey_height),
         ])
         .split(area);
@@ -105,16 +106,36 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_stateful_widget(table, chunks[1], &mut state);
     }
 
-    f.render_widget(Paragraph::new(hotkey_lines), chunks[2]);
+    f.render_widget(Paragraph::new(hotkey_lines), chunks[3]);
 
-    // Draw form overlay if active
     if let Some(ref form) = app.cred_form {
-        draw_form(f, form, f.area());
+        draw_form(
+            f,
+            form,
+            Rect {
+                height: chunks[2].y.saturating_sub(area.y),
+                ..area
+            },
+        );
+    }
+    if let Some(ref status) = app.status_message {
+        let color = match status.kind {
+            StatusKind::Success => Color::Green,
+            StatusKind::Info => Color::Blue,
+            StatusKind::Warning => Color::Yellow,
+            StatusKind::Error => Color::Red,
+        };
+        f.render_widget(
+            Paragraph::new(status.text.as_str())
+                .style(Style::default().fg(color))
+                .wrap(Wrap { trim: false }),
+            chunks[2],
+        );
     }
 }
 
 fn draw_form(f: &mut Frame, form: &CredentialForm, area: Rect) {
-    let popup = centered_rect(62, 70, area);
+    let popup = centered_rect(80, 90, area);
     f.render_widget(Clear, popup);
 
     let title = if form.editing_id.is_some() {
@@ -132,11 +153,13 @@ fn draw_form(f: &mut Frame, form: &CredentialForm, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // type toggle
-            Constraint::Length(2), // name
-            Constraint::Length(2), // username
-            Constraint::Length(2), // password or key_path
-            Constraint::Length(1), // hotkeys
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(if form.is_key { 2 } else { 0 }),
+            Constraint::Length(2),
+            Constraint::Length(2),
         ])
         .margin(1)
         .split(inner);
@@ -193,31 +216,45 @@ fn draw_form(f: &mut Frame, form: &CredentialForm, area: Rect) {
             form.cursor,
             chunks[3],
         );
-    } else {
-        let masked: String = "•".repeat(form.password.chars().count());
-        let pw_label = if form.editing_id.is_some() {
-            "Password: (blank=keep)"
+    }
+    let secret_field = if form.is_key { 4 } else { 3 };
+    let masked = "•".repeat(form.password.chars().count());
+    render_field(
+        f,
+        if form.is_key {
+            "Passphrase:"
         } else {
             "Password:"
-        };
-        render_field(
-            f,
-            pw_label,
-            &masked,
-            form.focused == 3,
-            form.cursor,
-            chunks[3],
-        );
-    }
-
+        },
+        &masked,
+        form.focused == secret_field,
+        form.cursor,
+        chunks[secret_field],
+    );
+    let guidance = if form.editing_id.is_some() {
+        "Blank keeps secret only for same type.\nNew type: password required; passphrase optional."
+    } else if form.is_key {
+        "Passphrase optional; blank for an unencrypted key."
+    } else {
+        "Password required."
+    };
     f.render_widget(
-        Paragraph::new(hotkey_line(&[
-            ("Tab", "next"),
-            ("Space", "toggle type"),
-            ("Enter", "save"),
-            ("Esc", "cancel"),
-        ])),
-        chunks[4],
+        Paragraph::new(guidance)
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(Wrap { trim: false }),
+        chunks[5],
+    );
+    f.render_widget(
+        Paragraph::new(crate::tui::wrap_hotkey_lines(
+            &[
+                ("Tab", "next"),
+                ("Space", "toggle type"),
+                ("Enter", "save"),
+                ("Esc", "cancel"),
+            ],
+            chunks[6].width,
+        )),
+        chunks[6],
     );
 }
 
@@ -234,7 +271,7 @@ fn render_field(f: &mut Frame, label: &str, value: &str, focused: bool, cursor: 
     };
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(10), Constraint::Min(0)])
+        .constraints([Constraint::Length(12), Constraint::Min(0)])
         .split(area);
     f.render_widget(
         Paragraph::new(label).style(Style::default().fg(Color::DarkGray)),
@@ -248,24 +285,6 @@ fn render_field(f: &mut Frame, label: &str, value: &str, focused: bool, cursor: 
         ),
         chunks[1],
     );
-}
-
-fn hotkey_line<'a>(pairs: &[(&'a str, &'a str)]) -> Line<'a> {
-    let mut spans = vec![];
-    for (i, (key, label)) in pairs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(
-            format!("[{key}]"),
-            Style::default().fg(Color::Blue),
-        ));
-        spans.push(Span::styled(
-            format!(" {label}"),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    Line::from(spans)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -352,8 +371,17 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
             let id = app.credentials[app.cred_selected.min(creds_len - 1)]
                 .id
                 .clone();
-            app.config.default_credential_id = Some(id);
-            crate::config::save_config(&app.config)?;
+            let mut config = app.config.clone();
+            config.default_credential_id = Some(id);
+            match crate::config::save_config(&config) {
+                Ok(()) => {
+                    app.config = config;
+                    app.status_message = Some(StatusMessage::success("Default credential saved."));
+                }
+                Err(e) => {
+                    app.status_message = Some(StatusMessage::error(format!("Error: {e}")));
+                }
+            }
         }
         _ => {}
     }
@@ -361,7 +389,6 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 fn handle_form_key(app: &mut App, key: KeyEvent, mut form: CredentialForm) -> Result<()> {
-    // Text fields (1..=3) get full line editing; field 0 is the type toggle.
     if form.focused > 0 && !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Enter) {
         let mut cursor = form.cursor;
         let mut buf = std::mem::take(form_field(&mut form));
@@ -379,20 +406,22 @@ fn handle_form_key(app: &mut App, key: KeyEvent, mut form: CredentialForm) -> Re
             app.cred_form = None;
         }
         KeyCode::Tab => {
-            form.focused = (form.focused + 1) % 4;
+            form.focused = (form.focused + 1) % if form.is_key { 5 } else { 4 };
             form.cursor = crate::tui::input::end_of(form_field(&mut form));
             app.cred_form = Some(form);
         }
         KeyCode::Char(' ') if form.focused == 0 => {
             form.is_key = !form.is_key;
+            form.password.clear();
             app.cred_form = Some(form);
         }
         KeyCode::Enter => {
             if let Err(e) = save_form(app, &form) {
                 app.status_message =
-                    Some(crate::types::StatusMessage::error(format!("Error: {e}")));
+                    Some(crate::types::StatusMessage::error(format!("Error: {e:#}")));
             } else {
                 app.cred_form = None;
+                app.status_message = Some(StatusMessage::success("Credential saved."));
             }
         }
         _ => {}
@@ -404,7 +433,7 @@ fn form_field(form: &mut CredentialForm) -> &mut String {
     match form.focused {
         1 => &mut form.name,
         2 => &mut form.username,
-        _ if form.is_key => &mut form.key_path,
+        3 if form.is_key => &mut form.key_path,
         _ => &mut form.password,
     }
 }
@@ -433,7 +462,7 @@ fn save_form(app: &mut App, form: &CredentialForm) -> Result<()> {
     } else {
         None
     };
-    let password = if !form.is_key && !form.password.is_empty() {
+    let password = if !form.password.is_empty() {
         Some(form.password.as_str())
     } else {
         None
@@ -459,4 +488,118 @@ fn save_form(app: &mut App, form: &CredentialForm) -> Result<()> {
     }
     app.reload_credentials()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn app() -> App {
+        App::new(vec![], vec![], crate::config::AppConfig::default(), vec![])
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        let form = app.cred_form.clone().unwrap();
+        handle_form_key(app, KeyEvent::new(code, KeyModifiers::NONE), form).unwrap();
+    }
+
+    fn rendered(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn key_navigation_and_editing_use_password_for_passphrase() {
+        let mut app = app();
+        app.cred_form = Some(CredentialForm {
+            is_key: true,
+            key_path: "/tmp/key".into(),
+            password: "密".into(),
+            focused: 3,
+            ..Default::default()
+        });
+        press(&mut app, KeyCode::Tab);
+        let form = app.cred_form.as_ref().unwrap();
+        assert_eq!(form.focused, 4);
+        assert_eq!(form.cursor, 1);
+        press(&mut app, KeyCode::Char('!'));
+        let form = app.cred_form.as_ref().unwrap();
+        assert_eq!(form.password, "密!");
+        assert_eq!(form.key_path, "/tmp/key");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.cred_form.as_ref().unwrap().focused, 0);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.cred_form.as_ref().unwrap().password.is_empty());
+        for expected in [1, 2, 3, 0] {
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.cred_form.as_ref().unwrap().focused, expected);
+        }
+    }
+
+    #[test]
+    fn secret_field_depends_on_kind_and_focus() {
+        let mut form = CredentialForm::default();
+        for (is_key, focused, expected) in [
+            (false, 1, "name"),
+            (false, 2, "user"),
+            (false, 3, "secret"),
+            (true, 3, "path"),
+            (true, 4, "secret"),
+        ] {
+            form.name = "name".into();
+            form.username = "user".into();
+            form.password = "secret".into();
+            form.key_path = "path".into();
+            form.is_key = is_key;
+            form.focused = focused;
+            assert_eq!(form_field(&mut form), expected);
+        }
+    }
+
+    #[test]
+    fn renders_masked_secrets_and_blank_guidance() {
+        let mut app = app();
+        for is_key in [false, true] {
+            app.cred_form = Some(CredentialForm {
+                is_key,
+                editing_id: Some("test".into()),
+                password: "密secret".into(),
+                ..Default::default()
+            });
+            let text = rendered(&app);
+            assert!(text.contains(if is_key { "Passphrase:" } else { "Password:" }));
+            assert!(text.contains("•••••••"));
+            assert!(!text.contains("密secret"));
+            assert!(text.contains("Blank keeps secret only for same type."));
+            assert!(text.contains("password required; passphrase optional."));
+        }
+        app.cred_form.as_mut().unwrap().editing_id = None;
+        assert!(rendered(&app).contains("Passphrase optional; blank for an unencrypted key."));
+    }
+
+    #[test]
+    fn validation_error_is_visible_with_form_open() {
+        let mut app = app();
+        app.cred_form = Some(CredentialForm::default());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.cred_form.is_some());
+        assert_eq!(app.status_message.as_ref().unwrap().kind, StatusKind::Error);
+        assert!(rendered(&app).contains("Error: Name is required."));
+    }
+
+    #[test]
+    fn renders_default_save_success() {
+        let mut app = app();
+        app.status_message = Some(StatusMessage::success("Default credential saved."));
+        assert!(rendered(&app).contains("Default credential saved."));
+    }
 }

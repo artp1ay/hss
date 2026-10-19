@@ -14,15 +14,26 @@ path = "src/lib.rs"
 name = "hss"
 path = "src/main.rs"
 
+[[bin]]
+name = "generate-assets"
+path = "src/bin/generate_assets.rs"
+required-features = ["generate-assets"]
+
+[features]
+default = []
+generate-assets = ["dep:clap_complete", "dep:clap_mangen"]
+
 [dependencies]
 anyhow = "1"
 libc = "0.2"
 ureq = { version = "2", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = { version = "4", optional = true }
+clap_mangen = { version = "0.2", optional = true }
 crossterm = "0.28"
 dirs = "5"
-# linux-native: kernel keyutils (no D-Bus, session-scoped); apple-native: macOS Keychain
-keyring = { version = "3", default-features = false, features = ["linux-native", "apple-native"] }
+# Linux: постоянное хранилище Secret Service с шифрованием D-Bus; macOS: Keychain.
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust", "apple-native", "vendored"] }
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

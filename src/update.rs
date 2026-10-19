@@ -16,11 +16,30 @@ struct Asset {
     browser_download_url: String,
 }
 
+pub fn resolve_repo() -> String {
+    if let Ok(repo) = std::env::var("HSS_UPDATE_REPO") {
+        let trimmed = repo.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+
+    if let Ok(cfg) = crate::config::load_config() {
+        let trimmed = cfg.update_repo.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+
+    GITHUB_REPO.to_string()
+}
+
 pub fn run() -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    println!("hss v{current} — checking for updates...");
+    let repo = resolve_repo();
+    println!("hss v{current} — checking for updates from {repo}...");
 
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let release: Release = ureq::get(&url)
         .set("User-Agent", &format!("hss/{current}"))
         .call()
@@ -46,7 +65,7 @@ pub fn run() -> Result<()> {
         .ok_or_else(|| {
             anyhow!(
                 "No binary for '{asset_name}' in release {tag}.\n\
-                 Download manually: https://github.com/{GITHUB_REPO}/releases"
+                 Download manually: https://github.com/{repo}/releases"
             )
         })?;
 
@@ -133,7 +152,7 @@ fn platform_asset() -> Result<&'static str> {
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "hss-macos-aarch64"
     } else {
-        bail!("Unsupported platform — download from: https://github.com/{GITHUB_REPO}/releases")
+        bail!("Unsupported platform")
     })
 }
 
@@ -206,6 +225,11 @@ fn compute_file_sha256(path: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_repo_fallback_or_custom() {
+        assert!(!resolve_repo().is_empty());
+    }
 
     #[test]
     fn parse_checksum_table() {

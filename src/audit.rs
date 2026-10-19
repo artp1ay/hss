@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
-use crate::types::{Credential, CredentialKind, Host, ServerRecord};
+use crate::types::{Credential, Host, ServerRecord};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostStatus {
@@ -215,9 +215,23 @@ pub fn check_single_host(
         .iter()
         .find(|r| r.host_id == host.id)
         .and_then(|r| r.last_credential_id.as_deref());
-    let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_id)
-        .ok()
-        .flatten();
+    let resolved_cred = match crate::ssh::resolve_credential(creds, cfg, last_id) {
+        Ok(cred) => cred,
+        Err(e) => {
+            let detail = format!("Failed to resolve credential: {e}");
+            return HostAuditResult {
+                host_id: host.id.clone(),
+                host_name: host.name.clone(),
+                ip: host.ip.clone(),
+                port: host.port,
+                group: host.group.clone(),
+                status: HostStatus::Error(detail.clone()),
+                latency_ms: None,
+                credential_name: None,
+                detail,
+            };
+        }
+    };
     let cred_name = resolved_cred.map(|c| c.name.clone());
 
     // 1. Connectivity test: TCP port probe (when direct)
@@ -325,10 +339,12 @@ fn check_ssh_auth(
     timeout: Duration,
 ) -> (HostStatus, String, Option<u64>) {
     let t0 = Instant::now();
-    let password = if cred.kind == CredentialKind::Password {
-        crate::credentials::get_password(&cred.id).ok()
-    } else {
-        None
+    let secret = match crate::credentials::get_secret(cred) {
+        Ok(secret) => secret,
+        Err(e) => {
+            let detail = format!("Failed to load credential secret: {e}");
+            return (HostStatus::Error(detail.clone()), detail, None);
+        }
     };
 
     if let Err(e) = crate::ssh::validate_host(&host.ip) {
@@ -376,16 +392,11 @@ fn check_ssh_auth(
         cred.username.clone(),
     ];
 
-    if let Some(ref key) = cred.key_path {
-        args.extend_from_slice(&["-i".into(), key.clone()]);
-        args.extend_from_slice(&["-o".into(), "IdentitiesOnly=yes".into()]);
-    }
+    crate::ssh::append_auth_args(&mut args, cred, secret.is_some(), false);
     if let Some(j) = jump {
         args.extend_from_slice(&["-J".into(), j.to_string()]);
     }
-    if password.is_none() {
-        args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
-    }
+
     args.push("--".into());
     args.push(host.ip.clone());
     args.push("exit 0".into());
@@ -396,19 +407,13 @@ fn check_ssh_auth(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let askpass_path = if let Some(ref pw) = password {
-        if let Ok(p) = crate::ssh::write_askpass_helper() {
-            let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-            cmd.env("SSH_ASKPASS", &p)
-                .env("SSH_ASKPASS_REQUIRE", "force")
-                .env("DISPLAY", display)
-                .env("HSS_PASSWORD", pw);
-            Some(p)
-        } else {
-            None
+    let askpass_path = match crate::ssh::configure_askpass(&mut cmd, &cred.kind, secret.as_deref())
+    {
+        Ok(path) => path,
+        Err(e) => {
+            let detail = format!("Failed to prepare SSH askpass: {e}");
+            return (HostStatus::Error(detail.clone()), detail, None);
         }
-    } else {
-        None
     };
 
     let result = match cmd.spawn() {
@@ -490,22 +495,80 @@ fn check_ssh_auth(
                         None,
                     ),
                     crate::ssh::SshErrorKind::NoRoute => (
-                        HostStatus::Unreachable("No route to host".into()),
+                        HostStatus::Unreachable("Network unreachable or no route to host".into()),
                         err_line,
                         None,
                     ),
-                    crate::ssh::SshErrorKind::Unknown(msg) => (
-                        HostStatus::Unreachable(if msg.is_empty() {
-                            "SSH failed".into()
-                        } else {
-                            msg.clone()
-                        }),
+                    crate::ssh::SshErrorKind::Unknown(_) => (
+                        HostStatus::Error(format!(
+                            "SSH error (exit {})",
+                            status.code().unwrap_or(-1)
+                        )),
                         err_line,
                         Some(elapsed_ms),
                     ),
                 }
             }
         }
-        Err(e) => (HostStatus::Unreachable(e.clone()), e, None),
+        Err(e) => (HostStatus::Error(e.clone()), e, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_state_initialization() {
+        let hosts = vec![Host {
+            id: "h1".into(),
+            name: "srv1".into(),
+            ip: "127.0.0.1".into(),
+            group: "prod".into(),
+            port: 22,
+            user: None,
+            tags: vec![],
+            description: None,
+            jump_host_id: None,
+        }];
+
+        let state = AuditState::new(&hosts);
+        assert_eq!(state.total, 1);
+        assert_eq!(state.results.len(), 1);
+        assert_eq!(state.results[0].status, HostStatus::Pending);
+    }
+
+    #[test]
+    fn check_single_host_without_credential() {
+        let hosts = vec![
+            Host {
+                id: "bastion".into(),
+                name: "bastion".into(),
+                ip: "127.0.0.1".into(),
+                group: "infra".into(),
+                port: 22,
+                user: None,
+                tags: vec![],
+                description: None,
+                jump_host_id: None,
+            },
+            Host {
+                id: "h1".into(),
+                name: "srv1".into(),
+                ip: "10.0.0.2".into(),
+                group: "prod".into(),
+                port: 22,
+                user: None,
+                tags: vec![],
+                description: None,
+                jump_host_id: Some("bastion".into()),
+            },
+        ];
+        let creds = vec![];
+        let records = vec![];
+        let cfg = AppConfig::default();
+
+        let res = check_single_host(&hosts[1], &hosts, &creds, &records, &cfg);
+        assert_eq!(res.status, HostStatus::NoCredential);
     }
 }

@@ -1,15 +1,28 @@
-name: Release
+name: release
 
 on:
   push:
-    tags: ["v1.0.*"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+      release_notes:
+        description: "Release notes / changelog description (optional)"
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  # ── 0. Quality Gate (fmt, clippy, tests) ──────────────────────────────────
   quality:
+    name: quality gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,12 +33,44 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features --locked -- --nocapture
+      - name: Format check
+        run: cargo fmt --all -- --check
 
-  # ── Build for all targets (Linux + macOS) ────────────────────────────────
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Tests
+        run: RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features --locked -- --nocapture
+
+  # Generate shell completions and man pages
+  generate-assets:
+    name: generate shell completions & man pages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate assets
+        run: cargo run --features generate-assets --bin generate-assets -- dist-assets
+
+      - name: Package completions & man page
+        run: |
+          tar -czf hss-completions.tar.gz -C dist-assets/completions .
+          tar -czf hss-man.tar.gz -C dist-assets/man .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hss-extra-assets
+          path: |
+            hss-completions.tar.gz
+            hss-man.tar.gz
+            dist-assets/
+
   build:
+    name: build ${{ matrix.artifact }}
     needs: quality
     strategy:
       fail-fast: false
@@ -63,17 +108,21 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Strip leading zeros for SemVer: v1.0.0007 → 1.0.7 in Cargo.toml.
-      # hss --update compares parse::<u64>() so "0007" == "7" — no breakage.
-      - name: Stamp version into Cargo.toml
+      - name: Resolve target version
+        shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          SEMVER=$(echo "${TAG#v}" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
-          perl -pi -e "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
+          RAW_TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${RAW_TAG#v}"
+          if [[ -n "$VERSION" ]]; then
+            sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+            rm -f Cargo.toml.bak
+          fi
 
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y musl-tools
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Install cross
         if: matrix.cross == true
@@ -81,7 +130,7 @@ jobs:
         with:
           tool: cross
 
-      - name: Build
+      - name: Build binary
         run: |
           if [[ "${{ matrix.cross }}" == "true" ]]; then
             cross build --release --target ${{ matrix.target }}
@@ -89,7 +138,7 @@ jobs:
             cargo build --release --target ${{ matrix.target }}
           fi
 
-      - name: Stage artifact
+      - name: Stage binary artifact
         run: cp target/${{ matrix.target }}/release/hss ${{ matrix.artifact }}
 
       - uses: actions/upload-artifact@v4
@@ -97,43 +146,86 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-  # ── Publish GitHub release with all platform binaries ────────────────────
-  release:
-    needs: build
+  publish:
+    name: publish release
+    needs: [build, generate-assets]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Generate changelog
+      - name: Prepare release metadata
+        id: meta
+        shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          PREV=$(git tag --sort=-version:refname | grep "^v1\.0\." | sed -n '2p')
-          if [ -z "$PREV" ]; then
-            git log --pretty=format:"- %s" > CHANGELOG.md
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${{ github.event.inputs.release_notes }}" ]]; then
+            cat << 'EOF' > NOTES.md
+          ${{ github.event.inputs.release_notes }}
+          EOF
           else
-            git log --pretty=format:"- %s" "${PREV}..${TAG}" > CHANGELOG.md
+            git fetch --force origin "+refs/tags/*:refs/tags/*" 2>/dev/null || true
+            TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG" 2>/dev/null | sed '/^$/d' || true)
+            if [[ -n "$TAG_MESSAGE" ]]; then
+              printf '%s\n' "$TAG_MESSAGE" > NOTES.md
+            else
+              PREV=$(git tag --sort=-version:refname | grep -E '^v[0-9]+' | grep -v "^${TAG}$" | head -1 || true)
+              if [[ -z "$PREV" ]]; then
+                git log --pretty=format:"- %s" -n 50 > NOTES.md
+              else
+                git log --pretty=format:"- %s" "${PREV}..${TAG}" > NOTES.md
+              fi
+            fi
           fi
 
       - uses: actions/download-artifact@v4
-
-      - name: Generate SHA256 checksums
-        run: |
-          sha256sum hss-linux-x86_64/hss-linux-x86_64 \
-                    hss-linux-aarch64/hss-linux-aarch64 \
-                    hss-macos-x86_64/hss-macos-x86_64 \
-                    hss-macos-aarch64/hss-macos-aarch64 \
-                    | sed 's|hss-[^/]*/||' > SHA256SUMS
-
-      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          body_path: CHANGELOG.md
-          files: |
-            hss-linux-x86_64/hss-linux-x86_64
-            hss-linux-aarch64/hss-linux-aarch64
-            hss-macos-x86_64/hss-macos-x86_64
-            hss-macos-aarch64/hss-macos-aarch64
-            SHA256SUMS
+          path: dist
+
+      - name: Package release archives, assets, and checksums
+        run: |
+          mkdir -p release-assets
+
+          # Copy standalone binaries (for direct download and hss --update / install.sh)
+          cp dist/hss-linux-x86_64/hss-linux-x86_64 release-assets/
+          cp dist/hss-linux-aarch64/hss-linux-aarch64 release-assets/
+          cp dist/hss-macos-x86_64/hss-macos-x86_64 release-assets/
+          cp dist/hss-macos-aarch64/hss-macos-aarch64 release-assets/
+
+          # Copy completions and man pages
+          cp dist/hss-extra-assets/hss-completions.tar.gz release-assets/
+          cp dist/hss-extra-assets/hss-man.tar.gz release-assets/
+
+          TAG="${{ steps.meta.outputs.tag }}"
+
+          # Create distribution tarballs including README, LICENSE, completions, and man page
+          for target in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
+            pkg_dir="hss-${TAG}-${target}"
+            mkdir -p "$pkg_dir"
+            cp "release-assets/hss-${target}" "${pkg_dir}/hss"
+            cp README.md LICENSE "${pkg_dir}/"
+            if [ -d "dist/hss-extra-assets/dist-assets/completions" ]; then
+              cp -r dist/hss-extra-assets/dist-assets/completions "${pkg_dir}/"
+            fi
+            if [ -d "dist/hss-extra-assets/dist-assets/man" ]; then
+              cp -r dist/hss-extra-assets/dist-assets/man "${pkg_dir}/"
+            fi
+            tar -czf "release-assets/${pkg_dir}.tar.gz" "$pkg_dir"
+            rm -rf "$pkg_dir"
+          done
+
+          cd release-assets
+          sha256sum * > SHA256SUMS
+          md5sum * > MD5SUMS 2>/dev/null || true
+          cd ..
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          body_path: NOTES.md
+          files: release-assets/*

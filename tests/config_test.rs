@@ -10,6 +10,22 @@ fn test_appconfig_default() {
 }
 
 #[test]
+fn test_default_credential_survives_disk_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("hss-test-default-{}", uuid::Uuid::new_v4()));
+    hss::config::ensure_config_dir(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let cfg = hss::config::AppConfig {
+        default_credential_id: Some("selected".into()),
+        ..Default::default()
+    };
+    hss::config::write_secure_atomic_file(&path, &toml::to_string(&cfg).unwrap()).unwrap();
+    let loaded: hss::config::AppConfig =
+        toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(loaded.default_credential_id.as_deref(), Some("selected"));
+}
+
+#[test]
 fn test_hosts_roundtrip() {
     use hss::types::Host;
     let hosts = vec![Host {

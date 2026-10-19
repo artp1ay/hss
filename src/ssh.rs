@@ -3,7 +3,8 @@ use crate::credentials;
 use crate::types::{Credential, CredentialKind, Host};
 use anyhow::Result;
 use libc;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
 
 /// Build the ssh -J destination ("user@ip:port") for a host's jump host, if any.
@@ -314,13 +315,11 @@ pub fn resolve_credential<'a>(
     cfg: &AppConfig,
     last_id: Option<&str>,
 ) -> Result<Option<&'a Credential>> {
-    if let Some(id) = last_id {
+    for id in [cfg.default_credential_id.as_deref(), last_id]
+        .into_iter()
+        .flatten()
+    {
         if let Some(c) = creds.iter().find(|c| c.id == id) {
-            return Ok(Some(c));
-        }
-    }
-    if let Some(ref id) = cfg.default_credential_id {
-        if let Some(c) = creds.iter().find(|c| &c.id == id) {
             return Ok(Some(c));
         }
     }
@@ -344,13 +343,7 @@ pub fn spawn_ssh(
         validate_jump_spec(j)?;
     }
 
-    // If keychain entry is missing (e.g. session keyring cleared on logout),
-    // fall back to SSH's own interactive password prompt rather than crashing.
-    let password = if cred.kind == CredentialKind::Password {
-        credentials::get_password(&cred.id).ok()
-    } else {
-        None
-    };
+    let secret = credentials::get_secret(cred)?;
 
     let mut ssh_args: Vec<String> = vec![
         "-o".into(),
@@ -362,10 +355,7 @@ pub fn spawn_ssh(
         "-l".into(),
         cred.username.clone(),
     ];
-    if let Some(ref key) = cred.key_path {
-        ssh_args.extend_from_slice(&["-i".into(), key.clone()]);
-        ssh_args.extend_from_slice(&["-o".into(), "IdentitiesOnly=yes".into()]);
-    }
+    append_auth_args(&mut ssh_args, cred, secret.is_some(), true);
     if let Some(j) = jump {
         ssh_args.extend_from_slice(&["-J".into(), j.to_string()]);
     }
@@ -383,19 +373,7 @@ pub fn spawn_ssh(
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
-    let askpass_path = if let Some(ref pw) = password {
-        let path = write_askpass_helper()?;
-        // DISPLAY is required by some SSH implementations (older macOS, some Linux) even
-        // when SSH_ASKPASS_REQUIRE=force is set. Use the existing DISPLAY or a dummy value.
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-        cmd.env("SSH_ASKPASS", &path)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", display)
-            .env("HSS_PASSWORD", pw);
-        Some(path)
-    } else {
-        None
-    };
+    let askpass_path = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
 
     // Ignore SIGINT in hss while SSH runs: Ctrl+C kills SSH but returns control here.
     // Without this, Ctrl+C sends SIGINT to the whole process group and hss exits too.
@@ -440,11 +418,7 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
         validate_jump_spec(j)?;
     }
 
-    let password = if cred.kind == CredentialKind::Password {
-        credentials::get_password(&cred.id).ok()
-    } else {
-        None
-    };
+    let secret = credentials::get_secret(cred)?;
 
     let mut ssh_args: Vec<String> = vec![
         "-o".into(),
@@ -461,17 +435,11 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
         "-l".into(),
         cred.username.clone(),
     ];
-    if let Some(ref key) = cred.key_path {
-        ssh_args.extend_from_slice(&["-i".into(), key.clone()]);
-        ssh_args.extend_from_slice(&["-o".into(), "IdentitiesOnly=yes".into()]);
-    }
+    append_auth_args(&mut ssh_args, cred, secret.is_some(), false);
     if let Some(ref j) = jump {
         ssh_args.extend_from_slice(&["-J".into(), j.clone()]);
     }
-    if password.is_none() {
-        // Key auth: never hang on an interactive prompt
-        ssh_args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
-    }
+
     ssh_args.push("--".into());
     ssh_args.push(h.ip.clone());
     ssh_args.push(command.to_string());
@@ -479,17 +447,7 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
     let mut cmd = Command::new("ssh");
     cmd.args(&ssh_args).stdin(std::process::Stdio::null());
 
-    let askpass_path = if let Some(ref pw) = password {
-        let path = write_askpass_helper()?;
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-        cmd.env("SSH_ASKPASS", &path)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", display)
-            .env("HSS_PASSWORD", pw);
-        Some(path)
-    } else {
-        None
-    };
+    let askpass_path = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
 
     let timeout = cfg.exec_timeout;
     let out = if timeout == 0 {
@@ -626,7 +584,17 @@ pub fn copy_id(
         "-o".into(),
         format!("ConnectTimeout={}", cfg.connect_timeout),
     ];
-    if password.is_none() {
+    if password.is_some() {
+        for option in [
+            "PreferredAuthentications=password,keyboard-interactive",
+            "PubkeyAuthentication=no",
+            "PasswordAuthentication=yes",
+            "KbdInteractiveAuthentication=yes",
+            "BatchMode=no",
+        ] {
+            args.extend(["-o".into(), option.into()]);
+        }
+    } else {
         args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
     }
     args.push(format!("{user}@{ip}"));
@@ -634,17 +602,7 @@ pub fn copy_id(
     let mut cmd = Command::new("ssh-copy-id");
     cmd.args(&args).stdin(std::process::Stdio::null());
 
-    let askpass_path = if let Some(pw) = password {
-        let path = write_askpass_helper()?;
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
-        cmd.env("SSH_ASKPASS", &path)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", display)
-            .env("HSS_PASSWORD", pw);
-        Some(path)
-    } else {
-        None
-    };
+    let askpass_path = configure_askpass(&mut cmd, &CredentialKind::Password, password)?;
 
     let out = cmd.output();
     if let Some(ref path) = askpass_path {
@@ -653,25 +611,88 @@ pub fn copy_id(
     Ok(out?)
 }
 
-pub fn write_askpass_helper() -> Result<std::path::PathBuf> {
-    let rand: u64 = {
-        let mut buf = [0u8; 8];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
-            .unwrap_or_else(|_| {
-                buf = std::process::id()
-                    .to_ne_bytes()
-                    .into_iter()
-                    .chain([0u8; 4])
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap_or([0u8; 8]);
-            });
-        u64::from_ne_bytes(buf)
+pub(crate) fn append_auth_args(
+    args: &mut Vec<String>,
+    cred: &Credential,
+    has_secret: bool,
+    interactive: bool,
+) {
+    let options = match cred.kind {
+        CredentialKind::Password => [
+            "PreferredAuthentications=password,keyboard-interactive",
+            "PubkeyAuthentication=no",
+            "PasswordAuthentication=yes",
+            "KbdInteractiveAuthentication=yes",
+        ],
+        CredentialKind::Key => [
+            "PreferredAuthentications=publickey",
+            "PubkeyAuthentication=yes",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+        ],
     };
-    let path = std::env::temp_dir().join(format!("hss-askpass-{:016x}", rand));
-    std::fs::write(&path, "#!/bin/sh\necho \"$HSS_PASSWORD\"\n")?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    for option in options {
+        args.extend(["-o".into(), option.into()]);
+    }
+    if cred.kind == CredentialKind::Key {
+        if let Some(key) = &cred.key_path {
+            args.extend([
+                "-i".into(),
+                key.clone(),
+                "-o".into(),
+                "IdentitiesOnly=yes".into(),
+            ]);
+        }
+    }
+    args.extend([
+        "-o".into(),
+        if has_secret || interactive {
+            "BatchMode=no"
+        } else {
+            "BatchMode=yes"
+        }
+        .into(),
+    ]);
+}
+
+pub(crate) fn configure_askpass(
+    cmd: &mut Command,
+    kind: &CredentialKind,
+    secret: Option<&str>,
+) -> Result<Option<std::path::PathBuf>> {
+    let Some(secret) = secret else {
+        return Ok(None);
+    };
+    let path = write_askpass_helper()?;
+    cmd.env("SSH_ASKPASS", &path)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env(
+            "DISPLAY",
+            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
+        )
+        .env("HSS_SECRET", secret)
+        .env(
+            "HSS_SECRET_KIND",
+            match kind {
+                CredentialKind::Password => "password",
+                CredentialKind::Key => "key",
+            },
+        );
+    Ok(Some(path))
+}
+
+pub fn write_askpass_helper() -> Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("hss-askpass-{}", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)?;
+    let script = b"#!/bin/sh\ncase \"$HSS_SECRET_KIND:$1\" in\n  key:*[Pp]assphrase*) ;;\n  password:*[Pp]assphrase*) exit 1 ;;\n  password:*[Pp]assword*) ;;\n  *) exit 1 ;;\nesac\nprintf '%s\\n' \"$HSS_SECRET\"\n";
+    if let Err(err) = file.write_all(script) {
+        let _ = std::fs::remove_file(&path);
+        return Err(err.into());
+    }
     Ok(path)
 }
 
@@ -793,6 +814,123 @@ mod tests {
         let creds = vec![key_cred("a"), key_cred("b")];
         let result = resolve_credential(&creds, &AppConfig::default(), Some("b")).unwrap();
         assert_eq!(result.unwrap().id, "b");
+    }
+
+    #[test]
+    fn resolve_default_overrides_history() {
+        let creds = vec![key_cred("a"), key_cred("b")];
+        let cfg = AppConfig {
+            default_credential_id: Some("a".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_credential(&creds, &cfg, Some("b"))
+                .unwrap()
+                .unwrap()
+                .id,
+            "a"
+        );
+    }
+
+    #[test]
+    fn resolve_missing_default_uses_history() {
+        let creds = vec![key_cred("a"), key_cred("b")];
+        let cfg = AppConfig {
+            default_credential_id: Some("missing".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_credential(&creds, &cfg, Some("b"))
+                .unwrap()
+                .unwrap()
+                .id,
+            "b"
+        );
+    }
+
+    #[test]
+    fn auth_args_isolate_credential_kind_and_allow_saved_passphrase() {
+        let mut cred = key_cred("key");
+        cred.key_path = Some("/test/key".into());
+        let mut args = Vec::new();
+        append_auth_args(&mut args, &cred, true, false);
+        for expected in [
+            "PreferredAuthentications=publickey",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "BatchMode=no",
+            "IdentitiesOnly=yes",
+            "/test/key",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
+        }
+        args.clear();
+        append_auth_args(&mut args, &cred, false, false);
+        assert!(args.iter().any(|arg| arg == "BatchMode=yes"));
+        args.clear();
+        append_auth_args(&mut args, &cred, false, true);
+        assert!(args.iter().any(|arg| arg == "BatchMode=no"));
+        cred.kind = CredentialKind::Password;
+        args.clear();
+        append_auth_args(&mut args, &cred, true, false);
+        for expected in [
+            "PreferredAuthentications=password,keyboard-interactive",
+            "PubkeyAuthentication=no",
+            "PasswordAuthentication=yes",
+            "KbdInteractiveAuthentication=yes",
+        ] {
+            assert!(args.iter().any(|arg| arg == expected), "missing {expected}");
+        }
+        assert!(!args.iter().any(|arg| arg == "-i" || arg == "/test/key"));
+    }
+
+    #[test]
+    fn askpass_is_private_literal_and_prompt_scoped() {
+        use std::os::unix::fs::PermissionsExt;
+        let secret = "-n back\\slash 'quoted'\nsecond line";
+        for (kind, prompt, allowed) in [
+            (
+                CredentialKind::Key,
+                "Enter passphrase for key '/test/key':",
+                true,
+            ),
+            (CredentialKind::Key, "u@host's password:", false),
+            (CredentialKind::Password, "u@host's password:", true),
+            (CredentialKind::Password, "Password: ", true),
+            (CredentialKind::Password, "Enter passphrase for key:", false),
+            (CredentialKind::Password, "Verification code:", false),
+            (
+                CredentialKind::Key,
+                "Are you sure you want to continue connecting?",
+                false,
+            ),
+        ] {
+            let mut cmd = Command::new("sh");
+            let path = configure_askpass(&mut cmd, &kind, Some(secret))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert!(!std::fs::read_to_string(&path).unwrap().contains(secret));
+            let output = cmd.arg(&path).arg(prompt).output().unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(output.status.success(), allowed);
+            assert_eq!(
+                output.stdout,
+                if allowed {
+                    format!("{secret}\n").into_bytes()
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+        let mut cmd = Command::new("ssh");
+        assert!(configure_askpass(&mut cmd, &CredentialKind::Key, None)
+            .unwrap()
+            .is_none());
+        assert_eq!(cmd.get_envs().count(), 0);
     }
 
     #[test]
