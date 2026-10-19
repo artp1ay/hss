@@ -117,7 +117,8 @@ jobs:
           RAW_TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="${RAW_TAG#v}"
           if [[ -n "$VERSION" ]]; then
-            sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+            SEMVER=$(echo "$VERSION" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
+            sed -i.bak -E "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
             rm -f Cargo.toml.bak
           fi
 
