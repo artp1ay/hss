@@ -475,7 +475,7 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     if let Err(e) = handle_key(terminal, app, key) {
                         app.status_message =
-                            Some(crate::types::StatusMessage::error(format!("Error: {e}")));
+                            Some(crate::types::StatusMessage::error(format!("Error: {e:#}")));
                     }
                 }
             }

@@ -93,6 +93,14 @@ On Linux, hss needs a running **session D-Bus** and a Secret Service provider (s
 
 On macOS, Keychain persists across reboots, but unlocking or access approval may be required, particularly in headless/SSH sessions.
 
+**`org.freedesktop.secrets` / D-Bus errors:** the Secret Service provider is unavailable to the process running hss. A successful save requires a running provider and an unlocked persistent collection; reinstalling hss or re-entering a password does not start that service. On Linux, check the session bus from the same user/session as MCP:
+
+```sh
+busctl --user status org.freedesktop.secrets
+```
+
+Native macOS hss uses Keychain, not D-Bus. If a macOS client shows this error, check whether its MCP command/endpoint runs hss in Linux, a container, or a remote session. TUI and MCP must run as the same user in the same environment to share credentials. After upgrading hss, restart the MCP server in the client: replacing the binary does not update an already-running process.
+
 ## MCP Server (Model Context Protocol)
 
 `hss` can serve as an MCP server for LLM agents (Claude Desktop, Zed, Cursor, OpenCode):

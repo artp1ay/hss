@@ -11,11 +11,24 @@ fn validate_fields(name: &str, username: &str) -> Result<()> {
     Ok(())
 }
 
+fn secret_store_context(operation: &str) -> String {
+    let hint = if cfg!(target_os = "macos") {
+        "macOS Keychain: unlock the login keychain and allow access for the hss executable"
+    } else {
+        "Secret Service: run a session D-Bus and an unlocked persistent keyring (e.g. GNOME Keyring) for the user running hss; org.freedesktop.secrets must be available on that bus"
+    };
+    format!(
+        "Cannot {operation} credential in system secret store (hss {}, {}): {hint}. MCP uses the secret store of its own process, not the SSH destination",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    )
+}
+
 fn read_secret(entry: &keyring::Entry) -> Result<Option<String>> {
     match entry.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(err).context("Cannot read credential from system secret store"),
+        Err(err) => Err(err).with_context(|| secret_store_context("read")),
     }
 }
 
@@ -23,10 +36,10 @@ fn write_secret(entry: &keyring::Entry, secret: Option<&str>) -> Result<()> {
     match secret {
         Some(secret) => entry
             .set_password(secret)
-            .context("Cannot save credential to system secret store"),
+            .with_context(|| secret_store_context("save")),
         None => match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(err) => Err(err).context("Cannot delete credential from system secret store"),
+            Err(err) => Err(err).with_context(|| secret_store_context("delete")),
         },
     }
 }
@@ -88,7 +101,8 @@ pub fn add_credential(
         kind,
         key_path,
     };
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &cred.id)?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &cred.id)
+        .with_context(|| secret_store_context("initialize"))?;
     creds.push(cred.clone());
     save_with_secret(&entry, None, secret, || config::save_credentials(&creds))?;
     Ok(cred)
@@ -108,7 +122,8 @@ pub fn update_credential(
         .iter()
         .position(|c| c.id == id)
         .ok_or_else(|| anyhow::anyhow!("credential not found: {id}"))?;
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, id)?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, id)
+        .with_context(|| secret_store_context("initialize"))?;
     let old = read_secret(&entry)?;
     let new = next_secret(&kind, Some(&creds[idx].kind), old.as_deref(), password)?;
     creds[idx] = Credential {
@@ -125,7 +140,8 @@ pub fn update_credential(
 
 pub fn delete_credential(id: &str) -> Result<()> {
     let mut creds = config::load_credentials()?;
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, id)?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, id)
+        .with_context(|| secret_store_context("initialize"))?;
     let old = read_secret(&entry)?;
     creds.retain(|c| c.id != id);
     save_with_secret(&entry, old.as_deref(), None, || {
@@ -134,7 +150,8 @@ pub fn delete_credential(id: &str) -> Result<()> {
 }
 
 pub fn get_secret(cred: &Credential) -> Result<Option<String>> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &cred.id)?;
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &cred.id)
+        .with_context(|| secret_store_context("initialize"))?;
     let secret = read_secret(&entry)?;
     next_secret(&cred.kind, Some(&cred.kind), secret.as_deref(), None)
         .with_context(|| format!("Credential '{}' has no saved password", cred.name))?;
@@ -142,8 +159,11 @@ pub fn get_secret(cred: &Credential) -> Result<Option<String>> {
 }
 
 pub fn get_password(id: &str) -> Result<String> {
-    read_secret(&keyring::Entry::new(KEYCHAIN_SERVICE, id)?)?
-        .ok_or_else(|| anyhow::anyhow!("No saved password; save it in Credentials"))
+    read_secret(
+        &keyring::Entry::new(KEYCHAIN_SERVICE, id)
+            .with_context(|| secret_store_context("initialize"))?,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("No saved password; save it in Credentials"))
 }
 
 #[cfg(test)]
@@ -229,7 +249,10 @@ mod tests {
             .downcast_ref::<MockCredential>()
             .unwrap();
         mock.set_error(keyring::Error::Invalid("backend".into(), "locked".into()));
-        assert!(read_secret(&entry).is_err());
+        let error = read_secret(&entry).unwrap_err();
+        assert!(error.to_string().contains(std::env::consts::OS));
+        assert!(error.to_string().contains("MCP uses the secret store"));
+        assert!(format!("{error:#}").contains("locked"));
         mock.set_error(keyring::Error::Invalid("backend".into(), "locked".into()));
         assert!(save_with_secret(&entry, None, Some("new"), || panic!(
             "must not save metadata"

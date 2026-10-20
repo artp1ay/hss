@@ -435,7 +435,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     app.status_message = None;
                 }
                 Err(e) => {
-                    app.status_message = Some(crate::types::StatusMessage::error(format!("{e}")));
+                    app.status_message = Some(crate::types::StatusMessage::error(format!("{e:#}")));
                 }
             }
         }

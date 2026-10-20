@@ -379,7 +379,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     app.status_message = Some(StatusMessage::success("Default credential saved."));
                 }
                 Err(e) => {
-                    app.status_message = Some(StatusMessage::error(format!("Error: {e}")));
+                    app.status_message = Some(StatusMessage::error(format!("Error: {e:#}")));
                 }
             }
         }

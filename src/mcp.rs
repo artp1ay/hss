@@ -770,9 +770,9 @@ fn call_tool(
                         Level::Err,
                         "tool",
                         format!("list-servers failed ({} ms)", t0.elapsed().as_millis()),
-                        vec![format!("error: {e}")],
+                        vec![format!("error: {e:#}")],
                     );
-                    tool_text(format!("Failed to load hosts: {e}"), true)
+                    tool_text(format!("Failed to load hosts: {e:#}"), true)
                 }
             }
         }
@@ -948,9 +948,9 @@ fn call_tool(
                             "execute-command @ {host} failed ({} ms)",
                             t0.elapsed().as_millis()
                         ),
-                        vec![format!("error: {e}")],
+                        vec![format!("error: {e:#}")],
                     );
-                    tool_text(format!("Error: {e}"), true)
+                    tool_text(format!("Error: {e:#}"), true)
                 }
             }
         }

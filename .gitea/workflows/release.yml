@@ -30,8 +30,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             artifact: hss-linux-x86_64
+            cross: false
           - target: aarch64-unknown-linux-musl
             artifact: hss-linux-aarch64
+            cross: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,23 +55,30 @@ jobs:
             rm -f Cargo.toml.bak
           fi
       - name: Install build tools
+        if: matrix.cross == false
         run: |
           sudo apt-get update
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            sudo apt-get install -y musl-tools
-          else
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+          sudo apt-get install -y musl-tools
+      - name: Install cross
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
       - name: Build
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
       - name: Stage artifact
         run: cp target/${{ matrix.target }}/release/hss ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+          if-no-files-found: error
 
   release:
     needs: build
@@ -79,20 +88,35 @@ jobs:
         with:
           fetch-depth: 0
       - uses: actions/download-artifact@v3
-      - name: Create release and upload assets
+      - name: Prepare release assets and checksums
+        shell: bash
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          RELEASE_ID=$(curl -sf -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          set -euo pipefail
+          mkdir -p release-assets
+          cp hss-linux-x86_64/hss-linux-x86_64 release-assets/
+          cp hss-linux-aarch64/hss-linux-aarch64 release-assets/
+          cd release-assets
+          sha256sum hss-linux-x86_64 hss-linux-aarch64 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create release and upload assets
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES_URL: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases
+        run: |
+          set -euo pipefail
+          cd release-assets
+          PAYLOAD=$(python3 -c 'import json, os; tag = os.environ["TAG"]; print(json.dumps({"tag_name": tag, "name": tag, "body": "Release " + tag}))')
+          RELEASE_ID=$(curl -fsS -X POST \
+            -H "Authorization: token ${TOKEN}" \
             -H "Content-Type: application/json" \
-            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
-            -d "{\"tag_name\":\"${TAG}\",\"name\":\"${TAG}\",\"body\":\"Release ${TAG}\"}" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" || true)
-          if [[ -n "$RELEASE_ID" ]]; then
-            for f in hss-linux-x86_64/hss-linux-x86_64 hss-linux-aarch64/hss-linux-aarch64; do
-              curl -sf -X POST \
-                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-                "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases/${RELEASE_ID}/assets?name=$(basename $f)" \
-                -F "attachment=@${f}" || true
-            done
-          fi
+            "$RELEASES_URL" \
+            -d "$PAYLOAD" \
+            | python3 -c 'import sys, json; release_id = json.load(sys.stdin)["id"]; assert type(release_id) is int and release_id > 0; print(release_id)')
+          for f in hss-linux-x86_64 hss-linux-aarch64 SHA256SUMS; do
+            curl -fsS -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              "${RELEASES_URL}/${RELEASE_ID}/assets?name=${f}" \
+              -F "attachment=@${f}"
+          done

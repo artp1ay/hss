@@ -218,7 +218,7 @@ pub fn check_single_host(
     let resolved_cred = match crate::ssh::resolve_credential(creds, cfg, last_id) {
         Ok(cred) => cred,
         Err(e) => {
-            let detail = format!("Failed to resolve credential: {e}");
+            let detail = format!("Failed to resolve credential: {e:#}");
             return HostAuditResult {
                 host_id: host.id.clone(),
                 host_name: host.name.clone(),
@@ -342,7 +342,7 @@ fn check_ssh_auth(
     let secret = match crate::credentials::get_secret(cred) {
         Ok(secret) => secret,
         Err(e) => {
-            let detail = format!("Failed to load credential secret: {e}");
+            let detail = format!("Failed to load credential secret: {e:#}");
             return (HostStatus::Error(detail.clone()), detail, None);
         }
     };
