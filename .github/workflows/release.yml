@@ -176,13 +176,15 @@ jobs:
             TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG" 2>/dev/null | sed '/^$/d' || true)
             if [[ -n "$TAG_MESSAGE" ]]; then
               printf '%s\n' "$TAG_MESSAGE" > NOTES.md
-            else
+            elif git rev-parse "$TAG" >/dev/null 2>&1; then
               PREV=$(git tag --sort=-version:refname | grep -E '^v[0-9]+' | grep -v "^${TAG}$" | head -1 || true)
-              if [[ -z "$PREV" ]]; then
-                git log --pretty=format:"- %s" -n 50 > NOTES.md
+              if [[ -n "$PREV" ]] && git rev-parse "$PREV" >/dev/null 2>&1; then
+                git log --pretty=format:"- %s" "${PREV}..${TAG}" > NOTES.md || git log --pretty=format:"- %s" -n 50 > NOTES.md
               else
-                git log --pretty=format:"- %s" "${PREV}..${TAG}" > NOTES.md
+                git log --pretty=format:"- %s" -n 50 > NOTES.md
               fi
+            else
+              git log --pretty=format:"- %s" -n 50 > NOTES.md
             fi
           fi
 
