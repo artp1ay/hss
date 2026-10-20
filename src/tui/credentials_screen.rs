@@ -16,7 +16,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         ("A", "add"),
         ("E", "edit"),
         ("D", "delete"),
-        ("*", "default"),
+        ("*/S", "default"),
         ("Esc", "back"),
     ];
     let hotkey_lines = crate::tui::wrap_hotkey_lines(hotkeys, area.width);
@@ -367,7 +367,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 });
             }
         }
-        KeyCode::Char('*') if creds_len > 0 => {
+        KeyCode::Char('*') | KeyCode::Char('s') | KeyCode::Char('S') if creds_len > 0 => {
             let id = app.credentials[app.cred_selected.min(creds_len - 1)]
                 .id
                 .clone();

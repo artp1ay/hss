@@ -12,6 +12,11 @@ fn validate_fields(name: &str, username: &str) -> Result<()> {
 }
 
 fn secret_store_context(operation: &str) -> String {
+    if crate::file_keystore::is_file_keystore() {
+        return format!(
+            "Cannot {operation} credential in file-based keystore (~/.config/hss/keystore/)"
+        );
+    }
     let hint = if cfg!(target_os = "macos") {
         "macOS Keychain: unlock the login keychain and allow access for the hss executable"
     } else {

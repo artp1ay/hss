@@ -2,6 +2,7 @@ pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod credentials;
+pub mod file_keystore;
 pub mod fzf;
 pub mod inventory;
 pub mod mcp;

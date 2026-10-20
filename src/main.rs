@@ -2,6 +2,7 @@ use clap::Parser;
 use hss::cli::Cli;
 
 fn main() -> anyhow::Result<()> {
+    hss::file_keystore::init_keystore_fallback();
     let cli = Cli::parse();
     if cli.ansible_inventory {
         let hosts = hss::config::load_hosts()?;
