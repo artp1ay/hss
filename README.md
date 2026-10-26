@@ -121,6 +121,8 @@ Or standalone HTTP daemon:
 hss --mcp
 ```
 
+For stdio MCP clients, use `hss --mcp-stdio -v`. The process stays alive waiting for newline-delimited JSON-RPC on stdin and exits when stdin closes. `-v` logs startup, selected credential backend, and request progress to **stderr**; stdout remains JSON-RPC only. If it stops at `initializing credential storage`, check the system keyring/D-Bus or run with `HSS_KEYSTORE=file` (secrets on disk are not encrypted).
+
 ## Config
 
 | OS | Path |

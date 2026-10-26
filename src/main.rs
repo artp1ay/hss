@@ -2,8 +2,21 @@ use clap::Parser;
 use hss::cli::Cli;
 
 fn main() -> anyhow::Result<()> {
-    hss::file_keystore::init_keystore_fallback();
     let cli = Cli::parse();
+    if cli.verbose && cli.mcp_stdio {
+        eprintln!("hss mcp: initializing credential storage");
+    }
+    hss::file_keystore::init_keystore_fallback();
+    if cli.verbose && cli.mcp_stdio {
+        eprintln!(
+            "hss mcp: credential storage: {}",
+            if hss::file_keystore::is_file_keystore() {
+                "file (not encrypted)"
+            } else {
+                "system"
+            }
+        );
+    }
     if cli.ansible_inventory {
         let hosts = hss::config::load_hosts()?;
         let creds = hss::config::load_credentials()?;
@@ -32,7 +45,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if cli.mcp_stdio {
-        return hss::mcp::run_stdio();
+        return hss::mcp::run_stdio(cli.verbose);
     }
 
     if cli.mcp {

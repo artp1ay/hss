@@ -3,6 +3,9 @@ use clap::{CommandFactory, Parser};
 #[derive(Parser, Debug)]
 #[command(name = "hss", about = "SSH manager — connect to your servers", version)]
 pub struct Cli {
+    /// Show MCP stdio startup and request diagnostics on stderr
+    #[arg(short, long)]
+    pub verbose: bool,
     /// Quick fzf picker mode
     #[arg(long)]
     pub fzf: bool,

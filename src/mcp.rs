@@ -430,7 +430,7 @@ pub fn process_json_rpc(body: &str) -> Option<Value> {
 }
 
 /// Run headless MCP server over stdio (JSON-RPC newline-delimited stream)
-pub fn run_stdio() -> Result<()> {
+pub fn run_stdio(verbose: bool) -> Result<()> {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -438,17 +438,40 @@ pub fn run_stdio() -> Result<()> {
     let log: Log = Arc::new(Mutex::new(LogState::default()));
     let started = Instant::now();
 
+    if verbose {
+        eprintln!("hss mcp: ready; waiting for newline-delimited JSON-RPC on stdin");
+    }
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
+        let request_started = Instant::now();
+        let method = if verbose {
+            let method = serde_json::from_str::<Value>(&line)
+                .ok()
+                .and_then(|req| req.get("method").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| "invalid JSON-RPC".into());
+            eprintln!("hss mcp: received {method}");
+            method
+        } else {
+            String::new()
+        };
         let (_, resp) = handle_rpc(&line, &log, started, true);
         if let Some(resp_val) = resp {
             let json_str = serde_json::to_string(&resp_val)?;
             writeln!(stdout, "{json_str}")?;
             stdout.flush()?;
         }
+        if verbose {
+            eprintln!(
+                "hss mcp: finished {method} in {} ms",
+                request_started.elapsed().as_millis()
+            );
+        }
+    }
+    if verbose {
+        eprintln!("hss mcp: stdin closed; exiting");
     }
     Ok(())
 }
