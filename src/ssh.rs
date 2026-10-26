@@ -314,10 +314,15 @@ pub fn resolve_credential<'a>(
     creds: &'a [Credential],
     cfg: &AppConfig,
     last_id: Option<&str>,
+    server_default_id: Option<&str>,
 ) -> Result<Option<&'a Credential>> {
-    for id in [cfg.default_credential_id.as_deref(), last_id]
-        .into_iter()
-        .flatten()
+    for id in [
+        server_default_id,
+        last_id,
+        cfg.default_credential_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         if let Some(c) = creds.iter().find(|c| c.id == id) {
             return Ok(Some(c));
@@ -403,12 +408,14 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
         .find(|h| h.name == host_query || h.ip == host_query)
         .ok_or_else(|| anyhow::anyhow!("Host not found: {host_query}"))?;
     let records = config::migrate_server_records(records, &hosts);
-    let last_id = records
-        .iter()
-        .find(|r| r.host_id == h.id)
-        .and_then(|r| r.last_credential_id.clone());
-    let cred = resolve_credential(&creds, &cfg, last_id.as_deref())?
-        .ok_or_else(|| anyhow::anyhow!("No credential resolved for host '{}'", h.name))?;
+    let record = records.iter().find(|r| r.host_id == h.id);
+    let cred = resolve_credential(
+        &creds,
+        &cfg,
+        record.and_then(|r| r.last_credential_id.as_deref()),
+        record.and_then(|r| r.default_credential_id.as_deref()),
+    )?
+    .ok_or_else(|| anyhow::anyhow!("No credential resolved for host '{}'", h.name))?;
 
     validate_host(&h.ip)?;
     validate_port(h.port)?;
@@ -703,19 +710,22 @@ pub fn connect_direct(host: &str) -> Result<()> {
     let hosts = config::load_hosts()?;
 
     let records = config::migrate_server_records(records, &hosts);
-    let (ssh_host, port, last_cred_id, jump) =
+    let (ssh_host, port, record, jump) =
         if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
-            let last_id = records
-                .iter()
-                .find(|r| r.host_id == h.id)
-                .and_then(|r| r.last_credential_id.clone());
+            let record = records.iter().find(|r| r.host_id == h.id);
             let jump = resolve_jump_spec(&hosts, h)?;
-            (h.ip.clone(), h.port, last_id, jump)
+            (h.ip.clone(), h.port, record, jump)
         } else {
             (host.to_string(), 22, None, None)
         };
 
-    let cred = resolve_credential(&creds, &cfg, last_cred_id.as_deref())?.ok_or_else(|| {
+    let cred = resolve_credential(
+        &creds,
+        &cfg,
+        record.and_then(|r| r.last_credential_id.as_deref()),
+        record.and_then(|r| r.default_credential_id.as_deref()),
+    )?
+    .ok_or_else(|| {
         anyhow::anyhow!("No credentials configured. Run `hss` to set up credentials.")
     })?;
 
@@ -812,23 +822,46 @@ mod tests {
     #[test]
     fn resolve_last_id_wins() {
         let creds = vec![key_cred("a"), key_cred("b")];
-        let result = resolve_credential(&creds, &AppConfig::default(), Some("b")).unwrap();
+        let result = resolve_credential(&creds, &AppConfig::default(), Some("b"), None).unwrap();
         assert_eq!(result.unwrap().id, "b");
     }
 
     #[test]
-    fn resolve_default_overrides_history() {
+    fn resolve_history_overrides_global_default() {
         let creds = vec![key_cred("a"), key_cred("b")];
         let cfg = AppConfig {
             default_credential_id: Some("a".into()),
             ..Default::default()
         };
         assert_eq!(
-            resolve_credential(&creds, &cfg, Some("b"))
+            resolve_credential(&creds, &cfg, Some("b"), None)
                 .unwrap()
                 .unwrap()
                 .id,
-            "a"
+            "b"
+        );
+    }
+
+    #[test]
+    fn resolve_server_default_overrides_history_and_global() {
+        let creds = vec![key_cred("a"), key_cred("b"), key_cred("c")];
+        let cfg = AppConfig {
+            default_credential_id: Some("a".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_credential(&creds, &cfg, Some("b"), Some("c"))
+                .unwrap()
+                .unwrap()
+                .id,
+            "c"
+        );
+        assert_eq!(
+            resolve_credential(&creds, &cfg, Some("b"), Some("missing"))
+                .unwrap()
+                .unwrap()
+                .id,
+            "b"
         );
     }
 
@@ -840,7 +873,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_credential(&creds, &cfg, Some("b"))
+            resolve_credential(&creds, &cfg, Some("b"), None)
                 .unwrap()
                 .unwrap()
                 .id,
@@ -940,21 +973,21 @@ mod tests {
             default_credential_id: Some("a".into()),
             ..Default::default()
         };
-        let result = resolve_credential(&creds, &cfg, None).unwrap();
+        let result = resolve_credential(&creds, &cfg, None, None).unwrap();
         assert_eq!(result.unwrap().id, "a");
     }
 
     #[test]
     fn resolve_single_cred_auto() {
         let creds = vec![key_cred("only")];
-        let result = resolve_credential(&creds, &AppConfig::default(), None).unwrap();
+        let result = resolve_credential(&creds, &AppConfig::default(), None, None).unwrap();
         assert_eq!(result.unwrap().id, "only");
     }
 
     #[test]
     fn resolve_none_when_ambiguous() {
         let creds = vec![key_cred("a"), key_cred("b")];
-        let result = resolve_credential(&creds, &AppConfig::default(), None).unwrap();
+        let result = resolve_credential(&creds, &AppConfig::default(), None, None).unwrap();
         assert!(result.is_none());
     }
 
@@ -965,7 +998,7 @@ mod tests {
             default_credential_id: Some("b".into()),
             ..Default::default()
         };
-        let result = resolve_credential(&creds, &cfg, Some("nonexistent")).unwrap();
+        let result = resolve_credential(&creds, &cfg, Some("nonexistent"), None).unwrap();
         assert_eq!(result.unwrap().id, "b");
     }
 

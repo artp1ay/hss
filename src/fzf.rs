@@ -43,13 +43,16 @@ pub fn run() -> Result<()> {
     }
     .ok_or_else(|| anyhow::anyhow!("Host not found for selection: {line}"))?;
 
-    let last_cred_id = records
-        .iter()
-        .find(|r| r.host_id == host.id)
-        .and_then(|r| r.last_credential_id.clone());
+    let record = records.iter().find(|r| r.host_id == host.id);
 
-    let cred = ssh::resolve_credential(&creds, &cfg, last_cred_id.as_deref())?;
+    let cred = ssh::resolve_credential(
+        &creds,
+        &cfg,
+        record.and_then(|r| r.last_credential_id.as_deref()),
+        record.and_then(|r| r.default_credential_id.as_deref()),
+    )?;
 
+    let mut explicitly_selected = false;
     let cred = if let Some(c) = cred {
         c.clone()
     } else if creds.is_empty() {
@@ -73,6 +76,7 @@ pub fn run() -> Result<()> {
         let Some(cred_line) = selected_cred else {
             return Ok(());
         };
+        explicitly_selected = true;
         cred_pairs
             .iter()
             .find(|(_, s)| s == &cred_line)
@@ -81,9 +85,7 @@ pub fn run() -> Result<()> {
     };
 
     let jump = ssh::resolve_jump_spec(&hosts, host)?;
-    let status = ssh::spawn_ssh(&host.ip, host.port, &cred, &cfg, jump.as_deref())?;
-    if status.success() && cfg.auto_save_credential {
-        // Save last credential
+    if explicitly_selected || cfg.auto_save_credential {
         let mut records = config::migrate_server_records(config::load_server_records()?, &hosts);
         if let Some(r) = records.iter_mut().find(|r| r.host_id == host.id) {
             r.last_credential_id = Some(cred.id.clone());
@@ -91,10 +93,12 @@ pub fn run() -> Result<()> {
             records.push(crate::types::ServerRecord {
                 host_id: host.id.clone(),
                 last_credential_id: Some(cred.id.clone()),
+                default_credential_id: None,
             });
         }
         config::save_server_records(&records)?;
     }
+    ssh::spawn_ssh(&host.ip, host.port, &cred, &cfg, jump.as_deref())?;
 
     Ok(())
 }

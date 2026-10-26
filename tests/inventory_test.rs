@@ -279,6 +279,7 @@ fn test_generate_ansible_inventory_structure() {
     let records = vec![ServerRecord {
         host_id: "app-id".into(),
         last_credential_id: Some("cred-key".into()),
+        default_credential_id: None,
     }];
 
     let cfg = AppConfig {

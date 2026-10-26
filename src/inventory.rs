@@ -246,14 +246,16 @@ pub fn generate_ansible_inventory(
     let mut tag_groups: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for host in hosts {
-        let last_cred_id = records
-            .iter()
-            .find(|r| r.host_id == host.id)
-            .and_then(|r| r.last_credential_id.as_deref());
+        let record = records.iter().find(|r| r.host_id == host.id);
 
-        let resolved_cred = crate::ssh::resolve_credential(creds, cfg, last_cred_id)
-            .ok()
-            .flatten();
+        let resolved_cred = crate::ssh::resolve_credential(
+            creds,
+            cfg,
+            record.and_then(|r| r.last_credential_id.as_deref()),
+            record.and_then(|r| r.default_credential_id.as_deref()),
+        )
+        .ok()
+        .flatten();
 
         let mut vars = serde_json::Map::new();
         vars.insert("ansible_host".into(), json!(host.ip));

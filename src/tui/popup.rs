@@ -67,7 +67,11 @@ pub fn draw(f: &mut Frame, app: &App) {
                     crate::types::CredentialKind::Key => "key",
                     crate::types::CredentialKind::Password => "password",
                 };
-                let default_marker = if app.config.default_credential_id.as_deref() == Some(&c.id) {
+                let default_marker = if app
+                    .record_for(&host.id)
+                    .and_then(|r| r.default_credential_id.as_deref())
+                    == Some(c.id.as_str())
+                {
                     "★"
                 } else {
                     ""
@@ -115,6 +119,11 @@ pub fn draw(f: &mut Frame, app: &App) {
             " connect  ",
             Style::default().fg(Color::DarkGray),
         ));
+        hotkey_spans.push(Span::styled("[*]", Style::default().fg(Color::Blue)));
+        hotkey_spans.push(Span::styled(
+            " default  ",
+            Style::default().fg(Color::DarkGray),
+        ));
         hotkey_spans.push(Span::styled("[A]", Style::default().fg(Color::Blue)));
         hotkey_spans.push(Span::styled(" add  ", Style::default().fg(Color::DarkGray)));
     }
@@ -152,9 +161,19 @@ pub fn handle_key(
             app.cred_form = Some(crate::types::CredentialForm::default());
             app.screen = Screen::Credentials;
         }
+        KeyCode::Char('*') if creds_len > 0 => {
+            let cred = &app.credentials[app.popup_selected.min(creds_len - 1)];
+            let host_id = app.hosts[host_idx].id.clone();
+            let cred_id = cred.id.clone();
+            app.select_credential(&host_id, &cred_id, true)?;
+            app.status_message = Some(crate::types::StatusMessage::info(
+                "Default credential saved for server.",
+            ));
+        }
         KeyCode::Enter if creds_len > 0 => {
             let cred = app.credentials[app.popup_selected.min(creds_len - 1)].clone();
             let host_id = app.hosts[host_idx].id.clone();
+            app.select_credential(&host_id, &cred.id, false)?;
             app.screen = Screen::Main;
             crate::tui::do_connect(terminal, app, &host_id, &cred)?;
         }

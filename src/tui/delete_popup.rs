@@ -128,6 +128,7 @@ fn do_delete(app: &mut App, popup: &crate::types::DeletePopup) -> Result<()> {
             if popup.idx < app.credentials.len() {
                 let id = app.credentials[popup.idx].id.clone();
                 crate::credentials::delete_credential(&id)?;
+                app.clear_credential_references(&id)?;
                 if app.config.default_credential_id.as_deref() == Some(&id) {
                     app.config.default_credential_id = None;
                     crate::config::save_config(&app.config)?;

@@ -148,27 +148,65 @@ impl App {
             .collect()
     }
 
-    pub fn last_credential_id(&self, host_id: &str) -> Option<&str> {
-        self.server_records
-            .iter()
-            .find(|r| r.host_id == host_id)
-            .and_then(|r| r.last_credential_id.as_deref())
+    pub fn record_for(&self, host_id: &str) -> Option<&ServerRecord> {
+        self.server_records.iter().find(|r| r.host_id == host_id)
     }
 
-    pub fn save_last_credential(&mut self, host_id: &str, cred_id: &str) -> Result<()> {
-        if let Some(r) = self
-            .server_records
-            .iter_mut()
-            .find(|r| r.host_id == host_id)
-        {
-            r.last_credential_id = Some(cred_id.to_string());
+    pub fn select_credential(&mut self, host_id: &str, cred_id: &str, pin: bool) -> Result<()> {
+        let mut records = self.server_records.clone();
+        if let Some(r) = records.iter_mut().find(|r| r.host_id == host_id) {
+            if pin {
+                r.default_credential_id = Some(cred_id.to_string());
+            } else {
+                r.last_credential_id = Some(cred_id.to_string());
+            }
         } else {
-            self.server_records.push(ServerRecord {
+            records.push(ServerRecord {
                 host_id: host_id.to_string(),
-                last_credential_id: Some(cred_id.to_string()),
+                last_credential_id: (!pin).then(|| cred_id.to_string()),
+                default_credential_id: pin.then(|| cred_id.to_string()),
             });
         }
-        crate::config::save_server_records(&self.server_records)
+        crate::config::save_server_records(&records)?;
+        self.server_records = records;
+        Ok(())
+    }
+
+    pub fn picker_selection(&self, host_id: &str) -> usize {
+        let record = self.record_for(host_id);
+        let id = [
+            record.and_then(|r| r.default_credential_id.as_deref()),
+            record.and_then(|r| r.last_credential_id.as_deref()),
+            self.config.default_credential_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|id| self.credentials.iter().any(|c| c.id == *id));
+        self.credentials
+            .iter()
+            .position(|c| Some(c.id.as_str()) == id)
+            .unwrap_or(0)
+    }
+
+    pub fn clear_credential_references(&mut self, cred_id: &str) -> Result<()> {
+        if !self.server_records.iter().any(|r| {
+            r.last_credential_id.as_deref() == Some(cred_id)
+                || r.default_credential_id.as_deref() == Some(cred_id)
+        }) {
+            return Ok(());
+        }
+        let mut records = self.server_records.clone();
+        for record in &mut records {
+            if record.last_credential_id.as_deref() == Some(cred_id) {
+                record.last_credential_id = None;
+            }
+            if record.default_credential_id.as_deref() == Some(cred_id) {
+                record.default_credential_id = None;
+            }
+        }
+        crate::config::save_server_records(&records)?;
+        self.server_records = records;
+        Ok(())
     }
 
     pub fn save_hosts(&self) -> Result<()> {
@@ -415,7 +453,7 @@ pub fn do_connect(
     if status.success() {
         if app.config.auto_save_credential {
             if let Some(ref h) = host {
-                app.save_last_credential(&h.id, &cred.id)?;
+                app.select_credential(&h.id, &cred.id, false)?;
             }
         }
         app.status_message = None;

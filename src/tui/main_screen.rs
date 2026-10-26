@@ -338,7 +338,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         KeyCode::Char('r') | KeyCode::Char('R') if !app.search_focused && hosts_len > 0 => {
             let idx_in_all = get_host_idx_in_all(app);
             if let Some(idx) = idx_in_all {
-                app.popup_selected = 0;
+                app.popup_selected = app.picker_selection(&app.hosts[idx].id);
                 app.screen = Screen::CredentialPicker {
                     host_idx: idx,
                     after_failure: false,
@@ -466,16 +466,20 @@ fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
     }
     let host = filtered[app.selected_row.min(filtered.len() - 1)].clone();
 
-    let last_cred_id = app.last_credential_id(&host.id).map(|s| s.to_string());
-    let cred =
-        crate::ssh::resolve_credential(&app.credentials, &app.config, last_cred_id.as_deref())?
-            .cloned();
+    let record = app.record_for(&host.id);
+    let cred = crate::ssh::resolve_credential(
+        &app.credentials,
+        &app.config,
+        record.and_then(|r| r.last_credential_id.as_deref()),
+        record.and_then(|r| r.default_credential_id.as_deref()),
+    )?
+    .cloned();
 
     if let Some(cred) = cred {
         crate::tui::do_connect(terminal, app, &host.id, &cred)?;
     } else {
         if let Some(idx) = app.hosts.iter().position(|h| h.id == host.id) {
-            app.popup_selected = 0;
+            app.popup_selected = app.picker_selection(&host.id);
             app.screen = Screen::CredentialPicker {
                 host_idx: idx,
                 after_failure: false,
@@ -492,6 +496,33 @@ mod tests {
 
     fn test_app() -> App {
         App::new(vec![], vec![], crate::config::AppConfig::default(), vec![])
+    }
+
+    #[test]
+    fn picker_restores_server_default_and_falls_back_to_last() {
+        use crate::types::{Credential, CredentialKind, ServerRecord};
+        let mut app = test_app();
+        app.credentials = ["global", "last", "pinned"]
+            .into_iter()
+            .map(|id| Credential {
+                id: id.into(),
+                name: id.into(),
+                username: "u".into(),
+                kind: CredentialKind::Key,
+                key_path: None,
+            })
+            .collect();
+        app.config.default_credential_id = Some("global".into());
+        app.server_records.push(ServerRecord {
+            host_id: "host".into(),
+            last_credential_id: Some("last".into()),
+            default_credential_id: Some("pinned".into()),
+        });
+        assert_eq!(app.picker_selection("host"), 2);
+        app.server_records[0].default_credential_id = Some("deleted".into());
+        assert_eq!(app.picker_selection("host"), 1);
+        app.server_records[0].last_credential_id = None;
+        assert_eq!(app.picker_selection("host"), 0);
     }
 
     #[test]

@@ -318,18 +318,19 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             });
 
             if let Some(host_id) = selected_host_id {
-                let last_cred_id = app.last_credential_id(&host_id).map(|s| s.to_string());
+                let record = app.record_for(&host_id);
                 let cred = crate::ssh::resolve_credential(
                     &app.credentials,
                     &app.config,
-                    last_cred_id.as_deref(),
+                    record.and_then(|r| r.last_credential_id.as_deref()),
+                    record.and_then(|r| r.default_credential_id.as_deref()),
                 )?
                 .cloned();
                 if let Some(c) = cred {
                     crate::tui::do_connect(terminal, app, &host_id, &c)?;
                 } else {
                     if let Some(idx) = app.hosts.iter().position(|x| x.id == host_id) {
-                        app.popup_selected = 0;
+                        app.popup_selected = app.picker_selection(&host_id);
                         app.screen = Screen::CredentialPicker {
                             host_idx: idx,
                             after_failure: false,

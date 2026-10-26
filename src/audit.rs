@@ -211,11 +211,13 @@ pub fn check_single_host(
     let jump = crate::ssh::jump_spec(hosts, host);
     let has_jump = jump.is_some();
 
-    let last_id = records
-        .iter()
-        .find(|r| r.host_id == host.id)
-        .and_then(|r| r.last_credential_id.as_deref());
-    let resolved_cred = match crate::ssh::resolve_credential(creds, cfg, last_id) {
+    let record = records.iter().find(|r| r.host_id == host.id);
+    let resolved_cred = match crate::ssh::resolve_credential(
+        creds,
+        cfg,
+        record.and_then(|r| r.last_credential_id.as_deref()),
+        record.and_then(|r| r.default_credential_id.as_deref()),
+    ) {
         Ok(cred) => cred,
         Err(e) => {
             let detail = format!("Failed to resolve credential: {e:#}");

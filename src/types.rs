@@ -35,6 +35,8 @@ pub struct ServerRecord {
     #[serde(alias = "name")]
     pub host_id: String,
     pub last_credential_id: Option<String>,
+    #[serde(default)]
+    pub default_credential_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

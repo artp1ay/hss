@@ -72,10 +72,12 @@ fn test_server_records_roundtrip() {
         ServerRecord {
             host_id: "host-uuid-1".into(),
             last_credential_id: Some("cred-1".into()),
+            default_credential_id: Some("pinned".into()),
         },
         ServerRecord {
             host_id: "host-uuid-2".into(),
             last_credential_id: None,
+            default_credential_id: None,
         },
     ];
     let s = hss::config::serialize_server_records(&records).unwrap();
@@ -83,6 +85,15 @@ fn test_server_records_roundtrip() {
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].host_id, "host-uuid-1");
     assert_eq!(parsed[0].last_credential_id, Some("cred-1".into()));
+    assert_eq!(parsed[0].default_credential_id.as_deref(), Some("pinned"));
+    assert_eq!(
+        hss::config::parse_server_records(
+            "[[server]]\nhost_id = 'old'\nlast_credential_id = 'cred-1'\n"
+        )
+        .unwrap()[0]
+            .default_credential_id,
+        None
+    );
     assert_eq!(parsed[1].last_credential_id, None);
 }
 
@@ -105,11 +116,13 @@ fn test_migrate_server_records_rewrites_name_keyed_entries() {
         ServerRecord {
             host_id: "web1".into(),
             last_credential_id: Some("cred-a".into()),
+            default_credential_id: None,
         },
         // Already-migrated entry: stays untouched
         ServerRecord {
             host_id: "uuid-2".into(),
             last_credential_id: Some("cred-b".into()),
+            default_credential_id: None,
         },
     ];
     let migrated = hss::config::migrate_server_records(records, &hosts);

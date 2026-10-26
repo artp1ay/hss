@@ -352,6 +352,7 @@ fn handle_list_key(app: &mut App, key: KeyEvent) -> Result<()> {
             if app.skip_delete_confirm {
                 let id = app.credentials[idx].id.clone();
                 crate::credentials::delete_credential(&id)?;
+                app.clear_credential_references(&id)?;
                 if app.config.default_credential_id.as_deref() == Some(&id) {
                     app.config.default_credential_id = None;
                     crate::config::save_config(&app.config)?;
