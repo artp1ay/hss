@@ -130,7 +130,7 @@ hss --mcp
 
 `config.toml` — settings · `hosts.toml` — server list · `servers.toml` — last-used credentials
 
-Passwords are stored in the system keychain, not in any config file.
+Passwords and SSH key passphrases use the system keychain when available. On Linux without a session D-Bus, hss falls back to `~/.config/hss/keystore/` (or the platform's config directory). **File-keystore secrets are base64-encoded, not encrypted**: file permissions are restricted to the current user, but anyone who can read the files or backups can recover the secrets. Use an unlocked Secret Service keyring for encrypted-at-rest storage. `HSS_KEYSTORE=file` or `HSS_KEYSTORE=system` selects a backend explicitly. Switching backends does not migrate saved secrets: re-enter them in Credentials if they are missing. Avoid sharing a config directory between processes using different backends.
 
 To configure a custom GitHub repository for self-updates (`hss --update`), set `update_repo` in `config.toml`:
 

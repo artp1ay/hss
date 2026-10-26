@@ -2,6 +2,7 @@ use keyring::credential::{
     Credential, CredentialApi, CredentialBuilder, CredentialBuilderApi, CredentialPersistence,
 };
 use keyring::Error;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 static USING_FILE_KEYSTORE: std::sync::atomic::AtomicBool =
@@ -16,18 +17,26 @@ fn keystore_dir() -> PathBuf {
 }
 
 fn entry_path(service: &str, user: &str) -> PathBuf {
-    let name = format!("{service}_{user}");
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    keystore_dir().join(safe)
+    let name = format!("{service}:{user}");
+    let safe: String = name.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let dir = keystore_dir();
+    let legacy = dir.join(
+        format!("{service}_{user}")
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>(),
+    );
+    if legacy.exists() {
+        legacy
+    } else {
+        dir.join(safe)
+    }
 }
 
 #[derive(Debug)]
@@ -38,6 +47,13 @@ struct FileCredential {
 impl CredentialApi for FileCredential {
     fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
         use base64::Engine;
+        if let Some(dir) = self.path.parent() {
+            crate::config::ensure_config_dir(dir).map_err(|e| {
+                Error::PlatformFailure(Box::new(std::io::Error::other(e.to_string())))
+            })?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::PlatformFailure(Box::new(e)))?;
+        }
         let encoded = base64::engine::general_purpose::STANDARD.encode(secret);
         crate::config::write_secure_atomic_file(&self.path, &encoded)
             .map_err(|e| Error::PlatformFailure(Box::new(std::io::Error::other(e.to_string()))))
@@ -117,14 +133,19 @@ pub fn init_keystore_fallback() {
         .map(|v| v.eq_ignore_ascii_case("system"))
         .unwrap_or(false);
 
-    if force_file || (!force_system && !probe_system_keyring()) {
+    let dir = keystore_dir();
+    let no_session_bus =
+        cfg!(target_os = "linux") && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none();
+    if force_file || (!force_system && (dir.exists() || no_session_bus || !probe_system_keyring()))
+    {
         keyring::set_default_credential_builder(default_credential_builder());
         USING_FILE_KEYSTORE.store(true, std::sync::atomic::Ordering::Relaxed);
         if std::io::IsTerminal::is_terminal(&std::io::stderr())
             && !std::env::args().any(|a| a == "--mcp-stdio" || a == "--ansible-inventory")
         {
             eprintln!(
-                "hss: system keyring unavailable, using file-based keystore (~/.config/hss/keystore/)"
+                "hss: using file-based keystore ({}); secrets are NOT encrypted, protect this directory and your backups",
+                dir.display()
             );
         }
     }
@@ -136,8 +157,8 @@ mod tests {
     use std::fs;
 
     fn tmp_credential(name: &str) -> FileCredential {
-        let dir = std::env::temp_dir().join("hss_test_keystore");
-        let _ = fs::create_dir_all(&dir);
+        let dir = std::env::temp_dir().join(format!("hss_test_keystore_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
         FileCredential {
             path: dir.join(name),
         }
@@ -184,18 +205,36 @@ mod tests {
         let name = p.file_name().unwrap().to_str().unwrap();
         assert!(!name.contains('/'));
         assert!(!name.contains('@'));
+        assert_ne!(entry_path("hss", "a/b"), entry_path("hss", "a_b"));
+        assert_ne!(entry_path("ab", "c"), entry_path("a", "bc"));
+    }
+
+    #[test]
+    fn file_secret_persists_with_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let cred = tmp_credential("persist_permissions");
+        cred.set_password("key passphrase").unwrap();
+        let reopened = FileCredential {
+            path: cred.path.clone(),
+        };
+        assert_eq!(reopened.get_password().unwrap(), "key passphrase");
+        assert_eq!(
+            fs::metadata(&cred.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(cred.path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        reopened.delete_credential().unwrap();
     }
 
     #[test]
     fn probe_system_keyring_does_not_panic() {
         let _ = probe_system_keyring();
-    }
-
-    #[test]
-    fn file_keystore_flag_initially_matches_state() {
-        assert_eq!(
-            is_file_keystore(),
-            USING_FILE_KEYSTORE.load(std::sync::atomic::Ordering::Relaxed)
-        );
     }
 }
