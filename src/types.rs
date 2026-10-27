@@ -105,8 +105,35 @@ pub struct HostForm {
     pub jump_query: String,
     pub jump_cursor: usize,
     pub jump_selected: usize,
+    pub credential_picker: bool,
+    pub credential_query: String,
+    pub credential_cursor: usize,
+    pub credential_selected: usize,
+    pub credential_id: Option<String>,
+    pub credential_changed: bool,
     pub cursor: usize,
     pub error_message: Option<String>,
+}
+
+impl HostForm {
+    pub fn from_host(h: &Host) -> Self {
+        Self {
+            editing_id: Some(h.id.clone()),
+            name: h.name.clone(),
+            ip: h.ip.clone(),
+            group: h.group.clone(),
+            port: h.port.to_string(),
+            user: h.user.clone().unwrap_or_default(),
+            tags: h.tags.join(", "),
+            description: h.description.clone().unwrap_or_default(),
+            jump_host_id: h.jump_host_id.clone(),
+            port_forwards: h.port_forwards.join(", "),
+            socks_port: h.socks_port.map(|p| p.to_string()).unwrap_or_default(),
+            http_proxy_port: h.http_proxy_port.map(|p| p.to_string()).unwrap_or_default(),
+            cursor: h.name.chars().count(),
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

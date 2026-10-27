@@ -16,6 +16,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let hotkeys = &[
         ("R", "re-test all"),
         ("Enter", "test selected"),
+        ("E", "edit & re-test"),
         ("C", "connect"),
         ("Esc/Q", "back"),
     ];
@@ -32,17 +33,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    let state = match &app.audit_state {
-        Some(s) => s,
-        None => {
-            f.render_widget(
-                Paragraph::new("Audit not started. Press [R] to run audit.")
-                    .alignment(ratatui::layout::Alignment::Center),
-                chunks[2],
-            );
-            return;
-        }
-    };
+    let state = app.audit_state.as_ref();
 
     // 1. Title bar
     let title = Line::from(vec![
@@ -52,12 +43,30 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " · audit & connectivity monitor",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(" · audit", Style::default().fg(Color::DarkGray)),
+        if let Some(ref msg) = app.status_message {
+            let color = match msg.kind {
+                crate::types::StatusKind::Success => Color::Green,
+                crate::types::StatusKind::Info => Color::Cyan,
+                crate::types::StatusKind::Warning => Color::Yellow,
+                crate::types::StatusKind::Error => Color::Red,
+            };
+            Span::styled(format!("  · {}", msg.text), Style::default().fg(color))
+        } else {
+            Span::raw("")
+        },
     ]);
     f.render_widget(Paragraph::new(title), chunks[0]);
+
+    let Some(state) = state else {
+        f.render_widget(
+            Paragraph::new("Audit not started. Press [R] to run audit.")
+                .alignment(ratatui::layout::Alignment::Center),
+            chunks[2],
+        );
+        f.render_widget(Paragraph::new(hotkey_lines), chunks[3]);
+        return;
+    };
 
     // 2. Summary stats
     let mut ok_cnt = 0;
@@ -269,6 +278,20 @@ fn group_color(group: &str) -> Color {
     PALETTE[(h % PALETTE.len() as u32) as usize]
 }
 
+fn edit_selected_host(app: &mut App) {
+    if let Some(host_id) = app
+        .audit_state
+        .as_ref()
+        .and_then(|state| state.results.get(state.selected).map(|r| &r.host_id))
+    {
+        if let Some(host) = app.hosts.iter().find(|h| &h.id == host_id) {
+            app.host_form = Some(crate::types::HostForm::from_host(host));
+            app.host_form_from_audit = true;
+            app.screen = Screen::HostForm;
+        }
+    }
+}
+
 pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
     let results_len = app
         .audit_state
@@ -295,6 +318,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.start_audit();
         }
+        KeyCode::Char('e') | KeyCode::Char('E') => edit_selected_host(app),
         KeyCode::Enter | KeyCode::Char(' ') => {
             if let Some(ref mut state) = app.audit_state {
                 let sel = state.selected;
@@ -342,4 +366,41 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Host;
+
+    #[test]
+    fn edit_selected_host_opens_form_over_audit_and_cancel_returns() {
+        let host = Host {
+            id: "host-1".into(),
+            name: "example".into(),
+            ip: "example.org".into(),
+            port: 22,
+            group: String::new(),
+            user: None,
+            tags: vec![],
+            description: None,
+            jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
+        };
+        let mut app = App::new(vec![host], vec![], Default::default(), vec![]);
+        app.audit_state = Some(crate::audit::AuditState::new(&app.hosts));
+        app.screen = Screen::Audit;
+        edit_selected_host(&mut app);
+        assert_eq!(app.screen, Screen::HostForm);
+        assert!(app.host_form_from_audit);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().editing_id.as_deref(),
+            Some("host-1")
+        );
+        crate::tui::host_form::cancel(&mut app);
+        assert_eq!(app.screen, Screen::Audit);
+        assert!(!app.host_form_from_audit);
+    }
 }

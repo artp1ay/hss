@@ -382,33 +382,14 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 group: app.config.default_group.clone(),
                 ..Default::default()
             });
+            app.host_form_from_audit = false;
             app.screen = Screen::HostForm;
         }
         KeyCode::Char('e') | KeyCode::Char('E') if !app.search_focused && hosts_len > 0 => {
             if let Some(idx) = get_host_idx_in_all(app) {
                 let h = &app.hosts[idx];
-                app.host_form = Some(crate::types::HostForm {
-                    editing_id: Some(h.id.clone()),
-                    name: h.name.clone(),
-                    ip: h.ip.clone(),
-                    group: h.group.clone(),
-                    port: h.port.to_string(),
-                    user: h.user.clone().unwrap_or_default(),
-                    tags: h.tags.join(", "),
-                    description: h.description.clone().unwrap_or_default(),
-                    jump_host_id: h.jump_host_id.clone(),
-                    port_forwards: h.port_forwards.join(", "),
-                    socks_port: h.socks_port.map(|p| p.to_string()).unwrap_or_default(),
-                    http_proxy_port: h.http_proxy_port.map(|p| p.to_string()).unwrap_or_default(),
-                    focused: 0,
-                    page: 0,
-                    jump_picker: false,
-                    jump_query: String::new(),
-                    jump_cursor: 0,
-                    jump_selected: 0,
-                    cursor: crate::tui::input::end_of(&h.name),
-                    error_message: None,
-                });
+                app.host_form = Some(crate::types::HostForm::from_host(h));
+                app.host_form_from_audit = false;
                 app.screen = Screen::HostForm;
             }
         }

@@ -90,6 +90,7 @@ pub struct App {
     pub popup_selected: usize,
     // Host form / import state
     pub host_form: Option<HostForm>,
+    pub host_form_from_audit: bool,
     pub import_path_input: String,
     pub import_cursor: usize,
     pub import_export_mode: usize, // 0 = import INI, 1 = export INI, 2 = export ssh_config
@@ -134,6 +135,7 @@ impl App {
             settings_reveal_token: false,
             popup_selected: 0,
             host_form: None,
+            host_form_from_audit: false,
             import_path_input: String::new(),
             import_cursor: 0,
             import_export_mode: 0,
@@ -735,7 +737,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             popup::draw(f, app);
         }
         Screen::HostForm => {
-            main_screen::draw(f, app);
+            if app.host_form_from_audit {
+                audit_screen::draw(f, app);
+            } else {
+                main_screen::draw(f, app);
+            }
             host_form::draw(f, app);
         }
         Screen::ImportHosts => {

@@ -12,13 +12,14 @@ use ratatui::{
 use uuid::Uuid;
 
 fn form_area(area: Rect) -> Rect {
-    crate::tui::adaptive_centered_rect(70, 80, 70, 16, area)
+    crate::tui::adaptive_centered_rect(70, 90, 70, 16, area)
 }
 
 fn form_rows(area: Rect) -> [Rect; 4] {
     let inner = Block::default().borders(Borders::ALL).inner(area);
+    let spacious = area.height >= 20;
     let rows = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(if spacious { 2 } else { 1 }),
         Constraint::Min(0),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -34,8 +35,8 @@ fn tab_at(area: Rect, column: u16, row: u16) -> Option<usize> {
         return None;
     }
     match column - tabs.x {
-        0..=8 => Some(0),
-        12..=29 => Some(1),
+        0..=11 => Some(0),
+        14..=34 => Some(1),
         _ => None,
     }
 }
@@ -53,7 +54,7 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
     let Some(form) = app.host_form.as_mut() else {
         return;
     };
-    if form.jump_picker {
+    if form.jump_picker || form.credential_picker {
         return;
     }
     if let Some(page) = tab_at(area, mouse.column, mouse.row) {
@@ -80,28 +81,36 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let tabs = Line::from(vec![
         Span::styled(
-            "[F1] Host",
+            " [F1] Host  ",
             if form.page == 0 {
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(Color::White)
+                    .bg(Color::Blue)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::Gray).bg(Color::Rgb(35, 39, 49))
             },
         ),
-        Span::raw("   "),
+        Span::raw("  "),
         Span::styled(
-            "[F2] Ports & Proxy",
+            " [F2] Ports & Proxy  ",
             if form.page == 1 {
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(Color::White)
+                    .bg(Color::Blue)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::Gray).bg(Color::Rgb(35, 39, 49))
             },
         ),
     ]);
-    f.render_widget(Paragraph::new(tabs), rows[0]);
+    f.render_widget(
+        Paragraph::new(tabs),
+        Rect {
+            height: 1,
+            ..rows[0]
+        },
+    );
 
     let fields: &[(usize, &str, &str)] = if form.page == 0 {
         &[
@@ -120,7 +129,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             (10, "HTTP proxy port", &form.http_proxy_port),
         ]
     };
-    let field_count = if form.page == 0 { 8 } else { 3 };
+    let field_count = if form.page == 0 { 9 } else { 3 };
     let row_height = if rows[1].height >= field_count * 2 {
         2
     } else {
@@ -207,6 +216,51 @@ pub fn draw(f: &mut Frame, app: &App) {
                 ..row
             },
         );
+        let row = Rect {
+            height: 1,
+            ..field_rows[8]
+        };
+        let focused = form.focused == 11;
+        let record = form.editing_id.as_deref().and_then(|id| app.record_for(id));
+        let value = crate::ssh::resolve_credential(
+            &app.credentials,
+            &app.config,
+            record.and_then(|r| r.last_credential_id.as_deref()),
+            form.credential_id
+                .as_deref()
+                .or_else(|| record.and_then(|r| r.default_credential_id.as_deref())),
+        )
+        .ok()
+        .flatten()
+        .map(|c| format!("{} ({})", c.name, c.username))
+        .unwrap_or_else(|| "(none)".into());
+        f.render_widget(
+            Paragraph::new("Credential").style(Style::default().fg(if focused {
+                Color::Blue
+            } else {
+                Color::DarkGray
+            })),
+            Rect {
+                width: row.width.min(18),
+                ..row
+            },
+        );
+        f.render_widget(
+            Paragraph::new(format!(" {value}  [Enter] select")).style(
+                Style::default()
+                    .fg(if focused { Color::White } else { Color::Gray })
+                    .bg(if focused {
+                        Color::Rgb(44, 59, 78)
+                    } else {
+                        Color::Rgb(35, 39, 49)
+                    }),
+            ),
+            Rect {
+                x: row.x.saturating_add(18),
+                width: row.width.saturating_sub(18),
+                ..row
+            },
+        );
     }
     if let Some(err) = &form.error_message {
         f.render_widget(
@@ -229,6 +283,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if form.jump_picker {
         draw_jump_picker(f, app, form);
+    } else if form.credential_picker {
+        draw_credential_picker(f, app, form);
     }
 }
 
@@ -321,6 +377,16 @@ pub fn draw_import(f: &mut Frame, app: &App) {
     );
 }
 
+pub fn cancel(app: &mut App) {
+    app.host_form = None;
+    app.screen = if app.host_form_from_audit {
+        Screen::Audit
+    } else {
+        Screen::Main
+    };
+    app.host_form_from_audit = false;
+}
+
 pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
     handle_form_key(app, key)
 }
@@ -333,8 +399,13 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
         handle_jump_picker(app, key);
         return Ok(());
     }
+    if form.credential_picker {
+        handle_credential_picker(app, key);
+        return Ok(());
+    }
 
     if form.focused != 7
+        && form.focused != 11
         && !matches!(
             key.code,
             KeyCode::Esc
@@ -360,23 +431,36 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
     let form = app.host_form.as_mut().unwrap();
     match key.code {
-        KeyCode::Esc => {
-            app.host_form = None;
-            app.screen = Screen::Main;
-        }
+        KeyCode::Esc => cancel(app),
         KeyCode::F(1) | KeyCode::F(2) => {
             switch_page(form, if key.code == KeyCode::F(1) { 0 } else { 1 });
         }
         KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
-            let (first, count) = if form.page == 0 { (0, 8) } else { (8, 3) };
-            let offset = form.focused - first;
-            form.focused = first
-                + if matches!(key.code, KeyCode::Tab | KeyCode::Down) {
-                    (offset + 1) % count
-                } else {
-                    (offset + count - 1) % count
-                };
+            let (first, count) = if form.page == 0 { (0, 9) } else { (8, 3) };
+            let offset = if form.focused == 11 {
+                8
+            } else {
+                form.focused - first
+            };
+            let next = if matches!(key.code, KeyCode::Tab | KeyCode::Down) {
+                (offset + 1) % count
+            } else {
+                (offset + count - 1) % count
+            };
+            form.focused = if form.page == 0 && next == 8 {
+                11
+            } else {
+                first + next
+            };
             form.cursor = crate::tui::input::end_of(active_field(form));
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+            if form.focused == 11 =>
+        {
+            form.credential_picker = true;
+            form.credential_query.clear();
+            form.credential_cursor = 0;
+            form.credential_selected = 0;
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
             if form.focused == 7 =>
@@ -391,6 +475,111 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn credential_matches<'a>(app: &'a App, form: &HostForm) -> Vec<&'a crate::types::Credential> {
+    let query = form.credential_query.to_lowercase();
+    app.credentials
+        .iter()
+        .filter(|c| {
+            c.name.to_lowercase().contains(&query) || c.username.to_lowercase().contains(&query)
+        })
+        .collect()
+}
+
+fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
+    let area = crate::tui::adaptive_centered_rect(60, 60, 50, 10, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Select credential ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let mut search = vec![Span::raw("Search: ")];
+    search.extend(crate::tui::input::spans(
+        &form.credential_query,
+        form.credential_cursor,
+        Style::default().fg(Color::White),
+    ));
+    f.render_widget(Paragraph::new(Line::from(search)), rows[0]);
+    let matches = credential_matches(app, form);
+    let selected = form
+        .credential_selected
+        .min(matches.len().saturating_sub(1));
+    let visible = rows[1].height as usize;
+    let start = selected.saturating_sub(visible.saturating_sub(1));
+    for index in start..(start + visible).min(matches.len()) {
+        let cred = matches[index];
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(
+                    "{} {} ({})",
+                    if index == selected { "▶" } else { " " },
+                    cred.name,
+                    cred.username
+                ),
+                style,
+            )),
+            Rect {
+                y: rows[1].y + (index - start) as u16,
+                height: 1,
+                ..rows[1]
+            },
+        );
+    }
+    f.render_widget(
+        Paragraph::new("[↑/↓] select  [Enter] apply  [Esc] cancel"),
+        rows[2],
+    );
+}
+
+fn handle_credential_picker(app: &mut App, key: KeyEvent) {
+    let matches = credential_matches(app, app.host_form.as_ref().unwrap());
+    let count = matches.len();
+    let selected_id = if key.code == KeyCode::Enter {
+        matches
+            .get(app.host_form.as_ref().unwrap().credential_selected)
+            .map(|c| c.id.clone())
+    } else {
+        None
+    };
+    let form = app.host_form.as_mut().unwrap();
+    match key.code {
+        KeyCode::Esc => form.credential_picker = false,
+        KeyCode::Up => form.credential_selected = form.credential_selected.saturating_sub(1),
+        KeyCode::Down => {
+            form.credential_selected = (form.credential_selected + 1).min(count.saturating_sub(1))
+        }
+        KeyCode::Enter => {
+            if let Some(id) = selected_id {
+                form.credential_id = Some(id);
+                form.credential_changed = true;
+                form.credential_picker = false;
+            }
+        }
+        _ => {
+            let mut query = std::mem::take(&mut form.credential_query);
+            let consumed = crate::tui::input::handle(&mut query, &mut form.credential_cursor, key);
+            form.credential_query = query;
+            if consumed {
+                form.credential_selected = 0;
+            }
+        }
+    }
 }
 
 fn jump_matches<'a>(app: &'a App, form: &HostForm) -> Vec<&'a Host> {
@@ -534,6 +723,8 @@ mod tests {
             http_proxy_port: None,
         });
         key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 11);
+        key(&mut app, KeyCode::Up);
         assert_eq!(app.host_form.as_ref().unwrap().focused, 7);
         key(&mut app, KeyCode::Enter);
         for c in "gate".chars() {
@@ -569,7 +760,7 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect();
             assert!(text.contains(if page == 0 {
-                "Jump host"
+                "Credential"
             } else {
                 "HTTP proxy port"
             }));
@@ -595,11 +786,11 @@ mod tests {
                 area,
             );
         };
-        click(&mut app, tabs.x + 12, tabs.y);
+        click(&mut app, tabs.x + 14, tabs.y);
         assert_eq!(app.host_form.as_ref().unwrap().page, 1);
         assert_eq!(app.host_form.as_ref().unwrap().focused, 8);
-        click(&mut app, tabs.x + 11, tabs.y);
-        click(&mut app, tabs.x + 12, tabs.y + 1);
+        click(&mut app, tabs.x + 12, tabs.y);
+        click(&mut app, tabs.x + 14, tabs.y + 1);
         assert_eq!(app.host_form.as_ref().unwrap().page, 1);
         app.host_form.as_mut().unwrap().jump_picker = true;
         click(&mut app, tabs.x, tabs.y);
@@ -608,8 +799,104 @@ mod tests {
         click(&mut app, tabs.x, tabs.y);
         assert_eq!(app.host_form.as_ref().unwrap().page, 0);
         assert_eq!(app.host_form.as_ref().unwrap().focused, 0);
+        app.host_form.as_mut().unwrap().credential_picker = true;
+        click(&mut app, tabs.x + 14, tabs.y);
+        assert_eq!(app.host_form.as_ref().unwrap().page, 0);
     }
 
+    #[test]
+    fn credential_picker_search_and_cancel() {
+        let mut app = app();
+        for (id, name) in [("first", "alpha"), ("second", "beta")] {
+            app.credentials.push(crate::types::Credential {
+                id: id.into(),
+                name: name.into(),
+                username: "operator".into(),
+                kind: crate::types::CredentialKind::Password,
+                key_path: None,
+            });
+        }
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 11);
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.host_form.as_ref().unwrap().description, "");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('b'));
+        key(&mut app, KeyCode::Enter);
+        let form = app.host_form.as_ref().unwrap();
+        assert_eq!(form.credential_id.as_deref(), Some("second"));
+        assert!(form.credential_changed);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().credential_id.as_deref(),
+            Some("second")
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(app.host_form.is_none());
+        assert!(app.server_records.is_empty());
+    }
+
+    #[test]
+    fn credential_picker_moves_through_matches() {
+        let mut app = app();
+        for name in ["alpha", "beta"] {
+            app.credentials.push(crate::types::Credential {
+                id: name.into(),
+                name: name.into(),
+                username: "operator".into(),
+                kind: crate::types::CredentialKind::Password,
+                key_path: None,
+            });
+        }
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().credential_id.as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn credential_field_shows_effective_and_new_selection() {
+        let mut app = app();
+        for name in ["alpha", "beta"] {
+            app.credentials.push(crate::types::Credential {
+                id: name.into(),
+                name: name.into(),
+                username: "operator".into(),
+                kind: crate::types::CredentialKind::Password,
+                key_path: None,
+            });
+        }
+        app.config.default_credential_id = Some("alpha".into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("alpha (operator)"));
+        app.host_form.as_mut().unwrap().credential_id = Some("beta".into());
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("beta (operator)"));
+    }
+
+    #[test]
+    #[test]
     #[test]
     fn field_background_and_spacing_adapt_to_height() {
         let app = app();
@@ -840,8 +1127,54 @@ fn save_host(app: &mut App) -> Result<()> {
     }
 
     app.save_hosts()?;
+    if form.credential_changed {
+        if let Some(ref credential_id) = form.credential_id {
+            let host_id = form
+                .editing_id
+                .as_deref()
+                .unwrap_or(&app.hosts.last().unwrap().id)
+                .to_string();
+            app.select_credential(&host_id, credential_id, true)?;
+        }
+    }
+    if app.host_form_from_audit {
+        if let Some(ref edit_id) = form.editing_id {
+            if let Some(ref mut state) = app.audit_state {
+                if let Some(idx) = state.results.iter().position(|r| &r.host_id == edit_id) {
+                    if state.is_running {
+                        app.start_audit();
+                        if let Some(ref mut state) = app.audit_state {
+                            state.selected = idx;
+                        }
+                    } else {
+                        if let Some(host) = app.hosts.iter().find(|h| &h.id == edit_id) {
+                            let result = &mut state.results[idx];
+                            result.host_name = host.name.clone();
+                            result.ip = host.ip.clone();
+                            result.port = host.port;
+                            result.group = host.group.clone();
+                            result.latency_ms = None;
+                            result.credential_name = None;
+                        }
+                        state.start_single(
+                            idx,
+                            app.hosts.clone(),
+                            app.credentials.clone(),
+                            app.server_records.clone(),
+                            app.config.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
     app.host_form = None;
-    app.screen = Screen::Main;
+    app.screen = if app.host_form_from_audit {
+        Screen::Audit
+    } else {
+        Screen::Main
+    };
+    app.host_form_from_audit = false;
     Ok(())
 }
 
