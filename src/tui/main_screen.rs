@@ -23,6 +23,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         &[
             ("Enter", "connect"),
+            ("X", "Proxy on/off"),
             ("/", "search"),
             ("N", "new"),
             ("E", "edit"),
@@ -64,6 +65,21 @@ pub fn draw(f: &mut Frame, app: &App) {
             format!(" · {} hosts", hosts.len()),
             Style::default().fg(Color::DarkGray),
         ),
+        if let Some(proxy) = &app.proxy {
+            Span::styled(
+                format!(
+                    " · Proxy: {}",
+                    app.hosts
+                        .iter()
+                        .find(|h| h.id == proxy.host_id)
+                        .map(|h| h.name.as_str())
+                        .unwrap_or("host")
+                ),
+                Style::default().fg(Color::Green),
+            )
+        } else {
+            Span::raw("")
+        },
         if let Some(ref msg) = app.status_message {
             let (icon, color) = match msg.kind {
                 crate::types::StatusKind::Success => ("✓", Color::Green),
@@ -348,6 +364,12 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         KeyCode::Enter if !app.search_focused && hosts_len > 0 => {
             connect_selected(terminal, app)?;
         }
+        KeyCode::Char('x') | KeyCode::Char('X') if !app.search_focused && hosts_len > 0 => {
+            if let Some(idx) = get_host_idx_in_all(app) {
+                let host = app.hosts[idx].clone();
+                crate::tui::toggle_proxy(app, &host)?;
+            }
+        }
         KeyCode::Char('n') | KeyCode::Char('N') if !app.search_focused => {
             let default_port = if app.config.default_port != 0 {
                 app.config.default_port.to_string()
@@ -375,7 +397,15 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                     tags: h.tags.join(", "),
                     description: h.description.clone().unwrap_or_default(),
                     jump_host_id: h.jump_host_id.clone(),
+                    port_forwards: h.port_forwards.join(", "),
+                    socks_port: h.socks_port.map(|p| p.to_string()).unwrap_or_default(),
+                    http_proxy_port: h.http_proxy_port.map(|p| p.to_string()).unwrap_or_default(),
                     focused: 0,
+                    page: 0,
+                    jump_picker: false,
+                    jump_query: String::new(),
+                    jump_cursor: 0,
+                    jump_selected: 0,
                     cursor: crate::tui::input::end_of(&h.name),
                     error_message: None,
                 });

@@ -38,6 +38,9 @@ fn test_hosts_roundtrip() {
         tags: vec!["production".into(), "nginx".into()],
         description: Some("Primary web server".into()),
         jump_host_id: None,
+        port_forwards: vec!["8080:80".into()],
+        socks_port: Some(1080),
+        http_proxy_port: Some(8081),
     }];
     let s = hss::config::serialize_hosts(&hosts).unwrap();
     let parsed = hss::config::parse_hosts(&s).unwrap();
@@ -46,6 +49,17 @@ fn test_hosts_roundtrip() {
     assert_eq!(parsed[0].port, 2222);
     assert_eq!(parsed[0].tags, vec!["production", "nginx"]);
     assert_eq!(parsed[0].description, Some("Primary web server".into()));
+    assert_eq!(parsed[0].port_forwards, vec!["8080:80"]);
+    assert_eq!(parsed[0].socks_port, Some(1080));
+    assert_eq!(parsed[0].http_proxy_port, Some(8081));
+    let old = s
+        .replace("port_forwards = [\"8080:80\"]\n", "")
+        .replace("socks_port = 1080\n", "")
+        .replace("http_proxy_port = 8081\n", "");
+    let legacy = hss::config::parse_hosts(&old).unwrap();
+    assert!(legacy[0].port_forwards.is_empty());
+    assert_eq!(legacy[0].socks_port, None);
+    assert_eq!(legacy[0].http_proxy_port, None);
 }
 
 #[test]
@@ -110,6 +124,9 @@ fn test_migrate_server_records_rewrites_name_keyed_entries() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        port_forwards: vec![],
+        socks_port: None,
+        http_proxy_port: None,
     }];
     let records = vec![
         // Old-style entry: host_id happens to equal the host's name

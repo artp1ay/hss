@@ -532,6 +532,9 @@ mod tests {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         }];
 
         let state = AuditState::new(&hosts);
@@ -553,6 +556,9 @@ mod tests {
                 tags: vec![],
                 description: None,
                 jump_host_id: None,
+                port_forwards: vec![],
+                socks_port: None,
+                http_proxy_port: None,
             },
             Host {
                 id: "h1".into(),
@@ -564,6 +570,9 @@ mod tests {
                 tags: vec![],
                 description: None,
                 jump_host_id: Some("bastion".into()),
+                port_forwards: vec![],
+                socks_port: None,
+                http_proxy_port: None,
             },
         ];
         let creds = vec![];

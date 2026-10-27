@@ -1178,6 +1178,9 @@ mod tests {
             tags: vec!["db".into(), "critical".into()],
             description: None,
             jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         };
 
         assert!(is_host_allowed_for_mcp("*", &host));

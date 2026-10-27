@@ -59,6 +59,9 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         });
     }
     hosts
@@ -160,6 +163,9 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
                 tags: ini_tags,
                 description: None,
                 jump_host_id: None,
+                port_forwards: vec![],
+                socks_port: None,
+                http_proxy_port: None,
             });
             added += 1;
         }

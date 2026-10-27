@@ -83,6 +83,9 @@ fn test_import_updates_existing_host() {
         tags: vec!["custom-tag".into()],
         description: Some("My server".into()),
         jump_host_id: None,
+        port_forwards: vec![],
+        socks_port: None,
+        http_proxy_port: None,
     };
     let mut hosts = vec![existing];
     let ini = "[webservers]\nweb1 ansible_host=10.0.0.1 ansible_user=deploy\n";
@@ -107,6 +110,9 @@ fn test_import_merges_tags() {
         tags: vec!["existing-tag".into()],
         description: None,
         jump_host_id: None,
+        port_forwards: vec![],
+        socks_port: None,
+        http_proxy_port: None,
     };
     let mut hosts = vec![existing];
     let ini = "[web]\nweb1 ansible_host=10.0.0.1 # tags=new-tag,existing-tag\n";
@@ -128,6 +134,9 @@ fn test_import_partial_merge_does_not_overwrite_with_defaults() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        port_forwards: vec![],
+        socks_port: None,
+        http_proxy_port: None,
     };
     let mut hosts = vec![existing];
 
@@ -153,6 +162,9 @@ fn test_generate_ansible_inventory_handles_reserved_group_names() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        port_forwards: vec![],
+        socks_port: None,
+        http_proxy_port: None,
     }];
     let creds = vec![];
     let records = vec![];
@@ -178,6 +190,9 @@ fn test_export_to_ssh_config() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         },
         Host {
             id: "w".into(),
@@ -189,6 +204,9 @@ fn test_export_to_ssh_config() {
             tags: vec!["web".into(), "prod".into()],
             description: Some("Main server".into()),
             jump_host_id: Some("b".into()),
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         },
     ];
     let cfg = hss::inventory::export_to_ssh_config(&hosts);
@@ -217,6 +235,9 @@ fn test_export_to_ini_basic() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         },
         Host {
             id: "2".into(),
@@ -228,6 +249,9 @@ fn test_export_to_ini_basic() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         },
     ];
     let ini = hss::inventory::export_to_ini(&hosts);
@@ -254,6 +278,9 @@ fn test_generate_ansible_inventory_structure() {
             tags: vec!["edge".into()],
             description: None,
             jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         },
         Host {
             id: "app-id".into(),
@@ -265,6 +292,9 @@ fn test_generate_ansible_inventory_structure() {
             tags: vec!["prod".into(), "k8s".into()],
             description: Some("Production node".into()),
             jump_host_id: Some("bastion-id".into()),
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         },
     ];
 

@@ -13,6 +13,12 @@ pub struct Host {
     pub description: Option<String>,
     #[serde(default)]
     pub jump_host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_forwards: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_proxy_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -89,9 +95,17 @@ pub struct HostForm {
     pub user: String,
     pub tags: String, // comma-separated
     pub description: String,
-    pub jump_host_id: Option<String>, // selected from existing hosts, cycled with ←/→
-    pub focused: usize, // 0=name 1=ip 2=group 3=port 4=user 5=tags 6=description 7=jump host
-    pub cursor: usize,  // char index inside the focused field
+    pub jump_host_id: Option<String>,
+    pub port_forwards: String,
+    pub socks_port: String,
+    pub http_proxy_port: String,
+    pub focused: usize,
+    pub page: usize,
+    pub jump_picker: bool,
+    pub jump_query: String,
+    pub jump_cursor: usize,
+    pub jump_selected: usize,
+    pub cursor: usize,
     pub error_message: Option<String>,
 }
 

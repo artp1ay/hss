@@ -74,7 +74,16 @@ hss --ansible-inventory  output dynamic Ansible inventory JSON
 | `M` | Start/view local MCP server |
 | `C` | Manage credentials |
 | `S` | Settings |
+| `X` | Start/stop Proxy for selected host |
 | `Q` | Quit |
+
+### Host forwarding and Proxy
+
+In a host card (`N` or `E`), press `F2` for **Ports & Proxy** (`F1` returns to host details). Use `↑/↓` or `Tab` to move between fields; on **Jump host**, press `Enter` or `←/→` to open a searchable host picker. Set **Forwards** to comma-separated `local:remote` ports (e.g. `15432:5432`). SSH binds each local port to `127.0.0.1` and connects to `127.0.0.1:remote` **on the remote host**. Set **SOCKS port** (e.g. `1080`) for a local SOCKS5 proxy; set **HTTP proxy port** (e.g. `8080`) to expose an HTTP/HTTPS CONNECT proxy through SOCKS. HTTP requires SOCKS; all local ports must be distinct.
+
+Press `X` on the host to start Proxy without opening a shell. The status line shows the active host. `X` again stops it; `X` on another host switches to that host. The proxy and forwards work only while `hss` is running and the SSH connection is alive. Jump hosts configured in the card are supported. With multiple credentials, select one for the host with `R` first. An ordinary `Enter` SSH session uses the same forwards unless Proxy is already active for that host. `hss HOST` and `hss --fzf` also use forwards during their interactive SSH session.
+
+Use `socks5h://127.0.0.1:1080` for SOCKS (remote DNS resolution), or `http://127.0.0.1:8080` for HTTP/HTTPS applications. Both listeners accept local connections only. HTTP CONNECT carries HTTPS traffic; plain HTTP requests are forwarded through SOCKS too.
 
 ## Credentials
 

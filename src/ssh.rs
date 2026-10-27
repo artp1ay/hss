@@ -93,7 +93,7 @@ impl SshErrorKind {
 pub fn classify_ssh_error(stderr: &str) -> SshErrorKind {
     let err_line = stderr
         .lines()
-        .rfind(|l| !l.trim().is_empty())
+        .rfind(|l| !l.trim().is_empty() && !l.trim().starts_with("Connection to "))
         .unwrap_or("")
         .trim();
 
@@ -334,23 +334,59 @@ pub fn resolve_credential<'a>(
     Ok(None)
 }
 
-pub fn spawn_ssh(
+pub fn port_forward_args(forwards: &[String], socks_port: Option<u16>) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut local_ports = std::collections::HashSet::new();
+    for forward in forwards {
+        let (local, remote) = forward.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("Invalid port forward '{forward}': expected local:remote")
+        })?;
+        let local: u16 = local
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid local port in '{forward}'"))?;
+        let remote: u16 = remote
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid remote port in '{forward}'"))?;
+        validate_port(local)?;
+        validate_port(remote)?;
+        anyhow::ensure!(
+            local_ports.insert(local),
+            "Local port {local} is configured more than once"
+        );
+        args.extend(["-L".into(), format!("127.0.0.1:{local}:127.0.0.1:{remote}")]);
+    }
+    if let Some(port) = socks_port {
+        validate_port(port)?;
+        anyhow::ensure!(
+            local_ports.insert(port),
+            "Local port {port} is configured more than once"
+        );
+        args.extend(["-D".into(), format!("127.0.0.1:{port}")]);
+    }
+    if !args.is_empty() {
+        args.extend(["-o".into(), "ExitOnForwardFailure=yes".into()]);
+    }
+    Ok(args)
+}
+
+fn ssh_command(
     host: &str,
     port: u16,
     cred: &Credential,
     cfg: &AppConfig,
     jump: Option<&str>,
-) -> Result<std::process::ExitStatus> {
+    forwards: &[String],
+    socks_port: Option<u16>,
+    proxy: bool,
+) -> Result<(Command, Option<String>)> {
     validate_host(host)?;
     validate_port(port)?;
     validate_username(&cred.username)?;
     if let Some(j) = jump {
         validate_jump_spec(j)?;
     }
-
     let secret = credentials::get_secret(cred)?;
-
-    let mut ssh_args: Vec<String> = vec![
+    let mut args = vec![
         "-o".into(),
         format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
         "-o".into(),
@@ -360,34 +396,112 @@ pub fn spawn_ssh(
         "-l".into(),
         cred.username.clone(),
     ];
-    append_auth_args(&mut ssh_args, cred, secret.is_some(), true);
+    append_auth_args(&mut args, cred, secret.is_some(), !proxy);
     if let Some(j) = jump {
-        ssh_args.extend_from_slice(&["-J".into(), j.to_string()]);
+        args.extend(["-J".into(), j.to_string()]);
+    }
+    args.extend(port_forward_args(forwards, socks_port)?);
+    if proxy {
+        args.extend([
+            "-N".into(),
+            "-o".into(),
+            "ServerAliveInterval=15".into(),
+            "-o".into(),
+            "ServerAliveCountMax=2".into(),
+        ]);
     }
     if !cfg.ssh_extra_args.is_empty() {
-        for arg in parse_extra_args(&cfg.ssh_extra_args) {
-            ssh_args.push(arg);
+        args.extend(parse_extra_args(&cfg.ssh_extra_args));
+    }
+    args.extend(["--".into(), host.to_string()]);
+    let mut cmd = Command::new("ssh");
+    cmd.args(args);
+    Ok((cmd, secret))
+}
+
+pub fn spawn_proxy(
+    host: &Host,
+    cred: &Credential,
+    cfg: &AppConfig,
+    jump: Option<&str>,
+) -> Result<(std::process::Child, Option<std::path::PathBuf>)> {
+    anyhow::ensure!(
+        !host.port_forwards.is_empty() || host.socks_port.is_some(),
+        "Configure forwards or a SOCKS port in the host card first"
+    );
+    let (mut cmd, secret) = ssh_command(
+        &host.ip,
+        host.port,
+        cred,
+        cfg,
+        jump,
+        &host.port_forwards,
+        host.socks_port,
+        true,
+    )?;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let path = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
+    let result = cmd.spawn();
+    if result.is_err() {
+        if let Some(ref path) = path {
+            let _ = std::fs::remove_file(path);
         }
     }
-    ssh_args.push("--".into());
-    ssh_args.push(host.to_string());
+    Ok((result?, path))
+}
 
-    let mut cmd = Command::new("ssh");
-    cmd.args(&ssh_args)
-        .stdin(std::process::Stdio::inherit())
+pub fn spawn_ssh(
+    host: &str,
+    port: u16,
+    cred: &Credential,
+    cfg: &AppConfig,
+    jump: Option<&str>,
+    forwards: &[String],
+    socks_port: Option<u16>,
+) -> Result<std::process::ExitStatus> {
+    Ok(spawn_ssh_with_error(host, port, cred, cfg, jump, forwards, socks_port)?.0)
+}
+
+pub fn spawn_ssh_with_error(
+    host: &str,
+    port: u16,
+    cred: &Credential,
+    cfg: &AppConfig,
+    jump: Option<&str>,
+    forwards: &[String],
+    socks_port: Option<u16>,
+) -> Result<(std::process::ExitStatus, String)> {
+    use std::io::{Read, Write};
+    let (mut cmd, secret) = ssh_command(host, port, cred, cfg, jump, forwards, socks_port, false)?;
+    cmd.stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
-
+        .stderr(std::process::Stdio::piped());
     let askpass_path = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
-
-    // Ignore SIGINT in hss while SSH runs: Ctrl+C kills SSH but returns control here.
-    // Without this, Ctrl+C sends SIGINT to the whole process group and hss exits too.
     let old_sigint = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
-    let result = cmd.spawn().and_then(|mut child| child.wait());
+    let result = (|| -> std::io::Result<_> {
+        let mut child = cmd.spawn()?;
+        let mut stderr = child.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut buf = [0; 4096];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let _ = std::io::stderr().write_all(&buf[..n]);
+                captured.extend_from_slice(&buf[..n]);
+            }
+            captured
+        });
+        let status = child.wait()?;
+        let captured = reader.join().unwrap_or_default();
+        Ok((status, String::from_utf8_lossy(&captured).into_owned()))
+    })();
     unsafe {
         libc::signal(libc::SIGINT, old_sigint);
     }
-
     if let Some(ref path) = askpass_path {
         let _ = std::fs::remove_file(path);
     }
@@ -710,14 +824,19 @@ pub fn connect_direct(host: &str) -> Result<()> {
     let hosts = config::load_hosts()?;
 
     let records = config::migrate_server_records(records, &hosts);
-    let (ssh_host, port, record, jump) =
-        if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
-            let record = records.iter().find(|r| r.host_id == h.id);
-            let jump = resolve_jump_spec(&hosts, h)?;
-            (h.ip.clone(), h.port, record, jump)
-        } else {
-            (host.to_string(), 22, None, None)
-        };
+    let saved_host = hosts.iter().find(|h| h.name == host || h.ip == host);
+    let (ssh_host, port, record, jump, forwards, socks_port) = if let Some(h) = saved_host {
+        (
+            h.ip.as_str(),
+            h.port,
+            records.iter().find(|r| r.host_id == h.id),
+            resolve_jump_spec(&hosts, h)?,
+            h.port_forwards.as_slice(),
+            h.socks_port,
+        )
+    } else {
+        (host, 22, None, None, &[][..], None)
+    };
 
     let cred = resolve_credential(
         &creds,
@@ -729,7 +848,15 @@ pub fn connect_direct(host: &str) -> Result<()> {
         anyhow::anyhow!("No credentials configured. Run `hss` to set up credentials.")
     })?;
 
-    spawn_ssh(&ssh_host, port, cred, &cfg, jump.as_deref())?;
+    spawn_ssh(
+        ssh_host,
+        port,
+        cred,
+        &cfg,
+        jump.as_deref(),
+        forwards,
+        socks_port,
+    )?;
     Ok(())
 }
 
@@ -759,6 +886,9 @@ mod tests {
             tags: vec![],
             description: None,
             jump_host_id: jump.map(Into::into),
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
         }
     }
 
@@ -1050,6 +1180,30 @@ mod tests {
     }
 
     #[test]
+    fn port_forward_args_bind_locally_and_reject_bad_ports() {
+        let args = port_forward_args(&["8080:80".into(), "9000:9001".into()], Some(1080)).unwrap();
+        assert_eq!(
+            args,
+            [
+                "-L",
+                "127.0.0.1:8080:127.0.0.1:80",
+                "-L",
+                "127.0.0.1:9000:127.0.0.1:9001",
+                "-D",
+                "127.0.0.1:1080",
+                "-o",
+                "ExitOnForwardFailure=yes",
+            ]
+        );
+        assert!(port_forward_args(&["8080:80".into()], Some(8080)).is_err());
+        assert!(port_forward_args(&["0:80".into()], None).is_err());
+        assert!(port_forward_args(&["8080:0".into()], None).is_err());
+        assert!(port_forward_args(&["8080:80:90".into()], None).is_err());
+        assert!(port_forward_args(&[], Some(0)).is_err());
+        assert!(port_forward_args(&[], None).unwrap().is_empty());
+    }
+
+    #[test]
     fn validate_port_rules() {
         assert!(validate_port(22).is_ok());
         assert!(validate_port(2222).is_ok());
@@ -1102,5 +1256,9 @@ mod tests {
             classify_ssh_error("some bizarre custom ssh proxy error"),
             SshErrorKind::Unknown(_)
         ));
+        assert_eq!(
+            classify_ssh_error("bind [127.0.0.1]:1080: Address already in use\nchannel_setup_fwd_listener_tcpip: cannot listen to port: 1080\nCould not request local forwarding.\nConnection to example.org closed."),
+            SshErrorKind::Unknown("Could not request local forwarding.".into())
+        );
     }
 }

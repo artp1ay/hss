@@ -3,6 +3,7 @@ use crate::types::{Credential, CredentialForm, DeletePopup, Host, HostForm, Serv
 use anyhow::Result;
 use crossterm::{
     cursor::Show,
+    event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,6 +15,7 @@ pub mod copy_id;
 pub mod credentials_screen;
 pub mod delete_popup;
 pub mod host_form;
+mod http_proxy;
 pub mod input;
 pub mod main_screen;
 pub mod mcp_screen;
@@ -43,6 +45,24 @@ pub enum CopyIdEvent {
     Progress(String),
     Success(String),
     Failure(String),
+}
+
+pub struct ProxySession {
+    pub host_id: String,
+    child: std::process::Child,
+    askpass_path: Option<std::path::PathBuf>,
+    http: Option<http_proxy::HttpProxy>,
+}
+
+impl Drop for ProxySession {
+    fn drop(&mut self) {
+        self.http.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(ref path) = self.askpass_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 pub struct App {
@@ -76,6 +96,7 @@ pub struct App {
     // MCP server (Some while running; screen is modal)
     pub mcp: Option<crate::mcp::McpServer>,
     pub mcp_scroll_offset: usize,
+    pub proxy: Option<ProxySession>,
     // ssh-copy-id overlay state
     pub copy_id_form: Option<crate::types::CopyIdForm>,
     pub copy_id_rx: Option<std::sync::mpsc::Receiver<CopyIdEvent>>,
@@ -118,6 +139,7 @@ impl App {
             import_export_mode: 0,
             mcp: None,
             mcp_scroll_offset: 0,
+            proxy: None,
             copy_id_form: None,
             copy_id_rx: None,
             delete_popup: None,
@@ -272,6 +294,7 @@ pub struct TerminalGuard {
     raw_mode_enabled: bool,
     alternate_screen_entered: bool,
     cursor_hidden: bool,
+    mouse_capture_enabled: bool,
 }
 
 impl TerminalGuard {
@@ -280,6 +303,7 @@ impl TerminalGuard {
             raw_mode_enabled: false,
             alternate_screen_entered: false,
             cursor_hidden: false,
+            mouse_capture_enabled: false,
         }
     }
 
@@ -292,11 +316,22 @@ impl TerminalGuard {
             execute!(io::stdout(), EnterAlternateScreen)?;
             self.alternate_screen_entered = true;
         }
+        if !self.mouse_capture_enabled {
+            execute!(io::stdout(), EnableMouseCapture)?;
+            self.mouse_capture_enabled = true;
+        }
         Ok(())
     }
 
     pub fn restore(&mut self) -> Result<()> {
         let mut first_err = None;
+        if self.mouse_capture_enabled {
+            if let Err(e) = execute!(io::stdout(), DisableMouseCapture) {
+                first_err = Some(e);
+            } else {
+                self.mouse_capture_enabled = false;
+            }
+        }
         if self.alternate_screen_entered {
             if let Err(e) = execute!(io::stdout(), LeaveAlternateScreen, Show) {
                 if first_err.is_none() {
@@ -332,12 +367,17 @@ impl Drop for TerminalGuard {
 pub fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 pub fn restore_terminal(terminal: &mut Term) -> Result<()> {
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
     let _ = disable_raw_mode();
     Ok(())
 }
@@ -423,6 +463,116 @@ pub fn wrap_hotkey_lines<'a>(
     lines
 }
 
+pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
+    if let Some(ref proxy) = app.proxy {
+        if proxy.host_id == host.id {
+            app.proxy = None;
+            app.status_message = Some(crate::types::StatusMessage::info("Proxy stopped"));
+            return Ok(());
+        }
+    }
+    let record = app.record_for(&host.id);
+    let cred = crate::ssh::resolve_credential(
+        &app.credentials,
+        &app.config,
+        record.and_then(|r| r.last_credential_id.as_deref()),
+        record.and_then(|r| r.default_credential_id.as_deref()),
+    )?
+    .ok_or_else(|| anyhow::anyhow!("Select a credential for this host with R first"))?;
+    let jump = crate::ssh::resolve_jump_spec(&app.hosts, host)?;
+    if let Some(port) = host.http_proxy_port {
+        crate::ssh::validate_port(port)?;
+        anyhow::ensure!(
+            host.socks_port != Some(port),
+            "HTTP and SOCKS ports must differ"
+        );
+        anyhow::ensure!(
+            !host
+                .port_forwards
+                .iter()
+                .any(|f| f.split_once(':').and_then(|(p, _)| p.parse::<u16>().ok()) == Some(port)),
+            "HTTP port conflicts with a local forward"
+        );
+    }
+    anyhow::ensure!(
+        host.http_proxy_port.is_none() || host.socks_port.is_some(),
+        "HTTP proxy requires a SOCKS port"
+    );
+    let check_port = host
+        .socks_port
+        .or_else(|| {
+            host.port_forwards
+                .first()
+                .and_then(|f| f.split_once(':'))
+                .and_then(|(p, _)| p.parse::<u16>().ok())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Configure forwards or a SOCKS port first"))?;
+    app.proxy = None;
+    for port in host
+        .port_forwards
+        .iter()
+        .filter_map(|f| f.split_once(':'))
+        .filter_map(|(p, _)| p.parse::<u16>().ok())
+        .chain(host.socks_port)
+    {
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .map_err(|e| anyhow::anyhow!("Local proxy port {port} is unavailable: {e}"))?;
+    }
+    let (mut child, path) = crate::ssh::spawn_proxy(host, cred, &app.config, jump.as_deref())?;
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(app.config.connect_timeout as u64 + 10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            use std::io::Read;
+            let mut error = String::new();
+            if let Some(ref mut stderr) = child.stderr {
+                let _ = stderr.read_to_string(&mut error);
+            }
+            if let Some(ref path) = path {
+                let _ = std::fs::remove_file(path);
+            }
+            anyhow::bail!("SSH proxy exited with {status}: {}", error.trim());
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", check_port)).is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(ref path) = path {
+                let _ = std::fs::remove_file(path);
+            }
+            anyhow::bail!("Timed out waiting for SSH proxy on port {check_port}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let http = match host.http_proxy_port {
+        Some(port) => match http_proxy::HttpProxy::start(port, host.socks_port.unwrap()) {
+            Ok(http) => Some(http),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(ref path) = path {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(err);
+            }
+        },
+        None => None,
+    };
+    app.proxy = Some(ProxySession {
+        host_id: host.id.clone(),
+        child,
+        askpass_path: path,
+        http,
+    });
+    app.status_message = Some(crate::types::StatusMessage::success(format!(
+        "Proxy active: {}",
+        host.name
+    )));
+    Ok(())
+}
+
 /// Tear down TUI, run SSH, re-init TUI. Saves credential on success; shows picker on auth failure.
 pub fn do_connect(
     terminal: &mut Term,
@@ -441,7 +591,27 @@ pub fn do_connect(
     };
 
     restore_terminal(terminal)?;
-    let status = match crate::ssh::spawn_ssh(&ip, port, cred, &app.config, jump.as_deref()) {
+    let proxy_active = host
+        .as_ref()
+        .is_some_and(|h| app.proxy.as_ref().is_some_and(|p| p.host_id == h.id));
+    let forwards = host
+        .as_ref()
+        .filter(|_| !proxy_active)
+        .map(|h| h.port_forwards.as_slice())
+        .unwrap_or(&[]);
+    let socks_port = host
+        .as_ref()
+        .filter(|_| !proxy_active)
+        .and_then(|h| h.socks_port);
+    let (status, stderr) = match crate::ssh::spawn_ssh_with_error(
+        &ip,
+        port,
+        cred,
+        &app.config,
+        jump.as_deref(),
+        forwards,
+        socks_port,
+    ) {
         Ok(s) => s,
         Err(e) => {
             *terminal = setup_terminal()?;
@@ -457,19 +627,29 @@ pub fn do_connect(
             }
         }
         app.status_message = None;
-    } else if status.code() == Some(255) {
-        if let Some(idx) = host
-            .as_ref()
-            .and_then(|h| app.hosts.iter().position(|x| x.id == h.id))
-        {
-            app.screen = Screen::CredentialPicker {
-                host_idx: idx,
-                after_failure: true,
-            };
+    } else {
+        let kind = crate::ssh::classify_ssh_error(&stderr);
+        if kind.is_auth_failure() && jump.is_none() {
+            if let Some(idx) = host
+                .as_ref()
+                .and_then(|h| app.hosts.iter().position(|x| x.id == h.id))
+            {
+                app.screen = Screen::CredentialPicker {
+                    host_idx: idx,
+                    after_failure: true,
+                };
+            }
         }
-        app.status_message = Some(crate::types::StatusMessage::error(
-            "Authentication failed. Choose different credentials.",
-        ));
+        app.status_message = Some(crate::types::StatusMessage::error(match kind {
+            crate::ssh::SshErrorKind::AuthFailed if jump.is_some() => {
+                "SSH authentication failed on the target or jump host. Check both connections."
+                    .into()
+            }
+            crate::ssh::SshErrorKind::Unknown(ref message) if message.is_empty() => {
+                format!("SSH exited with {status}")
+            }
+            _ => kind.display_message(),
+        }));
     }
     Ok(())
 }
@@ -487,6 +667,7 @@ pub fn run() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::new(hosts, credentials, cfg, records);
     let result = run_loop(&mut terminal, &mut app);
+    app.proxy = None;
     if let Some(mcp) = app.mcp.take() {
         mcp.stop();
     }
@@ -498,6 +679,14 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
     loop {
         app.poll_audit();
         app.poll_copy_id();
+        if let Some(ref mut proxy) = app.proxy {
+            if let Some(status) = proxy.child.try_wait()? {
+                app.proxy = None;
+                app.status_message = Some(crate::types::StatusMessage::error(format!(
+                    "Proxy disconnected: {status}"
+                )));
+            }
+        }
 
         // Clear expired status messages automatically
         if let Some(ref msg) = app.status_message {
@@ -509,13 +698,22 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
         terminal.draw(|f| draw(f, app))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if key.kind == crossterm::event::KeyEventKind::Press {
+            match crossterm::event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Err(e) = handle_key(terminal, app, key) {
                         app.status_message =
                             Some(crate::types::StatusMessage::error(format!("Error: {e:#}")));
                     }
                 }
+                Event::Mouse(mouse) if app.screen == Screen::HostForm => {
+                    let size = terminal.size()?;
+                    host_form::handle_mouse(
+                        app,
+                        mouse,
+                        ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                    );
+                }
+                _ => {}
             }
         }
 

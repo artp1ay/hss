@@ -98,7 +98,15 @@ pub fn run() -> Result<()> {
         }
         config::save_server_records(&records)?;
     }
-    ssh::spawn_ssh(&host.ip, host.port, &cred, &cfg, jump.as_deref())?;
+    ssh::spawn_ssh(
+        &host.ip,
+        host.port,
+        &cred,
+        &cfg,
+        jump.as_deref(),
+        &host.port_forwards,
+        host.socks_port,
+    )?;
 
     Ok(())
 }
