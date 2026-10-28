@@ -515,8 +515,7 @@ fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
         .min(matches.len().saturating_sub(1));
     let visible = rows[1].height as usize;
     let start = selected.saturating_sub(visible.saturating_sub(1));
-    for index in start..(start + visible).min(matches.len()) {
-        let cred = matches[index];
+    for (index, cred) in matches.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
                 .fg(Color::Blue)
@@ -681,246 +680,6 @@ fn handle_jump_picker(app: &mut App, key: KeyEvent) {
             if consumed {
                 form.jump_selected = 0;
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
-
-    fn app() -> App {
-        let mut app = App::new(vec![], vec![], Default::default(), vec![]);
-        app.host_form = Some(HostForm {
-            name: "example".into(),
-            ip: "example.org".into(),
-            port: "22".into(),
-            ..Default::default()
-        });
-        app
-    }
-
-    fn key(app: &mut App, code: KeyCode) {
-        handle_form_key(app, KeyEvent::from(code)).unwrap();
-    }
-
-    #[test]
-    fn tabs_navigation_and_picker_search() {
-        let mut app = app();
-        app.hosts.push(Host {
-            id: "jump".into(),
-            name: "gateway".into(),
-            ip: "10.0.0.1".into(),
-            group: String::new(),
-            port: 22,
-            user: None,
-            tags: vec![],
-            description: None,
-            jump_host_id: None,
-            port_forwards: vec![],
-            socks_port: None,
-            http_proxy_port: None,
-        });
-        key(&mut app, KeyCode::Up);
-        assert_eq!(app.host_form.as_ref().unwrap().focused, 11);
-        key(&mut app, KeyCode::Up);
-        assert_eq!(app.host_form.as_ref().unwrap().focused, 7);
-        key(&mut app, KeyCode::Enter);
-        for c in "gate".chars() {
-            key(&mut app, KeyCode::Char(c));
-        }
-        key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            app.host_form.as_ref().unwrap().jump_host_id.as_deref(),
-            Some("jump")
-        );
-        key(&mut app, KeyCode::F(2));
-        assert_eq!(app.host_form.as_ref().unwrap().focused, 8);
-        key(&mut app, KeyCode::Up);
-        assert_eq!(app.host_form.as_ref().unwrap().focused, 10);
-    }
-
-    #[test]
-    fn small_terminal_shows_each_page_and_error() {
-        let mut app = app();
-        for page in 0..=1 {
-            let form = app.host_form.as_mut().unwrap();
-            form.page = page;
-            form.focused = if page == 0 { 0 } else { 8 };
-            form.error_message = Some("validation error".into());
-            let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
-            terminal.draw(|f| draw(f, &app)).unwrap();
-            let text: String = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect();
-            assert!(text.contains(if page == 0 {
-                "Credential"
-            } else {
-                "HTTP proxy port"
-            }));
-            assert!(text.contains("validation error"));
-            assert!(text.contains("[Enter] save"));
-        }
-    }
-
-    #[test]
-    fn clicking_tabs_only_inside_form_switches_pages() {
-        let mut app = app();
-        let area = Rect::new(0, 0, 100, 30);
-        let tabs = form_rows(form_area(area))[0];
-        let click = |app: &mut App, x, y| {
-            handle_mouse(
-                app,
-                MouseEvent {
-                    kind: MouseEventKind::Down(MouseButton::Left),
-                    column: x,
-                    row: y,
-                    modifiers: crossterm::event::KeyModifiers::NONE,
-                },
-                area,
-            );
-        };
-        click(&mut app, tabs.x + 14, tabs.y);
-        assert_eq!(app.host_form.as_ref().unwrap().page, 1);
-        assert_eq!(app.host_form.as_ref().unwrap().focused, 8);
-        click(&mut app, tabs.x + 12, tabs.y);
-        click(&mut app, tabs.x + 14, tabs.y + 1);
-        assert_eq!(app.host_form.as_ref().unwrap().page, 1);
-        app.host_form.as_mut().unwrap().jump_picker = true;
-        click(&mut app, tabs.x, tabs.y);
-        assert_eq!(app.host_form.as_ref().unwrap().page, 1);
-        app.host_form.as_mut().unwrap().jump_picker = false;
-        click(&mut app, tabs.x, tabs.y);
-        assert_eq!(app.host_form.as_ref().unwrap().page, 0);
-        assert_eq!(app.host_form.as_ref().unwrap().focused, 0);
-        app.host_form.as_mut().unwrap().credential_picker = true;
-        click(&mut app, tabs.x + 14, tabs.y);
-        assert_eq!(app.host_form.as_ref().unwrap().page, 0);
-    }
-
-    #[test]
-    fn credential_picker_search_and_cancel() {
-        let mut app = app();
-        for (id, name) in [("first", "alpha"), ("second", "beta")] {
-            app.credentials.push(crate::types::Credential {
-                id: id.into(),
-                name: name.into(),
-                username: "operator".into(),
-                kind: crate::types::CredentialKind::Password,
-                key_path: None,
-            });
-        }
-        key(&mut app, KeyCode::Up);
-        assert_eq!(app.host_form.as_ref().unwrap().focused, 11);
-        key(&mut app, KeyCode::Char('x'));
-        assert_eq!(app.host_form.as_ref().unwrap().description, "");
-        key(&mut app, KeyCode::Enter);
-        key(&mut app, KeyCode::Char('b'));
-        key(&mut app, KeyCode::Enter);
-        let form = app.host_form.as_ref().unwrap();
-        assert_eq!(form.credential_id.as_deref(), Some("second"));
-        assert!(form.credential_changed);
-        key(&mut app, KeyCode::Enter);
-        key(&mut app, KeyCode::Char('a'));
-        key(&mut app, KeyCode::Esc);
-        assert_eq!(
-            app.host_form.as_ref().unwrap().credential_id.as_deref(),
-            Some("second")
-        );
-        key(&mut app, KeyCode::Esc);
-        assert!(app.host_form.is_none());
-        assert!(app.server_records.is_empty());
-    }
-
-    #[test]
-    fn credential_picker_moves_through_matches() {
-        let mut app = app();
-        for name in ["alpha", "beta"] {
-            app.credentials.push(crate::types::Credential {
-                id: name.into(),
-                name: name.into(),
-                username: "operator".into(),
-                kind: crate::types::CredentialKind::Password,
-                key_path: None,
-            });
-        }
-        key(&mut app, KeyCode::Up);
-        key(&mut app, KeyCode::Enter);
-        key(&mut app, KeyCode::Down);
-        key(&mut app, KeyCode::Enter);
-        assert_eq!(
-            app.host_form.as_ref().unwrap().credential_id.as_deref(),
-            Some("beta")
-        );
-    }
-
-    #[test]
-    fn credential_field_shows_effective_and_new_selection() {
-        let mut app = app();
-        for name in ["alpha", "beta"] {
-            app.credentials.push(crate::types::Credential {
-                id: name.into(),
-                name: name.into(),
-                username: "operator".into(),
-                kind: crate::types::CredentialKind::Password,
-                key_path: None,
-            });
-        }
-        app.config.default_credential_id = Some("alpha".into());
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| draw(f, &app)).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(text.contains("alpha (operator)"));
-        app.host_form.as_mut().unwrap().credential_id = Some("beta".into());
-        terminal.draw(|f| draw(f, &app)).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(text.contains("beta (operator)"));
-    }
-
-    #[test]
-    #[test]
-    #[test]
-    fn field_background_and_spacing_adapt_to_height() {
-        let app = app();
-        for (height, expected_step) in [(16, 1), (30, 2)] {
-            let area = Rect::new(0, 0, 100, height);
-            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-            terminal.draw(|f| draw(f, &app)).unwrap();
-            let field_area = form_rows(form_area(area))[1];
-            let first = terminal
-                .backend()
-                .buffer()
-                .cell((field_area.x + 19, field_area.y))
-                .unwrap();
-            assert_ne!(first.bg, Color::Reset);
-            let next = field_area.y + expected_step;
-            assert_eq!(
-                terminal
-                    .backend()
-                    .buffer()
-                    .cell((field_area.x, next))
-                    .unwrap()
-                    .symbol(),
-                "I"
-            );
         }
     }
 }
@@ -1257,4 +1016,242 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn app() -> App {
+        let mut app = App::new(vec![], vec![], Default::default(), vec![]);
+        app.host_form = Some(HostForm {
+            name: "example".into(),
+            ip: "example.org".into(),
+            port: "22".into(),
+            ..Default::default()
+        });
+        app
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        handle_form_key(app, KeyEvent::from(code)).unwrap();
+    }
+
+    #[test]
+    fn tabs_navigation_and_picker_search() {
+        let mut app = app();
+        app.hosts.push(Host {
+            id: "jump".into(),
+            name: "gateway".into(),
+            ip: "10.0.0.1".into(),
+            group: String::new(),
+            port: 22,
+            user: None,
+            tags: vec![],
+            description: None,
+            jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
+        });
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 11);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 7);
+        key(&mut app, KeyCode::Enter);
+        for c in "gate".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().jump_host_id.as_deref(),
+            Some("jump")
+        );
+        key(&mut app, KeyCode::F(2));
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 8);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 10);
+    }
+
+    #[test]
+    fn small_terminal_shows_each_page_and_error() {
+        let mut app = app();
+        for page in 0..=1 {
+            let form = app.host_form.as_mut().unwrap();
+            form.page = page;
+            form.focused = if page == 0 { 0 } else { 8 };
+            form.error_message = Some("validation error".into());
+            let mut terminal = Terminal::new(TestBackend::new(70, 16)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains(if page == 0 {
+                "Credential"
+            } else {
+                "HTTP proxy port"
+            }));
+            assert!(text.contains("validation error"));
+            assert!(text.contains("[Enter] save"));
+        }
+    }
+
+    #[test]
+    fn clicking_tabs_only_inside_form_switches_pages() {
+        let mut app = app();
+        let area = Rect::new(0, 0, 100, 30);
+        let tabs = form_rows(form_area(area))[0];
+        let click = |app: &mut App, x, y| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: x,
+                    row: y,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                area,
+            );
+        };
+        click(&mut app, tabs.x + 14, tabs.y);
+        assert_eq!(app.host_form.as_ref().unwrap().page, 1);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 8);
+        click(&mut app, tabs.x + 12, tabs.y);
+        click(&mut app, tabs.x + 14, tabs.y + 1);
+        assert_eq!(app.host_form.as_ref().unwrap().page, 1);
+        app.host_form.as_mut().unwrap().jump_picker = true;
+        click(&mut app, tabs.x, tabs.y);
+        assert_eq!(app.host_form.as_ref().unwrap().page, 1);
+        app.host_form.as_mut().unwrap().jump_picker = false;
+        click(&mut app, tabs.x, tabs.y);
+        assert_eq!(app.host_form.as_ref().unwrap().page, 0);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 0);
+        app.host_form.as_mut().unwrap().credential_picker = true;
+        click(&mut app, tabs.x + 14, tabs.y);
+        assert_eq!(app.host_form.as_ref().unwrap().page, 0);
+    }
+
+    #[test]
+    fn credential_picker_search_and_cancel() {
+        let mut app = app();
+        for (id, name) in [("first", "alpha"), ("second", "beta")] {
+            app.credentials.push(crate::types::Credential {
+                id: id.into(),
+                name: name.into(),
+                username: "operator".into(),
+                kind: crate::types::CredentialKind::Password,
+                key_path: None,
+            });
+        }
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 11);
+        key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.host_form.as_ref().unwrap().description, "");
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('b'));
+        key(&mut app, KeyCode::Enter);
+        let form = app.host_form.as_ref().unwrap();
+        assert_eq!(form.credential_id.as_deref(), Some("second"));
+        assert!(form.credential_changed);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('a'));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().credential_id.as_deref(),
+            Some("second")
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(app.host_form.is_none());
+        assert!(app.server_records.is_empty());
+    }
+
+    #[test]
+    fn credential_picker_moves_through_matches() {
+        let mut app = app();
+        for name in ["alpha", "beta"] {
+            app.credentials.push(crate::types::Credential {
+                id: name.into(),
+                name: name.into(),
+                username: "operator".into(),
+                kind: crate::types::CredentialKind::Password,
+                key_path: None,
+            });
+        }
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().credential_id.as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn credential_field_shows_effective_and_new_selection() {
+        let mut app = app();
+        for name in ["alpha", "beta"] {
+            app.credentials.push(crate::types::Credential {
+                id: name.into(),
+                name: name.into(),
+                username: "operator".into(),
+                kind: crate::types::CredentialKind::Password,
+                key_path: None,
+            });
+        }
+        app.config.default_credential_id = Some("alpha".into());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("alpha (operator)"));
+        app.host_form.as_mut().unwrap().credential_id = Some("beta".into());
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("beta (operator)"));
+    }
+
+    #[test]
+    fn field_background_and_spacing_adapt_to_height() {
+        let app = app();
+        for (height, expected_step) in [(16, 1), (30, 2)] {
+            let area = Rect::new(0, 0, 100, height);
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let field_area = form_rows(form_area(area))[1];
+            let first = terminal
+                .backend()
+                .buffer()
+                .cell((field_area.x + 19, field_area.y))
+                .unwrap();
+            assert_ne!(first.bg, Color::Reset);
+            let next = field_area.y + expected_step;
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((field_area.x, next))
+                    .unwrap()
+                    .symbol(),
+                "I"
+            );
+        }
+    }
 }

@@ -375,8 +375,7 @@ fn ssh_command(
     cred: &Credential,
     cfg: &AppConfig,
     jump: Option<&str>,
-    forwards: &[String],
-    socks_port: Option<u16>,
+    forwarding: (&[String], Option<u16>),
     proxy: bool,
 ) -> Result<(Command, Option<String>)> {
     validate_host(host)?;
@@ -400,7 +399,7 @@ fn ssh_command(
     if let Some(j) = jump {
         args.extend(["-J".into(), j.to_string()]);
     }
-    args.extend(port_forward_args(forwards, socks_port)?);
+    args.extend(port_forward_args(forwarding.0, forwarding.1)?);
     if proxy {
         args.extend([
             "-N".into(),
@@ -435,8 +434,7 @@ pub fn spawn_proxy(
         cred,
         cfg,
         jump,
-        &host.port_forwards,
-        host.socks_port,
+        (&host.port_forwards, host.socks_port),
         true,
     )?;
     cmd.stdin(std::process::Stdio::null())
@@ -474,7 +472,8 @@ pub fn spawn_ssh_with_error(
     socks_port: Option<u16>,
 ) -> Result<(std::process::ExitStatus, String)> {
     use std::io::{Read, Write};
-    let (mut cmd, secret) = ssh_command(host, port, cred, cfg, jump, forwards, socks_port, false)?;
+    let (mut cmd, secret) =
+        ssh_command(host, port, cred, cfg, jump, (forwards, socks_port), false)?;
     cmd.stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::piped());
