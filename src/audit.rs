@@ -208,7 +208,7 @@ pub fn check_single_host(
     cfg: &AppConfig,
 ) -> HostAuditResult {
     let timeout = Duration::from_secs(cfg.audit_timeout.max(1) as u64);
-    let jump = match crate::ssh::resolve_jump_spec(hosts, host) {
+    let jump = match crate::ssh::resolve_jump_auth(hosts, host, creds, records) {
         Ok(j) => j,
         Err(e) => {
             let detail = format!("Invalid jump host: {e:#}");
@@ -302,7 +302,7 @@ pub fn check_single_host(
         }
     };
 
-    let (status, detail, ssh_latency) = check_ssh_auth(host, cred, cfg, jump.as_deref(), timeout);
+    let (status, detail, ssh_latency) = check_ssh_auth(host, cred, cfg, jump.as_ref(), timeout);
     let final_latency = latency_ms.or(ssh_latency);
 
     HostAuditResult {
@@ -366,7 +366,7 @@ fn check_ssh_auth(
     host: &Host,
     cred: &Credential,
     cfg: &AppConfig,
-    jump: Option<&str>,
+    jump: Option<&crate::ssh::JumpAuth>,
     timeout: Duration,
 ) -> (HostStatus, String, Option<u64>) {
     let t0 = Instant::now();
@@ -408,17 +408,9 @@ fn check_ssh_auth(
                 return (HostStatus::Error(detail.clone()), detail, None);
             }
         };
-    if let Some(j) = jump {
-        if let Err(e) = crate::ssh::validate_jump_spec(j) {
-            return (
-                HostStatus::Unreachable(format!("Invalid jump spec: {e}")),
-                format!("Invalid jump spec: {e}"),
-                None,
-            );
-        }
-    }
 
-    let timeout_secs = timeout.as_secs().max(1).to_string();
+    let timeout_secs_u64 = timeout.as_secs().max(1);
+    let timeout_secs = timeout_secs_u64.to_string();
     let mut args: Vec<String> = vec![
         "-o".into(),
         format!("StrictHostKeyChecking={strict_host_checking}"),
@@ -433,27 +425,34 @@ fn check_ssh_auth(
     ];
 
     crate::ssh::append_auth_args(&mut args, cred, secret.is_some(), false);
-    if let Some(j) = jump {
-        args.extend_from_slice(&["-J".into(), j.to_string()]);
-    }
+
+    let mut cmd = Command::new("ssh");
+    let _askpass = match crate::ssh::configure_jump_and_askpass(
+        &mut cmd,
+        &mut args,
+        &cred.kind,
+        secret.as_deref(),
+        jump.map(crate::ssh::JumpInput::Auth),
+        strict_host_checking,
+        timeout_secs_u64,
+        false,
+        false,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let detail = format!("Failed to prepare SSH auth: {e}");
+            return (HostStatus::Error(detail.clone()), detail, None);
+        }
+    };
 
     args.push("--".into());
     args.push(host.ip.clone());
     args.push("exit 0".into());
 
-    let mut cmd = Command::new("ssh");
     cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-
-    let _askpass = match crate::ssh::configure_askpass(&mut cmd, &cred.kind, secret.as_deref()) {
-        Ok(guard) => guard,
-        Err(e) => {
-            let detail = format!("Failed to prepare SSH askpass: {e}");
-            return (HostStatus::Error(detail.clone()), detail, None);
-        }
-    };
 
     let result = match cmd.spawn() {
         Ok(mut child) => {
@@ -573,6 +572,7 @@ mod tests {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -597,6 +597,7 @@ mod tests {
                 tags: vec![],
                 description: None,
                 jump_host_id: None,
+                jump_credential_id: None,
                 port_forwards: vec![],
                 socks_port: None,
                 http_proxy_port: None,
@@ -611,6 +612,7 @@ mod tests {
                 tags: vec![],
                 description: None,
                 jump_host_id: Some("bastion".into()),
+                jump_credential_id: None,
                 port_forwards: vec![],
                 socks_port: None,
                 http_proxy_port: None,

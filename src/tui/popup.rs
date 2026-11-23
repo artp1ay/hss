@@ -25,7 +25,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(Clear, area);
 
     let title = if *after_failure {
-        format!(" Auth failed — choose credentials for {} ", host.name)
+        if host.jump_host_id.is_some() {
+            format!(" Auth failed — target credentials for {} ", host.name)
+        } else {
+            format!(" Auth failed — choose credentials for {} ", host.name)
+        }
+    } else if host.jump_host_id.is_some() {
+        format!(" Target credentials for {} ", host.name)
     } else {
         format!(" Credentials for {} ", host.name)
     };

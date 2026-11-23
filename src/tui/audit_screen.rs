@@ -385,6 +385,7 @@ mod tests {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,

@@ -283,7 +283,12 @@ fn run_copy(app: &mut App) -> Result<()> {
         Some(form.password.clone())
     };
 
-    let jump = match crate::ssh::resolve_jump_spec(&app.hosts, &host) {
+    let jump = match crate::ssh::resolve_jump_auth(
+        &app.hosts,
+        &host,
+        &app.credentials,
+        &app.server_records,
+    ) {
         Ok(j) => j,
         Err(e) => {
             if let Some(ref mut f) = app.copy_id_form {
@@ -317,13 +322,13 @@ fn run_copy(app: &mut App) -> Result<()> {
                 idx + 1,
                 total
             )));
-            match crate::ssh::copy_id_with_jump(
+            match crate::ssh::copy_id_with_jump_auth(
                 &host.ip,
                 host.port,
                 &user,
                 key,
                 password.as_deref(),
-                jump.as_deref(),
+                jump.as_ref(),
                 &cfg,
             ) {
                 Ok(out) if out.status.success() => copied += 1,

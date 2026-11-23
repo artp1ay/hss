@@ -83,6 +83,7 @@ fn test_import_updates_existing_host() {
         tags: vec!["custom-tag".into()],
         description: Some("My server".into()),
         jump_host_id: None,
+        jump_credential_id: None,
         port_forwards: vec![],
         socks_port: None,
         http_proxy_port: None,
@@ -110,6 +111,7 @@ fn test_import_merges_tags() {
         tags: vec!["existing-tag".into()],
         description: None,
         jump_host_id: None,
+        jump_credential_id: None,
         port_forwards: vec![],
         socks_port: None,
         http_proxy_port: None,
@@ -134,6 +136,7 @@ fn test_import_partial_merge_does_not_overwrite_with_defaults() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        jump_credential_id: None,
         port_forwards: vec![],
         socks_port: None,
         http_proxy_port: None,
@@ -162,6 +165,7 @@ fn test_generate_ansible_inventory_handles_reserved_group_names() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        jump_credential_id: None,
         port_forwards: vec![],
         socks_port: None,
         http_proxy_port: None,
@@ -190,6 +194,7 @@ fn test_export_to_ssh_config() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -204,6 +209,7 @@ fn test_export_to_ssh_config() {
             tags: vec!["web".into(), "prod".into()],
             description: Some("Main server".into()),
             jump_host_id: Some("b".into()),
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -235,6 +241,7 @@ fn test_export_to_ini_basic() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -249,6 +256,7 @@ fn test_export_to_ini_basic() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -278,6 +286,7 @@ fn test_generate_ansible_inventory_structure() {
             tags: vec!["edge".into()],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -292,6 +301,7 @@ fn test_generate_ansible_inventory_structure() {
             tags: vec!["prod".into(), "k8s".into()],
             description: Some("Production node".into()),
             jump_host_id: Some("bastion-id".into()),
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -461,6 +471,7 @@ fn test_inventory_merges_tag_group_collision_and_expands_tilde_key() {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -475,6 +486,7 @@ fn test_inventory_merges_tag_group_collision_and_expands_tilde_key() {
             tags: vec!["prod".into()],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -539,6 +551,7 @@ fn test_exports_sanitize_newlines_and_empty_groups() {
         tags: vec!["prod".into(), "tier1".into()],
         description: Some("line1\nline2".into()),
         jump_host_id: None,
+        jump_credential_id: None,
         port_forwards: vec![],
         socks_port: None,
         http_proxy_port: None,
@@ -553,4 +566,75 @@ fn test_exports_sanitize_newlines_and_empty_groups() {
     assert!(ini.contains("[ungrouped]\n"));
     assert!(!ini.contains("[]\n"));
     assert!(ini.contains("# tags=prod,tier1"));
+}
+
+#[test]
+fn test_ansible_inventory_uses_separate_jump_key_credential() {
+    use hss::config::AppConfig;
+    use hss::types::{Credential, CredentialKind, Host, ServerRecord};
+
+    let hosts = vec![
+        Host {
+            id: "bastion-id".into(),
+            name: "bastion".into(),
+            ip: "198.51.100.1".into(),
+            group: "gateways".into(),
+            port: 2222,
+            user: None,
+            tags: vec![],
+            description: None,
+            jump_host_id: None,
+            jump_credential_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
+        },
+        Host {
+            id: "app-id".into(),
+            name: "app1".into(),
+            ip: "10.0.1.10".into(),
+            group: "web".into(),
+            port: 22,
+            user: Some("appuser".into()),
+            tags: vec![],
+            description: None,
+            jump_host_id: Some("bastion-id".into()),
+            jump_credential_id: Some("jump-key".into()),
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
+        },
+    ];
+    let creds = vec![
+        Credential {
+            id: "jump-key".into(),
+            name: "Bastion Key".into(),
+            username: "bastion_ops".into(),
+            kind: CredentialKind::Key,
+            key_path: Some("/keys/bastion_ed25519".into()),
+        },
+        Credential {
+            id: "target-key".into(),
+            name: "App Key".into(),
+            username: "deploy".into(),
+            kind: CredentialKind::Key,
+            key_path: Some("/keys/app_ed25519".into()),
+        },
+    ];
+    let records = vec![ServerRecord {
+        host_id: "app-id".into(),
+        last_credential_id: Some("target-key".into()),
+        default_credential_id: None,
+    }];
+    let cfg = AppConfig::default();
+
+    let vars =
+        hss::inventory::generate_ansible_hostvars("app1", &hosts, &creds, &records, &cfg, false);
+    assert_eq!(vars["ansible_user"], "appuser");
+    assert_eq!(vars["ansible_ssh_private_key_file"], "/keys/app_ed25519");
+    let common = vars["ansible_ssh_common_args"].as_str().unwrap();
+    assert!(common.contains("-o ProxyCommand=\"ssh -W [%h]:%p -i '/keys/bastion_ed25519'"));
+    assert!(common.contains("-p 2222"));
+    assert!(common.contains("-l bastion_ops"));
+    assert!(common.contains("-- 198.51.100.1"));
 }

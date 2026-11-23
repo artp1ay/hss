@@ -209,6 +209,16 @@ impl App {
     }
 
     pub fn clear_credential_references(&mut self, cred_id: &str) -> Result<()> {
+        let mut hosts_changed = false;
+        for host in &mut self.hosts {
+            if host.jump_credential_id.as_deref() == Some(cred_id) {
+                host.jump_credential_id = None;
+                hosts_changed = true;
+            }
+        }
+        if hosts_changed {
+            self.save_hosts()?;
+        }
         if !self.server_records.iter().any(|r| {
             r.last_credential_id.as_deref() == Some(cred_id)
                 || r.default_credential_id.as_deref() == Some(cred_id)
@@ -260,6 +270,7 @@ impl App {
         for h in &mut self.hosts {
             if h.jump_host_id.as_deref() == Some(deleted_id.as_str()) {
                 h.jump_host_id = None;
+                h.jump_credential_id = None;
             }
         }
         self.hosts.remove(idx);
@@ -523,7 +534,8 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
         record.and_then(|r| r.default_credential_id.as_deref()),
     )?
     .ok_or_else(|| anyhow::anyhow!("Select a credential for this host with R first"))?;
-    let jump = crate::ssh::resolve_jump_spec(&app.hosts, host)?;
+    let jump =
+        crate::ssh::resolve_jump_auth(&app.hosts, host, &app.credentials, &app.server_records)?;
     if let Some(port) = host.http_proxy_port {
         crate::ssh::validate_port(port)?;
         anyhow::ensure!(
@@ -562,7 +574,8 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
         std::net::TcpListener::bind(("127.0.0.1", port))
             .map_err(|e| anyhow::anyhow!("Local proxy port {port} is unavailable: {e}"))?;
     }
-    let (mut child, askpass) = crate::ssh::spawn_proxy(host, cred, &app.config, jump.as_deref())?;
+    let (mut child, askpass) =
+        crate::ssh::spawn_proxy_with_jump_auth(host, cred, &app.config, jump.as_ref())?;
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(app.config.connect_timeout as u64 + 10);
     loop {
@@ -624,7 +637,9 @@ pub fn do_connect(
         .map(|h| (h.ip.clone(), h.port))
         .unwrap_or_else(|| (host_id.to_string(), 22));
     let jump = match host.as_ref() {
-        Some(h) => crate::ssh::resolve_jump_spec(&app.hosts, h)?,
+        Some(h) => {
+            crate::ssh::resolve_jump_auth(&app.hosts, h, &app.credentials, &app.server_records)?
+        }
         None => None,
     };
 
@@ -641,13 +656,13 @@ pub fn do_connect(
         .as_ref()
         .filter(|_| !proxy_active)
         .and_then(|h| h.socks_port);
-    let (status, stderr) = match crate::ssh::spawn_ssh_with_error_and_user(
+    let (status, stderr) = match crate::ssh::spawn_ssh_with_error_and_jump_auth(
         &ip,
         port,
         host.as_ref().and_then(|h| h.user.as_deref()),
         cred,
         &app.config,
-        jump.as_deref(),
+        jump.as_ref(),
         forwards,
         socks_port,
     ) {
@@ -681,7 +696,7 @@ pub fn do_connect(
         }
         app.status_message = Some(crate::types::StatusMessage::error(match kind {
             crate::ssh::SshErrorKind::AuthFailed if jump.is_some() => {
-                "SSH authentication failed on the target or jump host. Check both connections."
+                "SSH auth failed on target or jump host. Use [R] for target cred or [E] for jump cred."
                     .into()
             }
             crate::ssh::SshErrorKind::Unknown(ref message) if message.is_empty() => {

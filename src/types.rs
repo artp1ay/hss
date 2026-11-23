@@ -13,6 +13,8 @@ pub struct Host {
     pub description: Option<String>,
     #[serde(default)]
     pub jump_host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_credential_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_forwards: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +98,7 @@ pub struct HostForm {
     pub tags: String, // comma-separated
     pub description: String,
     pub jump_host_id: Option<String>,
+    pub jump_credential_id: Option<String>,
     pub port_forwards: String,
     pub socks_port: String,
     pub http_proxy_port: String,
@@ -106,6 +109,7 @@ pub struct HostForm {
     pub jump_cursor: usize,
     pub jump_selected: usize,
     pub credential_picker: bool,
+    pub credential_picker_for_jump: bool,
     pub credential_query: String,
     pub credential_cursor: usize,
     pub credential_selected: usize,
@@ -127,6 +131,7 @@ impl HostForm {
             tags: h.tags.join(", "),
             description: h.description.clone().unwrap_or_default(),
             jump_host_id: h.jump_host_id.clone(),
+            jump_credential_id: h.jump_credential_id.clone(),
             port_forwards: h.port_forwards.join(", "),
             socks_port: h.socks_port.map(|p| p.to_string()).unwrap_or_default(),
             http_proxy_port: h.http_proxy_port.map(|p| p.to_string()).unwrap_or_default(),

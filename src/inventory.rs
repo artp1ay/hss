@@ -311,6 +311,7 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
                 tags: vec![],
                 description: None,
                 jump_host_id: None,
+                jump_credential_id: None,
                 port_forwards: vec![],
                 socks_port: None,
                 http_proxy_port: None,
@@ -440,6 +441,7 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
                 tags: ini_tags,
                 description: None,
                 jump_host_id: None,
+                jump_credential_id: None,
                 port_forwards: vec![],
                 socks_port: None,
                 http_proxy_port: None,
@@ -664,8 +666,48 @@ fn build_hostvars(
     if has_private_key {
         ssh_args.push("-o IdentitiesOnly=yes".to_string());
     }
-    if let Some(jump) = crate::ssh::jump_spec(hosts, host) {
-        ssh_args.push(format!("-o ProxyJump={jump}"));
+    if let Ok(Some(ja)) = crate::ssh::resolve_jump_auth(hosts, host, creds, records) {
+        let jump_key = ja
+            .cred
+            .as_ref()
+            .filter(|c| c.kind == CredentialKind::Key)
+            .and_then(|c| c.key_path.as_deref())
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(crate::config::expand_tilde);
+        if let Some(key_file) = jump_key {
+            let mut pc = vec![
+                "ssh".to_string(),
+                "-W".to_string(),
+                "[%h]:%p".to_string(),
+                "-i".to_string(),
+                crate::ssh::shell_single_quote(&key_file),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+            ];
+            if ja.port != 22 {
+                pc.push("-p".to_string());
+                pc.push(ja.port.to_string());
+            }
+            if let Some(ref u) = ja.user {
+                pc.push("-l".to_string());
+                pc.push(u.clone());
+            }
+            if !cfg.strict_host_checking.trim().is_empty() {
+                if let Ok(checked) =
+                    crate::config::validate_strict_host_checking(&cfg.strict_host_checking)
+                {
+                    pc.push("-o".to_string());
+                    pc.push(format!("StrictHostKeyChecking={checked}"));
+                }
+            }
+            pc.push("--".to_string());
+            pc.push(ja.host.clone());
+            let proxy_cmd = pc.join(" ").replace('\\', "\\\\").replace('"', "\\\"");
+            ssh_args.push(format!("-o ProxyCommand=\"{proxy_cmd}\""));
+        } else {
+            ssh_args.push(format!("-o ProxyJump={}", ja.spec()));
+        }
     }
     if !cfg.strict_host_checking.trim().is_empty() {
         if let Ok(checked) = crate::config::validate_strict_host_checking(&cfg.strict_host_checking)

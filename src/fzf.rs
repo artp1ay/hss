@@ -84,7 +84,7 @@ pub fn run() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Credential not found"))?
     };
 
-    let jump = ssh::resolve_jump_spec(&hosts, host)?;
+    let jump = ssh::resolve_jump_auth(&hosts, host, &creds, &records)?;
     if explicitly_selected || cfg.auto_save_credential {
         let mut records = config::migrate_server_records(config::load_server_records()?, &hosts);
         if let Some(r) = records.iter_mut().find(|r| r.host_id == host.id) {
@@ -98,13 +98,13 @@ pub fn run() -> Result<()> {
         }
         config::save_server_records(&records)?;
     }
-    ssh::spawn_ssh_with_user(
+    ssh::spawn_ssh_with_jump_auth(
         &host.ip,
         host.port,
         host.user.as_deref(),
         &cred,
         &cfg,
-        jump.as_deref(),
+        jump.as_ref(),
         &host.port_forwards,
         host.socks_port,
     )?;

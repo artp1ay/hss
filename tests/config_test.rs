@@ -37,7 +37,8 @@ fn test_hosts_roundtrip() {
         user: Some("deploy".into()),
         tags: vec!["production".into(), "nginx".into()],
         description: Some("Primary web server".into()),
-        jump_host_id: None,
+        jump_host_id: Some("bastion-1".into()),
+        jump_credential_id: Some("jump-cred-1".into()),
         port_forwards: vec!["8080:80".into()],
         socks_port: Some(1080),
         http_proxy_port: Some(8081),
@@ -49,14 +50,18 @@ fn test_hosts_roundtrip() {
     assert_eq!(parsed[0].port, 2222);
     assert_eq!(parsed[0].tags, vec!["production", "nginx"]);
     assert_eq!(parsed[0].description, Some("Primary web server".into()));
+    assert_eq!(parsed[0].jump_host_id.as_deref(), Some("bastion-1"));
+    assert_eq!(parsed[0].jump_credential_id.as_deref(), Some("jump-cred-1"));
     assert_eq!(parsed[0].port_forwards, vec!["8080:80"]);
     assert_eq!(parsed[0].socks_port, Some(1080));
     assert_eq!(parsed[0].http_proxy_port, Some(8081));
     let old = s
+        .replace("jump_credential_id = \"jump-cred-1\"\n", "")
         .replace("port_forwards = [\"8080:80\"]\n", "")
         .replace("socks_port = 1080\n", "")
         .replace("http_proxy_port = 8081\n", "");
     let legacy = hss::config::parse_hosts(&old).unwrap();
+    assert_eq!(legacy[0].jump_credential_id, None);
     assert!(legacy[0].port_forwards.is_empty());
     assert_eq!(legacy[0].socks_port, None);
     assert_eq!(legacy[0].http_proxy_port, None);
@@ -124,6 +129,7 @@ fn test_migrate_server_records_rewrites_name_keyed_entries() {
         tags: vec![],
         description: None,
         jump_host_id: None,
+        jump_credential_id: None,
         port_forwards: vec![],
         socks_port: None,
         http_proxy_port: None,

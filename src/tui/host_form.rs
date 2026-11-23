@@ -41,6 +41,18 @@ fn tab_at(area: Rect, column: u16, row: u16) -> Option<usize> {
     }
 }
 
+fn page_fields(form: &HostForm) -> &'static [usize] {
+    if form.page == 0 {
+        if form.jump_host_id.is_some() {
+            &[0, 1, 2, 3, 4, 5, 6, 7, 12, 11]
+        } else {
+            &[0, 1, 2, 3, 4, 5, 6, 7, 11]
+        }
+    } else {
+        &[8, 9, 10]
+    }
+}
+
 fn switch_page(form: &mut HostForm, page: usize) {
     form.page = page;
     form.focused = if page == 0 { 0 } else { 8 };
@@ -129,7 +141,16 @@ pub fn draw(f: &mut Frame, app: &App) {
             (10, "HTTP proxy port", &form.http_proxy_port),
         ]
     };
-    let field_count = if form.page == 0 { 9 } else { 3 };
+    let has_jump = form.jump_host_id.is_some();
+    let field_count = if form.page == 0 {
+        if has_jump {
+            10
+        } else {
+            9
+        }
+    } else {
+        3
+    };
     let row_height = if rows[1].height >= field_count * 2 {
         2
     } else {
@@ -216,9 +237,65 @@ pub fn draw(f: &mut Frame, app: &App) {
                 ..row
             },
         );
+        if has_jump {
+            let row = Rect {
+                height: 1,
+                ..field_rows[8]
+            };
+            let focused = form.focused == 12;
+            let jump_cred_value = if let Some(ref cid) = form.jump_credential_id {
+                app.credentials
+                    .iter()
+                    .find(|c| c.id == *cid)
+                    .map(|c| format!("{} ({})", c.name, c.username))
+                    .unwrap_or_else(|| "(auto / ssh default)".into())
+            } else {
+                let jump_record = form
+                    .jump_host_id
+                    .as_deref()
+                    .and_then(|jid| app.record_for(jid));
+                [
+                    jump_record.and_then(|r| r.default_credential_id.as_deref()),
+                    jump_record.and_then(|r| r.last_credential_id.as_deref()),
+                ]
+                .into_iter()
+                .flatten()
+                .find_map(|cid| app.credentials.iter().find(|c| c.id == cid))
+                .map(|c| format!("{} ({}) [jump host]", c.name, c.username))
+                .unwrap_or_else(|| "(auto / ssh default)".into())
+            };
+            f.render_widget(
+                Paragraph::new("Jump credential").style(Style::default().fg(if focused {
+                    Color::Blue
+                } else {
+                    Color::DarkGray
+                })),
+                Rect {
+                    width: row.width.min(18),
+                    ..row
+                },
+            );
+            f.render_widget(
+                Paragraph::new(format!(" {jump_cred_value}  [Enter] select")).style(
+                    Style::default()
+                        .fg(if focused { Color::White } else { Color::Gray })
+                        .bg(if focused {
+                            Color::Rgb(44, 59, 78)
+                        } else {
+                            Color::Rgb(35, 39, 49)
+                        }),
+                ),
+                Rect {
+                    x: row.x.saturating_add(18),
+                    width: row.width.saturating_sub(18),
+                    ..row
+                },
+            );
+        }
+        let cred_row_idx = if has_jump { 9 } else { 8 };
         let row = Rect {
             height: 1,
-            ..field_rows[8]
+            ..field_rows[cred_row_idx]
         };
         let focused = form.focused == 11;
         let record = form.editing_id.as_deref().and_then(|id| app.record_for(id));
@@ -409,8 +486,7 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
-    if form.focused != 7
-        && form.focused != 11
+    if !matches!(form.focused, 7 | 11 | 12)
         && !matches!(
             key.code,
             KeyCode::Esc
@@ -441,28 +517,31 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             switch_page(form, if key.code == KeyCode::F(1) { 0 } else { 1 });
         }
         KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
-            let (first, count) = if form.page == 0 { (0, 9) } else { (8, 3) };
-            let offset = if form.focused == 11 {
-                8
-            } else {
-                form.focused - first
-            };
+            let order = page_fields(form);
+            let count = order.len();
+            let pos = order.iter().position(|&f| f == form.focused).unwrap_or(0);
             let next = if matches!(key.code, KeyCode::Tab | KeyCode::Down) {
-                (offset + 1) % count
+                (pos + 1) % count
             } else {
-                (offset + count - 1) % count
+                (pos + count - 1) % count
             };
-            form.focused = if form.page == 0 && next == 8 {
-                11
-            } else {
-                first + next
-            };
+            form.focused = order[next];
             form.cursor = crate::tui::input::end_of(active_field(form));
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
             if form.focused == 11 =>
         {
             form.credential_picker = true;
+            form.credential_picker_for_jump = false;
+            form.credential_query.clear();
+            form.credential_cursor = 0;
+            form.credential_selected = 0;
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+            if form.focused == 12 =>
+        {
+            form.credential_picker = true;
+            form.credential_picker_for_jump = true;
             form.credential_query.clear();
             form.credential_cursor = 0;
             form.credential_selected = 0;
@@ -475,7 +554,13 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             form.jump_cursor = 0;
             form.jump_selected = 0;
         }
-        KeyCode::Backspace | KeyCode::Delete if form.focused == 7 => form.jump_host_id = None,
+        KeyCode::Backspace | KeyCode::Delete if form.focused == 7 => {
+            form.jump_host_id = None;
+            form.jump_credential_id = None;
+        }
+        KeyCode::Backspace | KeyCode::Delete if form.focused == 12 => {
+            form.jump_credential_id = None;
+        }
         KeyCode::Backspace | KeyCode::Delete if form.focused == 11 => {
             form.credential_id = None;
             form.credential_changed = true;
@@ -499,8 +584,13 @@ fn credential_matches<'a>(app: &'a App, form: &HostForm) -> Vec<&'a crate::types
 fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
     let area = crate::tui::adaptive_centered_rect(60, 60, 50, 10, f.area());
     f.render_widget(Clear, area);
+    let title = if form.credential_picker_for_jump {
+        " Select jump credential "
+    } else {
+        " Select credential "
+    };
     let block = Block::default()
-        .title(" Select credential ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
     let inner = block.inner(area);
@@ -519,19 +609,27 @@ fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
     ));
     f.render_widget(Paragraph::new(Line::from(search)), rows[0]);
     let matches = credential_matches(app, form);
+    let mut items: Vec<String> = Vec::with_capacity(matches.len() + 1);
+    if form.credential_picker_for_jump {
+        items.push("(auto / from jump host)".to_string());
+    }
+    items.extend(
+        matches
+            .iter()
+            .map(|cred| format!("{} ({})", cred.name, cred.username)),
+    );
     let selected = form
         .credential_selected
-        .min(matches.len().saturating_sub(1));
+        .min(items.len().saturating_sub(1));
     let visible = rows[1].height as usize;
     let start = selected.saturating_sub(visible.saturating_sub(1));
-    for (offset, (index, cred)) in matches
+    for (offset, (index, label)) in items
         .iter()
         .enumerate()
         .skip(start)
         .take(visible)
         .enumerate()
     {
-        let cred = *cred;
         let style = if index == selected {
             Style::default()
                 .fg(Color::Blue)
@@ -541,12 +639,7 @@ fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
         };
         f.render_widget(
             Paragraph::new(Span::styled(
-                format!(
-                    "{} {} ({})",
-                    if index == selected { "▶" } else { " " },
-                    cred.name,
-                    cred.username
-                ),
+                format!("{} {label}", if index == selected { "▶" } else { " " }),
                 style,
             )),
             Rect {
@@ -563,24 +656,48 @@ fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
 }
 
 fn handle_credential_picker(app: &mut App, key: KeyEvent) {
+    let for_jump = app.host_form.as_ref().unwrap().credential_picker_for_jump;
     let matches = credential_matches(app, app.host_form.as_ref().unwrap());
-    let count = matches.len();
+    let count = if for_jump {
+        matches.len() + 1
+    } else {
+        matches.len()
+    };
+    let selected_idx = app
+        .host_form
+        .as_ref()
+        .unwrap()
+        .credential_selected
+        .min(count.saturating_sub(1));
     let selected_id = if key.code == KeyCode::Enter {
-        matches
-            .get(app.host_form.as_ref().unwrap().credential_selected)
-            .map(|c| c.id.clone())
+        if for_jump {
+            if selected_idx == 0 {
+                None
+            } else {
+                matches.get(selected_idx - 1).map(|c| c.id.clone())
+            }
+        } else {
+            matches.get(selected_idx).map(|c| c.id.clone())
+        }
     } else {
         None
     };
     let form = app.host_form.as_mut().unwrap();
     match key.code {
-        KeyCode::Esc => form.credential_picker = false,
+        KeyCode::Esc => {
+            form.credential_picker = false;
+            form.credential_picker_for_jump = false;
+        }
         KeyCode::Up => form.credential_selected = form.credential_selected.saturating_sub(1),
         KeyCode::Down => {
             form.credential_selected = (form.credential_selected + 1).min(count.saturating_sub(1))
         }
         KeyCode::Enter => {
-            if let Some(id) = selected_id {
+            if for_jump {
+                form.jump_credential_id = selected_id;
+                form.credential_picker = false;
+                form.credential_picker_for_jump = false;
+            } else if let Some(id) = selected_id {
                 form.credential_id = Some(id);
                 form.credential_changed = true;
                 form.credential_picker = false;
@@ -686,6 +803,9 @@ fn handle_jump_picker(app: &mut App, key: KeyEvent) {
         KeyCode::Up => form.jump_selected = form.jump_selected.saturating_sub(1),
         KeyCode::Down => form.jump_selected = (form.jump_selected + 1).min(count - 1),
         KeyCode::Enter => {
+            if selected_id.is_none() {
+                form.jump_credential_id = None;
+            }
             form.jump_host_id = selected_id;
             form.jump_picker = false;
         }
@@ -725,7 +845,7 @@ fn save_host(app: &mut App) -> Result<()> {
         if let Some(ref mut f) = app.host_form {
             f.error_message = Some(err.clone());
             f.focused = focus;
-            f.page = if focus >= 8 { 1 } else { 0 };
+            f.page = if matches!(focus, 8 | 9 | 10) { 1 } else { 0 };
             f.cursor = crate::tui::input::end_of(active_field(f));
         }
         app.status_message = Some(crate::types::StatusMessage::error(err));
@@ -844,6 +964,12 @@ fn save_host(app: &mut App) -> Result<()> {
         .filter(|t| !t.is_empty())
         .collect();
 
+    let jump_credential_id = if form.jump_host_id.is_some() {
+        form.jump_credential_id.clone()
+    } else {
+        None
+    };
+
     if let Some(ref edit_id) = form.editing_id {
         // Update existing host
         if let Some(h) = app.hosts.iter_mut().find(|h| &h.id == edit_id) {
@@ -863,6 +989,7 @@ fn save_host(app: &mut App) -> Result<()> {
                 Some(form.description.trim().to_string())
             };
             h.jump_host_id = form.jump_host_id.clone();
+            h.jump_credential_id = jump_credential_id;
             h.port_forwards = port_forwards.clone();
             h.socks_port = socks_port;
             h.http_proxy_port = http_proxy_port;
@@ -891,6 +1018,7 @@ fn save_host(app: &mut App) -> Result<()> {
                 Some(form.description.trim().to_string())
             },
             jump_host_id: form.jump_host_id.clone(),
+            jump_credential_id,
             port_forwards,
             socks_port,
             http_proxy_port,
@@ -1061,6 +1189,7 @@ mod tests {
             tags: vec![],
             description: None,
             jump_host_id: None,
+            jump_credential_id: None,
             port_forwards: vec![],
             socks_port: None,
             http_proxy_port: None,
@@ -1263,5 +1392,115 @@ mod tests {
                 "I"
             );
         }
+    }
+
+    #[test]
+    fn jump_credential_field_appears_selects_and_clears() {
+        let mut app = app();
+        app.hosts.push(Host {
+            id: "bastion".into(),
+            name: "bastion".into(),
+            ip: "10.0.0.1".into(),
+            group: String::new(),
+            port: 22,
+            user: None,
+            tags: vec![],
+            description: None,
+            jump_host_id: None,
+            jump_credential_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
+        });
+        for (id, name, user) in [
+            ("jump-c", "bastion-key", "ops"),
+            ("target-c", "app-pass", "deploy"),
+        ] {
+            app.credentials.push(crate::types::Credential {
+                id: id.into(),
+                name: name.into(),
+                username: user.into(),
+                kind: crate::types::CredentialKind::Password,
+                key_path: None,
+            });
+        }
+
+        // Select bastion as jump host (Up -> 11, Up -> 7, Enter -> Down -> Enter)
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 7);
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().jump_host_id.as_deref(),
+            Some("bastion")
+        );
+
+        // Down from field 7 now focuses field 12 (Jump credential)
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 12);
+
+        // Open jump credential picker and pick bastion-key (row 1 after "(auto / from jump host)")
+        key(&mut app, KeyCode::Enter);
+        assert!(app.host_form.as_ref().unwrap().credential_picker_for_jump);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.host_form
+                .as_ref()
+                .unwrap()
+                .jump_credential_id
+                .as_deref(),
+            Some("jump-c")
+        );
+        assert_eq!(app.host_form.as_ref().unwrap().credential_id, None);
+
+        // Down moves to target Credential (field 11) and picks app-pass independently
+        key(&mut app, KeyCode::Down);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 11);
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.host_form.as_ref().unwrap().credential_picker_for_jump);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().credential_id.as_deref(),
+            Some("target-c")
+        );
+        assert_eq!(
+            app.host_form
+                .as_ref()
+                .unwrap()
+                .jump_credential_id
+                .as_deref(),
+            Some("jump-c")
+        );
+
+        // Rendered form displays Jump credential and selected credential
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Jump credential"));
+        assert!(text.contains("bastion-key (ops)"));
+        assert!(text.contains("app-pass (deploy)"));
+
+        // Clearing jump host clears jump_credential_id without affecting target credential_id
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 12);
+        key(&mut app, KeyCode::Up);
+        assert_eq!(app.host_form.as_ref().unwrap().focused, 7);
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.host_form.as_ref().unwrap().jump_host_id, None);
+        assert_eq!(app.host_form.as_ref().unwrap().jump_credential_id, None);
+        assert_eq!(
+            app.host_form.as_ref().unwrap().credential_id.as_deref(),
+            Some("target-c")
+        );
     }
 }
