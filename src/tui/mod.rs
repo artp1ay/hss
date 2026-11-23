@@ -8,7 +8,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io::{self, Stdout};
+use std::collections::VecDeque;
+use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub mod audit_screen;
 pub mod copy_id;
@@ -20,6 +24,7 @@ pub mod input;
 pub mod main_screen;
 pub mod mcp_screen;
 pub mod popup;
+pub mod proxy_screen;
 pub mod settings_screen;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -38,6 +43,9 @@ pub enum Screen {
     ImportHosts, // overlay for importing from INI file path
     McpServer,   // modal: MCP server status + log while it runs
     CopyId,      // overlay for ssh-copy-id (key multi-select + password)
+    Proxy {
+        host_idx: usize,
+    }, // overlay for explicit proxy status, endpoints, logs, start/stop
 }
 
 #[derive(Debug, Clone)]
@@ -47,10 +55,153 @@ pub enum CopyIdEvent {
     Failure(String),
 }
 
+const MAX_PROXY_LOG_LINES: usize = 80;
+const MAX_PROXY_LOG_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+pub struct ProxyStderrLog {
+    lines: VecDeque<String>,
+    total_bytes: usize,
+}
+
+impl ProxyStderrLog {
+    fn push_line(&mut self, raw: String) {
+        let line = raw.trim_end_matches('\r').to_string();
+        if line.is_empty() {
+            return;
+        }
+        self.total_bytes += line.len();
+        self.lines.push_back(line);
+        while self.lines.len() > MAX_PROXY_LOG_LINES || self.total_bytes > MAX_PROXY_LOG_BYTES {
+            if let Some(old) = self.lines.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(old.len());
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        self.lines.iter().cloned().collect()
+    }
+
+    pub fn last_meaningful(&self) -> Option<String> {
+        self.lines
+            .iter()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .cloned()
+    }
+}
+
+fn spawn_stderr_drain(stderr: Option<std::process::ChildStderr>) -> Arc<Mutex<ProxyStderrLog>> {
+    let log = Arc::new(Mutex::new(ProxyStderrLog::default()));
+    if let Some(stderr) = stderr {
+        let log_bg = Arc::clone(&log);
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(text) => {
+                        if let Ok(mut guard) = log_bg.lock() {
+                            guard.push_line(text);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    log
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyConfigSummary {
+    pub host_id: String,
+    pub host_name: String,
+    pub host_ip: String,
+    pub host_port: u16,
+    pub jump_label: Option<String>,
+    pub cred_label: String,
+    pub socks_port: Option<u16>,
+    pub internal_socks_port: Option<u16>,
+    pub http_proxy_port: Option<u16>,
+    pub port_forwards: Vec<String>,
+}
+
+impl ProxyConfigSummary {
+    pub fn effective_socks_port(&self) -> Option<u16> {
+        self.socks_port.or(self.internal_socks_port)
+    }
+
+    pub fn bound_local_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self
+            .port_forwards
+            .iter()
+            .filter_map(|f| f.split_once(':'))
+            .filter_map(|(p, _)| p.parse::<u16>().ok())
+            .collect();
+        if let Some(p) = self.effective_socks_port() {
+            ports.push(p);
+        }
+        if let Some(p) = self.http_proxy_port {
+            ports.push(p);
+        }
+        ports
+    }
+
+    pub fn short_endpoints(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(p) = self.socks_port {
+            parts.push(format!("SOCKS5 127.0.0.1:{p}"));
+        }
+        if let Some(p) = self.http_proxy_port {
+            parts.push(format!("HTTP 127.0.0.1:{p}"));
+        }
+        for fwd in &self.port_forwards {
+            parts.push(format!("L {}", fwd.replace(':', "→")));
+        }
+        parts.join("  ·  ")
+    }
+}
+
+pub struct ProxyStartup {
+    pub summary: ProxyConfigSummary,
+    child: Option<std::process::Child>,
+    _askpass: Option<crate::ssh::AskpassGuard>,
+    check_port: u16,
+    check_is_socks: bool,
+    deadline: Instant,
+    pub started_at: Instant,
+    pub log: Arc<Mutex<ProxyStderrLog>>,
+}
+
+impl Drop for ProxyStartup {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub struct ProxySession {
     pub host_id: String,
+    pub summary: ProxyConfigSummary,
     child: std::process::Child,
     http: Option<http_proxy::HttpProxy>,
+    pub started_at: Instant,
+    pub log: Arc<Mutex<ProxyStderrLog>>,
+}
+
+impl ProxySession {
+    pub fn http_metrics(&self) -> Option<http_proxy::ProxyMetricsSnapshot> {
+        self.http.as_ref().map(|h| h.metrics().snapshot())
+    }
+
+    pub fn http_bound_port(&self) -> Option<u16> {
+        self.http.as_ref().map(http_proxy::HttpProxy::port)
+    }
 }
 
 impl Drop for ProxySession {
@@ -59,6 +210,13 @@ impl Drop for ProxySession {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyErrorReport {
+    pub host_id: String,
+    pub message: String,
+    pub stderr_lines: Vec<String>,
 }
 
 pub struct App {
@@ -87,13 +245,18 @@ pub struct App {
     // Host form / import state
     pub host_form: Option<HostForm>,
     pub host_form_from_audit: bool,
+    pub host_form_return_to_proxy: Option<usize>,
     pub import_path_input: String,
     pub import_cursor: usize,
     pub import_export_mode: usize, // 0 = import INI, 1 = export INI, 2 = export ssh_config
     // MCP server (Some while running; screen is modal)
     pub mcp: Option<crate::mcp::McpServer>,
     pub mcp_scroll_offset: usize,
+    // Proxy state
     pub proxy: Option<ProxySession>,
+    pub proxy_starting: Option<ProxyStartup>,
+    pub proxy_last_error: Option<ProxyErrorReport>,
+    pub proxy_log_scroll: usize,
     // ssh-copy-id overlay state
     pub copy_id_form: Option<crate::types::CopyIdForm>,
     pub copy_id_rx: Option<std::sync::mpsc::Receiver<CopyIdEvent>>,
@@ -132,12 +295,16 @@ impl App {
             popup_selected: 0,
             host_form: None,
             host_form_from_audit: false,
+            host_form_return_to_proxy: None,
             import_path_input: String::new(),
             import_cursor: 0,
             import_export_mode: 0,
             mcp: None,
             mcp_scroll_offset: 0,
             proxy: None,
+            proxy_starting: None,
+            proxy_last_error: None,
+            proxy_log_scroll: 0,
             copy_id_form: None,
             copy_id_rx: None,
             delete_popup: None,
@@ -170,6 +337,25 @@ impl App {
 
     pub fn record_for(&self, host_id: &str) -> Option<&ServerRecord> {
         self.server_records.iter().find(|r| r.host_id == host_id)
+    }
+
+    pub fn active_proxy_ports(&self) -> Vec<u16> {
+        let mut ports = Vec::new();
+        if let Some(ref p) = self.proxy {
+            ports.extend(p.summary.bound_local_ports());
+        }
+        if let Some(ref s) = self.proxy_starting {
+            ports.extend(s.summary.bound_local_ports());
+        }
+        ports
+    }
+
+    pub fn is_proxy_active_or_starting_for(&self, host_id: &str) -> bool {
+        self.proxy.as_ref().is_some_and(|p| p.host_id == host_id)
+            || self
+                .proxy_starting
+                .as_ref()
+                .is_some_and(|s| s.summary.host_id == host_id)
     }
 
     pub fn select_credential(&mut self, host_id: &str, cred_id: &str, pin: bool) -> Result<()> {
@@ -256,7 +442,7 @@ impl App {
     }
 
     /// Delete a host by index, clearing dangling jump references, orphaned server records,
-    /// and any active proxy bound to the deleted host.
+    /// and any active/starting proxy bound to the deleted host.
     pub fn delete_host(&mut self, idx: usize) -> Result<Option<String>> {
         if idx >= self.hosts.len() {
             return Ok(None);
@@ -266,6 +452,13 @@ impl App {
 
         if self.proxy.as_ref().is_some_and(|p| p.host_id == deleted_id) {
             self.proxy = None;
+        }
+        if self
+            .proxy_starting
+            .as_ref()
+            .is_some_and(|s| s.summary.host_id == deleted_id)
+        {
+            self.proxy_starting = None;
         }
         for h in &mut self.hosts {
             if h.jump_host_id.as_deref() == Some(deleted_id.as_str()) {
@@ -312,6 +505,196 @@ impl App {
         }
     }
 
+    pub fn poll_proxy(&mut self) {
+        if let Some(mut starting) = self.proxy_starting.take() {
+            let status_res = starting
+                .child
+                .as_mut()
+                .map(std::process::Child::try_wait)
+                .transpose();
+            match status_res {
+                Ok(Some(Some(status))) => {
+                    std::thread::sleep(Duration::from_millis(30));
+                    let (lines, detail) = read_stderr_summary(&starting.log);
+                    let err_msg = match detail {
+                        Some(d) => format!("{d} ({status})"),
+                        None => format!("SSH proxy exited with {status}"),
+                    };
+                    self.proxy_last_error = Some(ProxyErrorReport {
+                        host_id: starting.summary.host_id.clone(),
+                        message: err_msg.clone(),
+                        stderr_lines: lines,
+                    });
+                    self.status_message = Some(crate::types::StatusMessage::error(format!(
+                        "Proxy failed ({}): {err_msg}",
+                        starting.summary.host_name
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    let (lines, _) = read_stderr_summary(&starting.log);
+                    let err_msg = format!("Failed to check SSH proxy process: {e}");
+                    self.proxy_last_error = Some(ProxyErrorReport {
+                        host_id: starting.summary.host_id.clone(),
+                        message: err_msg.clone(),
+                        stderr_lines: lines,
+                    });
+                    self.status_message = Some(crate::types::StatusMessage::error(err_msg));
+                    return;
+                }
+                _ => {}
+            }
+
+            let ready = if starting.check_is_socks {
+                probe_socks5_ready(starting.check_port)
+            } else {
+                probe_local_forward_ready(starting.check_port)
+            };
+
+            if ready {
+                // Re-check child is still alive (guards against partial bind + ExitOnForwardFailure exit).
+                if let Some(ref mut child) = starting.child {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        std::thread::sleep(Duration::from_millis(30));
+                        let (lines, detail) = read_stderr_summary(&starting.log);
+                        let err_msg = match detail {
+                            Some(d) => format!("{d} ({status})"),
+                            None => format!("SSH proxy exited with {status}"),
+                        };
+                        self.proxy_last_error = Some(ProxyErrorReport {
+                            host_id: starting.summary.host_id.clone(),
+                            message: err_msg.clone(),
+                            stderr_lines: lines,
+                        });
+                        self.status_message = Some(crate::types::StatusMessage::error(format!(
+                            "Proxy failed ({}): {err_msg}",
+                            starting.summary.host_name
+                        )));
+                        return;
+                    }
+                }
+
+                // Authentication succeeded and tunnel is listening; wipe askpass secrets immediately.
+                starting._askpass = None;
+
+                let http = match (
+                    starting.summary.http_proxy_port,
+                    starting.summary.effective_socks_port(),
+                ) {
+                    (Some(http_port), Some(socks_port)) => {
+                        match http_proxy::HttpProxy::start(http_port, socks_port) {
+                            Ok(http) => Some(http),
+                            Err(err) => {
+                                let (lines, _) = read_stderr_summary(&starting.log);
+                                let err_msg = format!("{err:#}");
+                                self.proxy_last_error = Some(ProxyErrorReport {
+                                    host_id: starting.summary.host_id.clone(),
+                                    message: err_msg.clone(),
+                                    stderr_lines: lines,
+                                });
+                                self.status_message =
+                                    Some(crate::types::StatusMessage::error(format!(
+                                        "HTTP proxy failed ({}): {err_msg}",
+                                        starting.summary.host_name
+                                    )));
+                                // `starting` drops here, killing SSH child cleanly.
+                                return;
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(child) = starting.child.take() {
+                    let host_id = starting.summary.host_id.clone();
+                    let summary_text = starting.summary.short_endpoints();
+                    let host_name = starting.summary.host_name.clone();
+                    let session = ProxySession {
+                        host_id,
+                        summary: starting.summary.clone(),
+                        child,
+                        http,
+                        started_at: Instant::now(),
+                        log: Arc::clone(&starting.log),
+                    };
+                    self.proxy = Some(session);
+                    self.proxy_last_error = None;
+                    self.status_message = Some(crate::types::StatusMessage::success(format!(
+                        "Proxy active ({host_name}): {summary_text}"
+                    )));
+                }
+                return;
+            }
+
+            if Instant::now() >= starting.deadline {
+                let (lines, detail) = read_stderr_summary(&starting.log);
+                let err_msg = match detail {
+                    Some(d) => format!(
+                        "Timed out waiting for port {} — {d}",
+                        starting.check_port
+                    ),
+                    None => format!(
+                        "Timed out waiting for SSH proxy on 127.0.0.1:{}",
+                        starting.check_port
+                    ),
+                };
+                self.proxy_last_error = Some(ProxyErrorReport {
+                    host_id: starting.summary.host_id.clone(),
+                    message: err_msg.clone(),
+                    stderr_lines: lines,
+                });
+                self.status_message = Some(crate::types::StatusMessage::error(format!(
+                    "Proxy failed ({}): {err_msg}",
+                    starting.summary.host_name
+                )));
+                // `starting` drops here, killing SSH child and wiping askpass secrets.
+                return;
+            }
+
+            self.proxy_starting = Some(starting);
+        }
+
+        if let Some(ref mut proxy) = self.proxy {
+            match proxy.child.try_wait() {
+                Ok(Some(status)) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    let (lines, detail) = read_stderr_summary(&proxy.log);
+                    let host_id = proxy.host_id.clone();
+                    let host_name = proxy.summary.host_name.clone();
+                    let err_msg = match detail {
+                        Some(d) => format!("{d} ({status})"),
+                        None => format!("SSH tunnel exited with {status}"),
+                    };
+                    self.proxy = None;
+                    self.proxy_last_error = Some(ProxyErrorReport {
+                        host_id,
+                        message: err_msg.clone(),
+                        stderr_lines: lines,
+                    });
+                    self.status_message = Some(crate::types::StatusMessage::error(format!(
+                        "Proxy disconnected ({host_name}): {err_msg}"
+                    )));
+                }
+                Err(e) => {
+                    let host_id = proxy.host_id.clone();
+                    let host_name = proxy.summary.host_name.clone();
+                    let (lines, _) = read_stderr_summary(&proxy.log);
+                    let err_msg = format!("Proxy monitor error: {e}");
+                    self.proxy = None;
+                    self.proxy_last_error = Some(ProxyErrorReport {
+                        host_id,
+                        message: err_msg.clone(),
+                        stderr_lines: lines,
+                    });
+                    self.status_message = Some(crate::types::StatusMessage::error(format!(
+                        "Proxy disconnected ({host_name}): {err_msg}"
+                    )));
+                }
+                Ok(None) => {}
+            }
+        }
+    }
+
     pub fn poll_copy_id(&mut self) {
         if let Some(ref rx) = self.copy_id_rx {
             while let Ok(event) = rx.try_recv() {
@@ -342,6 +725,47 @@ impl App {
             }
         }
     }
+}
+
+fn read_stderr_summary(log: &Arc<Mutex<ProxyStderrLog>>) -> (Vec<String>, Option<String>) {
+    match log.lock() {
+        Ok(guard) => (guard.snapshot(), guard.last_meaningful()),
+        Err(_) => (Vec::new(), None),
+    }
+}
+
+fn probe_socks5_ready(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+    if stream.write_all(&[5, 1, 0]).is_err() {
+        return false;
+    }
+    let mut resp = [0u8; 2];
+    stream.read_exact(&mut resp).is_ok() && resp == [5, 0]
+}
+
+fn probe_local_forward_ready(port: u16) -> bool {
+    match TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_listener) => false,
+        Err(e) => e.kind() == io::ErrorKind::AddrInUse,
+    }
+}
+
+fn allocate_ephemeral_port(avoid: &[u16]) -> Result<u16> {
+    for _ in 0..8 {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| anyhow::anyhow!("Cannot allocate internal SOCKS port: {e}"))?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        if port != 0 && !avoid.contains(&port) {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("Failed to allocate a free internal local port for HTTP proxy")
 }
 
 #[derive(Default)]
@@ -518,14 +942,25 @@ pub fn wrap_hotkey_lines<'a>(
     lines
 }
 
-pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
-    if let Some(ref proxy) = app.proxy {
-        if proxy.host_id == host.id {
-            app.proxy = None;
-            app.status_message = Some(crate::types::StatusMessage::info("Proxy stopped"));
-            return Ok(());
-        }
+pub fn stop_proxy(app: &mut App) {
+    if let Some(starting) = app.proxy_starting.take() {
+        let name = starting.summary.host_name.clone();
+        drop(starting);
+        app.status_message = Some(crate::types::StatusMessage::info(format!(
+            "Proxy startup cancelled ({name})"
+        )));
+        return;
     }
+    if let Some(proxy) = app.proxy.take() {
+        let name = proxy.summary.host_name.clone();
+        drop(proxy);
+        app.status_message = Some(crate::types::StatusMessage::info(format!(
+            "Proxy stopped ({name})"
+        )));
+    }
+}
+
+pub fn start_proxy(app: &mut App, host: &Host) -> Result<()> {
     let record = app.record_for(&host.id);
     let cred = crate::ssh::resolve_credential(
         &app.credentials,
@@ -533,9 +968,19 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
         record.and_then(|r| r.last_credential_id.as_deref()),
         record.and_then(|r| r.default_credential_id.as_deref()),
     )?
-    .ok_or_else(|| anyhow::anyhow!("Select a credential for this host with R first"))?;
+    .ok_or_else(|| anyhow::anyhow!("Select a credential for this host with [R] first"))?
+    .clone();
     let jump =
         crate::ssh::resolve_jump_auth(&app.hosts, host, &app.credentials, &app.server_records)?;
+
+    anyhow::ensure!(
+        !host.port_forwards.is_empty()
+            || host.socks_port.is_some()
+            || host.http_proxy_port.is_some(),
+        "Configure forwards, SOCKS port, or HTTP proxy port first ([E] -> F2)"
+    );
+    crate::ssh::port_forward_args(&host.port_forwards, host.socks_port)?;
+
     if let Some(port) = host.http_proxy_port {
         crate::ssh::validate_port(port)?;
         anyhow::ensure!(
@@ -550,78 +995,128 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
             "HTTP port conflicts with a local forward"
         );
     }
-    anyhow::ensure!(
-        host.http_proxy_port.is_none() || host.socks_port.is_some(),
-        "HTTP proxy requires a SOCKS port"
-    );
-    let check_port = host
-        .socks_port
-        .or_else(|| {
-            host.port_forwards
-                .first()
-                .and_then(|f| f.split_once(':'))
-                .and_then(|(p, _)| p.parse::<u16>().ok())
-        })
-        .ok_or_else(|| anyhow::anyhow!("Configure forwards or a SOCKS port first"))?;
-    app.proxy = None;
-    for port in host
+
+    let mut local_ports: Vec<u16> = host
         .port_forwards
         .iter()
         .filter_map(|f| f.split_once(':'))
         .filter_map(|(p, _)| p.parse::<u16>().ok())
-        .chain(host.socks_port)
-    {
-        std::net::TcpListener::bind(("127.0.0.1", port))
-            .map_err(|e| anyhow::anyhow!("Local proxy port {port} is unavailable: {e}"))?;
+        .collect();
+    if let Some(p) = host.socks_port {
+        local_ports.push(p);
     }
-    let (mut child, askpass) =
-        crate::ssh::spawn_proxy_with_jump_auth(host, cred, &app.config, jump.as_ref())?;
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(app.config.connect_timeout as u64 + 10);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            use std::io::Read;
-            let mut error = String::new();
-            if let Some(ref mut stderr) = child.stderr {
-                let _ = stderr.read_to_string(&mut error);
-            }
-            drop(askpass);
-            anyhow::bail!("SSH proxy exited with {status}: {}", error.trim());
-        }
-        if std::net::TcpStream::connect(("127.0.0.1", check_port)).is_ok() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            drop(askpass);
-            anyhow::bail!("Timed out waiting for SSH proxy on port {check_port}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    if let Some(p) = host.http_proxy_port {
+        local_ports.push(p);
     }
-    // Authentication succeeded and tunnel is listening; wipe askpass secret immediately.
-    drop(askpass);
-    let http = match host.http_proxy_port {
-        Some(port) => match http_proxy::HttpProxy::start(port, host.socks_port.unwrap()) {
-            Ok(http) => Some(http),
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(err);
-            }
-        },
-        None => None,
+
+    // Check ports not held by our own active/starting proxy BEFORE stopping the current proxy.
+    let own_ports = app.active_proxy_ports();
+    for &port in &local_ports {
+        if !own_ports.contains(&port) {
+            TcpListener::bind(("127.0.0.1", port))
+                .map_err(|e| anyhow::anyhow!("Local proxy port {port} is unavailable: {e}"))?;
+        }
+    }
+
+    // Allocate an internal ephemeral SOCKS5 port if only HTTP proxy is configured.
+    let internal_socks_port = if host.http_proxy_port.is_some() && host.socks_port.is_none() {
+        Some(allocate_ephemeral_port(&local_ports)?)
+    } else {
+        None
     };
-    app.proxy = Some(ProxySession {
+    let effective_socks = host.socks_port.or(internal_socks_port);
+
+    let (check_port, check_is_socks) = if let Some(sp) = effective_socks {
+        (sp, true)
+    } else {
+        let fwd_port = host
+            .port_forwards
+            .first()
+            .and_then(|f| f.split_once(':'))
+            .and_then(|(p, _)| p.parse::<u16>().ok())
+            .ok_or_else(|| anyhow::anyhow!("Invalid port forward configuration"))?;
+        (fwd_port, false)
+    };
+
+    // Stop any previous proxy now that validation succeeded.
+    app.proxy = None;
+    app.proxy_starting = None;
+    app.proxy_last_error = None;
+    app.proxy_log_scroll = 0;
+
+    // Verify all ports (including any previously owned by our old proxy) are now free.
+    for &port in &local_ports {
+        let mut bound = false;
+        for _ in 0..6 {
+            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                bound = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        anyhow::ensure!(bound, "Local proxy port {port} is unavailable");
+    }
+
+    let (mut child, askpass) = crate::ssh::spawn_proxy_with_options(
+        host,
+        &cred,
+        &app.config,
+        jump.as_ref(),
+        internal_socks_port,
+    )?;
+    let log = spawn_stderr_drain(child.stderr.take());
+
+    let jump_label = host
+        .jump_host_id
+        .as_deref()
+        .and_then(|jid| app.hosts.iter().find(|h| h.id == jid))
+        .map(|jh| {
+            if let Some(ref ja) = jump {
+                if let Some(ref jc) = ja.cred {
+                    return format!("{} ({}) via {}", jh.name, jh.ip, jc.name);
+                }
+            }
+            format!("{} ({})", jh.name, jh.ip)
+        });
+    let cred_label = format!("{} ({})", cred.name, cred.username);
+
+    let summary = ProxyConfigSummary {
         host_id: host.id.clone(),
-        child,
-        http,
+        host_name: host.name.clone(),
+        host_ip: host.ip.clone(),
+        host_port: host.port,
+        jump_label,
+        cred_label,
+        socks_port: host.socks_port,
+        internal_socks_port,
+        http_proxy_port: host.http_proxy_port,
+        port_forwards: host.port_forwards.clone(),
+    };
+
+    let timeout_secs = (app.config.connect_timeout as u64).saturating_add(10);
+    app.proxy_starting = Some(ProxyStartup {
+        summary,
+        child: Some(child),
+        _askpass: askpass,
+        check_port,
+        check_is_socks,
+        deadline: Instant::now() + Duration::from_secs(timeout_secs),
+        started_at: Instant::now(),
+        log,
     });
-    app.status_message = Some(crate::types::StatusMessage::success(format!(
-        "Proxy active: {}",
+    app.status_message = Some(crate::types::StatusMessage::info(format!(
+        "Starting proxy on {}…",
         host.name
     )));
     Ok(())
+}
+
+pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
+    if app.is_proxy_active_or_starting_for(&host.id) {
+        stop_proxy(app);
+        return Ok(());
+    }
+    start_proxy(app, host)
 }
 
 /// Tear down TUI, run SSH, re-init TUI. Saves credential on success; shows picker on auth failure.
@@ -644,18 +1139,30 @@ pub fn do_connect(
     };
 
     restore_terminal(terminal)?;
-    let proxy_active = host
+    let active_ports = app.active_proxy_ports();
+    let proxy_same_host = host
         .as_ref()
-        .is_some_and(|h| app.proxy.as_ref().is_some_and(|p| p.host_id == h.id));
-    let forwards = host
+        .is_some_and(|h| app.is_proxy_active_or_starting_for(&h.id));
+    let forwards: Vec<String> = host
         .as_ref()
-        .filter(|_| !proxy_active)
-        .map(|h| h.port_forwards.as_slice())
-        .unwrap_or(&[]);
+        .filter(|_| !proxy_same_host)
+        .map(|h| {
+            h.port_forwards
+                .iter()
+                .filter(|f| {
+                    f.split_once(':')
+                        .and_then(|(p, _)| p.parse::<u16>().ok())
+                        .is_none_or(|p| !active_ports.contains(&p))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let socks_port = host
         .as_ref()
-        .filter(|_| !proxy_active)
-        .and_then(|h| h.socks_port);
+        .filter(|_| !proxy_same_host)
+        .and_then(|h| h.socks_port)
+        .filter(|p| !active_ports.contains(p));
     let (status, stderr) = match crate::ssh::spawn_ssh_with_error_and_jump_auth(
         &ip,
         port,
@@ -663,7 +1170,7 @@ pub fn do_connect(
         cred,
         &app.config,
         jump.as_ref(),
-        forwards,
+        &forwards,
         socks_port,
     ) {
         Ok(s) => s,
@@ -721,6 +1228,7 @@ pub fn run() -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::new(hosts, credentials, cfg, records);
     let result = run_loop(&mut terminal, &mut app);
+    app.proxy_starting = None;
     app.proxy = None;
     if let Some(mcp) = app.mcp.take() {
         mcp.stop();
@@ -733,14 +1241,7 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
     loop {
         app.poll_audit();
         app.poll_copy_id();
-        if let Some(ref mut proxy) = app.proxy {
-            if let Some(status) = proxy.child.try_wait()? {
-                app.proxy = None;
-                app.status_message = Some(crate::types::StatusMessage::error(format!(
-                    "Proxy disconnected: {status}"
-                )));
-            }
-        }
+        app.poll_proxy();
 
         // Clear expired status messages automatically
         if let Some(ref msg) = app.status_message {
@@ -751,7 +1252,7 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
 
         terminal.draw(|f| draw(f, app))?;
 
-        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+        if crossterm::event::poll(Duration::from_millis(100))? {
             match crossterm::event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if let Err(e) = handle_key(terminal, app, key) {
@@ -805,6 +1306,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             main_screen::draw(f, app);
             copy_id::draw(f, app);
         }
+        Screen::Proxy { .. } => {
+            main_screen::draw(f, app);
+            proxy_screen::draw(f, app);
+        }
     }
     // Delete confirmation popup renders on top of any screen
     if app.delete_popup.is_some() {
@@ -830,5 +1335,6 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
         Screen::ImportHosts => host_form::handle_import_key(terminal, app, key),
         Screen::McpServer => mcp_screen::handle_key(terminal, app, key),
         Screen::CopyId => copy_id::handle_key(terminal, app, key),
+        Screen::Proxy { host_idx } => proxy_screen::handle_key(terminal, app, key, host_idx),
     }
 }

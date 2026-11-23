@@ -23,7 +23,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         &[
             ("Enter", "connect"),
-            ("X", "Proxy on/off"),
+            ("X", "proxy"),
             ("/", "search"),
             ("N", "new"),
             ("E", "edit"),
@@ -40,15 +40,28 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
     let hotkey_lines = crate::tui::wrap_hotkey_lines(hotkey_pairs, area.width);
     let hotkey_height = hotkey_lines.len() as u16;
+    let has_proxy_bar = app.proxy.is_some() || app.proxy_starting.is_some();
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let constraints: Vec<Constraint> = if has_proxy_bar {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(3),
+            Constraint::Length(hotkey_height),
+        ]
+    } else {
+        vec![
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Min(0),
             Constraint::Length(hotkey_height),
-        ])
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
 
     let hosts = app.filtered_hosts();
@@ -67,15 +80,17 @@ pub fn draw(f: &mut Frame, app: &App) {
         ),
         if let Some(proxy) = &app.proxy {
             Span::styled(
-                format!(
-                    " · Proxy: {}",
-                    app.hosts
-                        .iter()
-                        .find(|h| h.id == proxy.host_id)
-                        .map(|h| h.name.as_str())
-                        .unwrap_or("host")
-                ),
-                Style::default().fg(Color::Green),
+                format!(" · ● Proxy: {}", proxy.summary.host_name),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if let Some(starting) = &app.proxy_starting {
+            Span::styled(
+                format!(" · ◌ Proxy starting: {}…", starting.summary.host_name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             Span::raw("")
@@ -133,11 +148,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
 
     // Server table
-    let header = Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "TAGS", "DESCRIPTION"]).style(
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
+    let show_proxy_col = has_proxy_bar
+        || hosts
+            .iter()
+            .any(|h| crate::tui::proxy_screen::has_proxy_config(h));
 
     // Tags column sized to content (capped) so tags aren't cut while space remains
     let tags_width = hosts
@@ -147,18 +161,44 @@ pub fn draw(f: &mut Frame, app: &App) {
         .unwrap_or(0)
         .clamp(4, 28);
 
+    let header = if show_proxy_col {
+        Row::new(vec![
+            "NAME",
+            "GROUP",
+            "HOST",
+            "PORT",
+            "PROXY",
+            "TAGS",
+            "DESCRIPTION",
+        ])
+    } else {
+        Row::new(vec!["NAME", "GROUP", "HOST", "PORT", "TAGS", "DESCRIPTION"])
+    }
+    .style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
     let rows: Vec<Row> = hosts
         .iter()
         .map(|h| {
-            Row::new(vec![
+            let mut cells = vec![
                 Cell::from(h.name.clone()),
                 Cell::from(h.group.clone()).style(Style::default().fg(group_color(&h.group))),
                 Cell::from(h.ip.clone()).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(h.port.to_string()).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(fit_tags(&h.tags, tags_width)).style(Style::default().fg(Color::Cyan)),
+            ];
+            if show_proxy_col {
+                let (badge, style) = host_proxy_cell(app, h);
+                cells.push(Cell::from(badge).style(style));
+            }
+            cells.push(Cell::from(fit_tags(&h.tags, tags_width)).style(Style::default().fg(Color::Cyan)));
+            cells.push(
                 Cell::from(h.description.clone().unwrap_or_default())
                     .style(Style::default().fg(Color::DarkGray)),
-            ])
+            );
+            Row::new(cells)
         })
         .collect();
 
@@ -169,20 +209,31 @@ pub fn draw(f: &mut Frame, app: &App) {
         Some(selected)
     });
 
-    let table = Table::new(
-        rows,
-        [
+    let col_widths: Vec<Constraint> = if show_proxy_col {
+        vec![
+            Constraint::Length(20),
+            Constraint::Length(14),
+            Constraint::Length(17),
+            Constraint::Length(6),
+            Constraint::Length(16),
+            Constraint::Length(tags_width as u16),
+            Constraint::Min(8),
+        ]
+    } else {
+        vec![
             Constraint::Length(22),
             Constraint::Length(16),
             Constraint::Length(18),
             Constraint::Length(6),
             Constraint::Length(tags_width as u16),
             Constraint::Min(10),
-        ],
-    )
-    .header(header)
-    .row_highlight_style(Style::default().bg(Color::Rgb(31, 41, 55)))
-    .highlight_symbol("▶ ");
+        ]
+    };
+
+    let table = Table::new(rows, col_widths)
+        .header(header)
+        .row_highlight_style(Style::default().bg(Color::Rgb(31, 41, 55)))
+        .highlight_symbol("▶ ");
 
     if hosts.is_empty() {
         let hint = if app.search_query.is_empty() {
@@ -199,8 +250,136 @@ pub fn draw(f: &mut Frame, app: &App) {
         f.render_stateful_widget(table, chunks[2], &mut state);
     }
 
-    // Hotkey bar
-    f.render_widget(Paragraph::new(hotkey_lines), chunks[3]);
+    if has_proxy_bar {
+        draw_proxy_bar(f, app, chunks[3]);
+        f.render_widget(Paragraph::new(hotkey_lines), chunks[4]);
+    } else {
+        f.render_widget(Paragraph::new(hotkey_lines), chunks[3]);
+    }
+}
+
+fn compact_proxy_ports(h: &crate::types::Host) -> String {
+    let mut parts = Vec::new();
+    if let Some(s) = h.socks_port {
+        parts.push(format!("S:{s}"));
+    }
+    if let Some(p) = h.http_proxy_port {
+        parts.push(format!("H:{p}"));
+    }
+    if let Some(first) = h.port_forwards.first() {
+        let local = first.split_once(':').map(|(l, _)| l).unwrap_or(first);
+        if h.port_forwards.len() > 1 {
+            parts.push(format!("L:{local}+{}", h.port_forwards.len() - 1));
+        } else {
+            parts.push(format!("L:{local}"));
+        }
+    }
+    parts.join(" ")
+}
+
+fn host_proxy_cell(app: &App, h: &crate::types::Host) -> (String, Style) {
+    let summary = compact_proxy_ports(h);
+    if app.proxy.as_ref().is_some_and(|p| p.host_id == h.id) {
+        (
+            format!("● {summary}"),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if app
+        .proxy_starting
+        .as_ref()
+        .is_some_and(|s| s.summary.host_id == h.id)
+    {
+        (
+            format!("◌ {summary}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if !summary.is_empty() {
+        (summary, Style::default().fg(Color::DarkGray))
+    } else {
+        (String::new(), Style::default().fg(Color::DarkGray))
+    }
+}
+
+fn draw_proxy_bar(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    if let Some(ref proxy) = app.proxy {
+        let up = proxy.started_at.elapsed().as_secs();
+        let mut spans = vec![
+            Span::styled(
+                " ● ACTIVE ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                proxy.summary.host_name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({}m{:02}s)  ", up / 60, up % 60),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                proxy.summary.short_endpoints(),
+                Style::default().fg(Color::Cyan),
+            ),
+        ];
+        if let Some(metrics) = proxy.http_metrics() {
+            spans.push(Span::styled(
+                format!(
+                    "  [HTTP {} reqs, {} active]",
+                    metrics.total_requests, metrics.active_conns
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        spans.push(Span::styled(
+            "   [X] manage/stop",
+            Style::default().fg(Color::Blue),
+        ));
+        let bar = Paragraph::new(Line::from(spans)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        );
+        f.render_widget(bar, area);
+    } else if let Some(ref starting) = app.proxy_starting {
+        let elapsed = starting.started_at.elapsed().as_secs();
+        let spans = vec![
+            Span::styled(
+                " ◌ STARTING ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                starting.summary.host_name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({elapsed}s)  "),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                starting.summary.short_endpoints(),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled("   [X] details/cancel", Style::default().fg(Color::Blue)),
+        ];
+        let bar = Paragraph::new(Line::from(spans)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        f.render_widget(bar, area);
+    }
 }
 
 /// Join tags into terminal `width` columns; when they don't fit, show whole tags
@@ -366,8 +545,8 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Char('x') | KeyCode::Char('X') if !app.search_focused && hosts_len > 0 => {
             if let Some(idx) = get_host_idx_in_all(app) {
-                let host = app.hosts[idx].clone();
-                crate::tui::toggle_proxy(app, &host)?;
+                app.proxy_log_scroll = 0;
+                app.screen = Screen::Proxy { host_idx: idx };
             }
         }
         KeyCode::Char('n') | KeyCode::Char('N') if !app.search_focused => {
@@ -383,6 +562,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 ..Default::default()
             });
             app.host_form_from_audit = false;
+            app.host_form_return_to_proxy = None;
             app.screen = Screen::HostForm;
         }
         KeyCode::Char('e') | KeyCode::Char('E') if !app.search_focused && hosts_len > 0 => {
@@ -390,6 +570,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 let h = &app.hosts[idx];
                 app.host_form = Some(crate::types::HostForm::from_host(h));
                 app.host_form_from_audit = false;
+                app.host_form_return_to_proxy = None;
                 app.screen = Screen::HostForm;
             }
         }

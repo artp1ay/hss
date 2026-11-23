@@ -581,6 +581,14 @@ fn ssh_command(
         args.extend([
             "-N".into(),
             "-o".into(),
+            "NumberOfPasswordPrompts=1".into(),
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "ControlPath=none".into(),
+            "-o".into(),
+            "ClearAllForwardings=no".into(),
+            "-o".into(),
             "ServerAliveInterval=15".into(),
             "-o".into(),
             "ServerAliveCountMax=2".into(),
@@ -600,7 +608,7 @@ pub fn spawn_proxy(
     cfg: &AppConfig,
     jump: Option<&str>,
 ) -> Result<(std::process::Child, Option<AskpassGuard>)> {
-    spawn_proxy_internal(host, cred, cfg, jump.map(JumpInput::Raw))
+    spawn_proxy_internal(host, cred, cfg, jump.map(JumpInput::Raw), host.socks_port)
 }
 
 pub fn spawn_proxy_with_jump_auth(
@@ -609,7 +617,23 @@ pub fn spawn_proxy_with_jump_auth(
     cfg: &AppConfig,
     jump: Option<&JumpAuth>,
 ) -> Result<(std::process::Child, Option<AskpassGuard>)> {
-    spawn_proxy_internal(host, cred, cfg, jump.map(JumpInput::Auth))
+    spawn_proxy_internal(host, cred, cfg, jump.map(JumpInput::Auth), host.socks_port)
+}
+
+pub fn spawn_proxy_with_options(
+    host: &Host,
+    cred: &Credential,
+    cfg: &AppConfig,
+    jump: Option<&JumpAuth>,
+    socks_port_override: Option<u16>,
+) -> Result<(std::process::Child, Option<AskpassGuard>)> {
+    spawn_proxy_internal(
+        host,
+        cred,
+        cfg,
+        jump.map(JumpInput::Auth),
+        socks_port_override.or(host.socks_port),
+    )
 }
 
 fn spawn_proxy_internal(
@@ -617,10 +641,11 @@ fn spawn_proxy_internal(
     cred: &Credential,
     cfg: &AppConfig,
     jump: Option<JumpInput<'_>>,
+    effective_socks_port: Option<u16>,
 ) -> Result<(std::process::Child, Option<AskpassGuard>)> {
     anyhow::ensure!(
-        !host.port_forwards.is_empty() || host.socks_port.is_some(),
-        "Configure forwards or a SOCKS port in the host card first"
+        !host.port_forwards.is_empty() || effective_socks_port.is_some(),
+        "Configure forwards, a SOCKS port, or an HTTP proxy port in the host card first"
     );
     let (mut cmd, askpass) = ssh_command(
         &host.ip,
@@ -630,7 +655,7 @@ fn spawn_proxy_internal(
         cfg,
         jump,
         &host.port_forwards,
-        host.socks_port,
+        effective_socks_port,
         true,
     )?;
     cmd.stdin(std::process::Stdio::null())
@@ -2096,5 +2121,39 @@ mod tests {
     fn shell_single_quote_escapes_embedded_quotes() {
         assert_eq!(shell_single_quote("/tmp/foo"), "'/tmp/foo'");
         assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn ssh_command_proxy_mode_disables_control_master_and_keeps_forwards() {
+        let cred = key_cred("k");
+        let cfg = AppConfig::default();
+        let (cmd, _guard) = ssh_command(
+            "10.0.0.10",
+            22,
+            None,
+            &cred,
+            &cfg,
+            None,
+            &["15432:5432".into()],
+            Some(1080),
+            true,
+        )
+        .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "-N",
+            "ControlMaster=no",
+            "ControlPath=none",
+            "ClearAllForwardings=no",
+            "NumberOfPasswordPrompts=1",
+            "ExitOnForwardFailure=yes",
+            "127.0.0.1:15432:127.0.0.1:5432",
+            "127.0.0.1:1080",
+        ] {
+            assert!(args.iter().any(|a| a == expected), "missing {expected}");
+        }
     }
 }

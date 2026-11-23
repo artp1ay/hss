@@ -354,7 +354,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         );
     } else if form.page == 1 {
         f.render_widget(
-            Paragraph::new("Forwards: local:remote, comma-separated; HTTP supports HTTPS CONNECT"),
+            Paragraph::new("Forwards: local:remote (15432:5432); HTTP works with or without SOCKS"),
             rows[2],
         );
     }
@@ -461,11 +461,13 @@ pub fn draw_import(f: &mut Frame, app: &App) {
 
 pub fn cancel(app: &mut App) {
     app.host_form = None;
-    app.screen = if app.host_form_from_audit {
-        Screen::Audit
+    if let Some(host_idx) = app.host_form_return_to_proxy.take() {
+        app.screen = Screen::Proxy { host_idx };
+    } else if app.host_form_from_audit {
+        app.screen = Screen::Audit;
     } else {
-        Screen::Main
-    };
+        app.screen = Screen::Main;
+    }
     app.host_form_from_audit = false;
 }
 
@@ -941,15 +943,14 @@ fn save_host(app: &mut App) -> Result<()> {
         }
     };
     if let Some(port) = http_proxy_port {
-        if socks_port.is_none()
-            || socks_port == Some(port)
+        if socks_port == Some(port)
             || port_forwards
                 .iter()
                 .any(|f| f.split_once(':').and_then(|(p, _)| p.parse::<u16>().ok()) == Some(port))
         {
             set_error(
                 app,
-                "HTTP proxy requires a different SOCKS port and no conflicting forward.".into(),
+                "HTTP proxy port must differ from SOCKS port and local forwards.".into(),
                 10,
             );
             return Ok(());
@@ -1072,11 +1073,13 @@ fn save_host(app: &mut App) -> Result<()> {
         }
     }
     app.host_form = None;
-    app.screen = if app.host_form_from_audit {
-        Screen::Audit
+    if let Some(host_idx) = app.host_form_return_to_proxy.take() {
+        app.screen = Screen::Proxy { host_idx };
+    } else if app.host_form_from_audit {
+        app.screen = Screen::Audit;
     } else {
-        Screen::Main
-    };
+        app.screen = Screen::Main;
+    }
     app.host_form_from_audit = false;
     Ok(())
 }
