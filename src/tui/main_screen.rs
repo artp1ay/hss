@@ -193,7 +193,9 @@ pub fn draw(f: &mut Frame, app: &App) {
                 let (badge, style) = host_proxy_cell(app, h);
                 cells.push(Cell::from(badge).style(style));
             }
-            cells.push(Cell::from(fit_tags(&h.tags, tags_width)).style(Style::default().fg(Color::Cyan)));
+            cells.push(
+                Cell::from(fit_tags(&h.tags, tags_width)).style(Style::default().fg(Color::Cyan)),
+            );
             cells.push(
                 Cell::from(h.description.clone().unwrap_or_default())
                     .style(Style::default().fg(Color::DarkGray)),

@@ -11,9 +11,7 @@ use ratatui::{
 };
 
 pub fn has_proxy_config(host: &Host) -> bool {
-    host.socks_port.is_some()
-        || host.http_proxy_port.is_some()
-        || !host.port_forwards.is_empty()
+    host.socks_port.is_some() || host.http_proxy_port.is_some() || !host.port_forwards.is_empty()
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -263,12 +261,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .unwrap_or(http_port);
             let metrics_suffix = active_here
                 .and_then(crate::tui::ProxySession::http_metrics)
-                .map(|m| {
-                    format!(
-                        "  ({} reqs, {} active)",
-                        m.total_requests, m.active_conns
-                    )
-                })
+                .map(|m| format!("  ({} reqs, {} active)", m.total_requests, m.active_conns))
                 .unwrap_or_default();
             ep_lines.push(Line::from(vec![
                 Span::styled("HTTP / HTTPS   : ", Style::default().fg(Color::DarkGray)),
@@ -448,7 +441,11 @@ pub fn handle_key(
     };
 
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('x') | KeyCode::Char('X') => {
+        KeyCode::Esc
+        | KeyCode::Char('q')
+        | KeyCode::Char('Q')
+        | KeyCode::Char('x')
+        | KeyCode::Char('X') => {
             app.screen = Screen::Main;
         }
         KeyCode::Enter | KeyCode::Char(' ') => {

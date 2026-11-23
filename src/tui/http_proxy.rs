@@ -76,11 +76,10 @@ impl HttpProxy {
                     if stopped_bg.load(Ordering::SeqCst) {
                         break;
                     }
-                    let reserved = ACTIVE_PROXY_CONNS.try_update(
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                        |cur| (cur < MAX_ACTIVE_CONNS).then_some(cur + 1),
-                    );
+                    let reserved =
+                        ACTIVE_PROXY_CONNS.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                            (cur < MAX_ACTIVE_CONNS).then_some(cur + 1)
+                        });
                     if reserved.is_err() {
                         let _ = stream.write_all(
                             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

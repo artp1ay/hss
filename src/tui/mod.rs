@@ -629,10 +629,7 @@ impl App {
             if Instant::now() >= starting.deadline {
                 let (lines, detail) = read_stderr_summary(&starting.log);
                 let err_msg = match detail {
-                    Some(d) => format!(
-                        "Timed out waiting for port {} — {d}",
-                        starting.check_port
-                    ),
+                    Some(d) => format!("Timed out waiting for port {} — {d}", starting.check_port),
                     None => format!(
                         "Timed out waiting for SSH proxy on 127.0.0.1:{}",
                         starting.check_port

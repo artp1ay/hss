@@ -1,0 +1,43 @@
+name: Auto-format main
+
+# Commits land on GitHub from an agent that often forgets cargo fmt. Apply it
+# here so style alone never breaks CI or a release.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: autofmt-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  fmt:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --all
+
+      - name: Commit formatting changes
+        run: |
+          if git diff --quiet; then
+            echo "Already formatted"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style: auto-format main"
+          git pull --rebase origin main
+          git push origin main

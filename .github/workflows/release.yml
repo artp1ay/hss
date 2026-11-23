@@ -34,8 +34,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.7.3
 
-      - name: Format check
-        run: cargo fmt --all -- --check
+      # A tag can be pushed before autofmt lands: format in the checkout so
+      # the release still builds. CI on main keeps enforcing the check.
+      - name: Normalize formatting
+        run: cargo fmt --all
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
