@@ -9,21 +9,42 @@ on:
         description: "Release tag (e.g. v1.0.0)"
         required: true
 
+concurrency:
+  group: gitea-release-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: false
+
 jobs:
   quality:
+    name: quality gate (advisory)
+    continue-on-error: true
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2.7.3
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features --locked -- --nocapture
+        with:
+          key: gitea-release-quality
+      - run: cargo fmt --all
+      - name: Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCK_ARGS=()
+          [[ -f Cargo.lock ]] && LOCK_ARGS=(--locked)
+          cargo clippy --workspace --all-targets --all-features "${LOCK_ARGS[@]}" -- -D warnings
+      - name: Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCK_ARGS=()
+          [[ -f Cargo.lock ]] && LOCK_ARGS=(--locked)
+          RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features "${LOCK_ARGS[@]}" -- --nocapture
 
   build:
-    needs: quality
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -42,38 +63,84 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2.7.3
         with:
-          key: ${{ matrix.target }}
+          key: gitea-release-${{ matrix.target }}
 
       - name: Resolve target version
         shell: bash
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          RAW_TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          VERSION="${RAW_TAG#v}"
-          if [[ -n "$VERSION" ]]; then
-            SEMVER=$(echo "$VERSION" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
-            sed -i.bak -E "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
-            rm -f Cargo.toml.bak
-          fi
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          raw = os.environ.get("RAW_TAG", "").strip()
+          ver = raw.lstrip("v")
+          if not ver:
+              raise SystemExit(0)
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", ver):
+              raise SystemExit(f"Invalid release version derived from tag: {raw!r}")
+
+          cargo_toml = Path("Cargo.toml")
+          lines = cargo_toml.read_text(encoding="utf-8").splitlines(keepends=True)
+          in_pkg = False
+          updated = False
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("["):
+                  in_pkg = stripped == "[package]"
+              elif in_pkg and re.match(r'^version\s*=\s*"[^"]*"', stripped):
+                  lines[i] = f'version = "{ver}"\n'
+                  updated = True
+                  break
+          if not updated:
+              raise SystemExit("Could not locate [package] version in Cargo.toml")
+          cargo_toml.write_text("".join(lines), encoding="utf-8")
+          PY
+
       - name: Install build tools
         if: matrix.cross == false
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends musl-tools
+
       - name: Install cross
         if: matrix.cross == true
         uses: taiki-e/install-action@v2
         with:
           tool: cross
+
       - name: Build
         shell: bash
+        env:
+          USE_CROSS: ${{ matrix.cross }}
+          TARGET: ${{ matrix.target }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }}
+          set -euo pipefail
+          if [[ "$USE_CROSS" == "true" ]]; then
+            cross build --release --target "$TARGET"
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release --target "$TARGET"
           fi
-      - name: Stage artifact
-        run: cp target/${{ matrix.target }}/release/hss ${{ matrix.artifact }}
+
+      - name: Stage and verify artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          USE_CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          cp "target/${TARGET}/release/hss" "$ARTIFACT"
+          chmod +x "$ARTIFACT"
+          if [[ "$USE_CROSS" != "true" ]]; then
+            "./${ARTIFACT}" --version
+          fi
+
       - uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.artifact }}
@@ -83,6 +150,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -98,23 +166,54 @@ jobs:
           cd release-assets
           sha256sum hss-linux-x86_64 hss-linux-aarch64 > SHA256SUMS
           sha256sum --check SHA256SUMS
-      - name: Create release and upload assets
+      - name: Create or update release and upload assets
         shell: bash
         env:
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASES_URL: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases
         run: |
           set -euo pipefail
+          TAG="v${RAW_TAG#v}"
           cd release-assets
-          PAYLOAD=$(python3 -c 'import json, os; tag = os.environ["TAG"]; print(json.dumps({"tag_name": tag, "name": tag, "body": "Release " + tag}))')
-          RELEASE_ID=$(curl -fsS -X POST \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            "$RELEASES_URL" \
-            -d "$PAYLOAD" \
-            | python3 -c 'import sys, json; release_id = json.load(sys.stdin)["id"]; assert type(release_id) is int and release_id > 0; print(release_id)')
+
+          # Reuse existing release for this tag if re-running; otherwise create it
+          EXISTING=$(curl -sS -H "Authorization: token ${TOKEN}" "${RELEASES_URL}/tags/${TAG}" || true)
+          RELEASE_ID=$(printf '%s' "$EXISTING" | python3 -c '
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              rid = data.get("id")
+              if isinstance(rid, int) and rid > 0:
+                  print(rid)
+          except Exception:
+              pass
+          ')
+
+          if [[ -z "$RELEASE_ID" ]]; then
+            PAYLOAD=$(TAG="$TAG" python3 -c 'import json, os; tag = os.environ["TAG"]; print(json.dumps({"tag_name": tag, "name": tag, "body": "Release " + tag}))')
+            RELEASE_ID=$(curl -fsS -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              "$RELEASES_URL" \
+              -d "$PAYLOAD" \
+              | python3 -c 'import sys, json; release_id = json.load(sys.stdin)["id"]; assert type(release_id) is int and release_id > 0; print(release_id)')
+          fi
+
+          # Delete existing assets with matching names so re-uploads succeed idempotently
+          ASSETS_JSON=$(curl -fsS -H "Authorization: token ${TOKEN}" "${RELEASES_URL}/${RELEASE_ID}/assets")
           for f in hss-linux-x86_64 hss-linux-aarch64 SHA256SUMS; do
+            OLD_ID=$(ASSET_NAME="$f" printf '%s' "$ASSETS_JSON" | python3 -c '
+          import sys, json, os
+          name = os.environ["ASSET_NAME"]
+          for a in json.load(sys.stdin):
+              if a.get("name") == name:
+                  print(a["id"])
+                  break
+          ')
+            if [[ -n "$OLD_ID" ]]; then
+              curl -fsS -X DELETE -H "Authorization: token ${TOKEN}" "${RELEASES_URL}/${RELEASE_ID}/assets/${OLD_ID}"
+            fi
             curl -fsS -X POST \
               -H "Authorization: token ${TOKEN}" \
               "${RELEASES_URL}/${RELEASE_ID}/assets?name=${f}" \

@@ -1413,13 +1413,23 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::Credentials => credentials_screen::draw(f, app),
         Screen::Settings => settings_screen::draw(f, app),
         Screen::Audit => audit_screen::draw(f, app),
-        Screen::CredentialPicker { .. } => {
-            main_screen::draw(f, app);
+        Screen::CredentialPicker {
+            host_idx,
+            return_to_proxy,
+            ..
+        } => {
+            if *return_to_proxy {
+                proxy_screen::draw_for_host(f, app, *host_idx);
+            } else {
+                main_screen::draw(f, app);
+            }
             popup::draw(f, app);
         }
         Screen::HostForm => {
             if app.host_form_from_audit {
                 audit_screen::draw(f, app);
+            } else if let Some(host_idx) = app.host_form_return_to_proxy {
+                proxy_screen::draw_for_host(f, app, host_idx);
             } else {
                 main_screen::draw(f, app);
             }
@@ -1434,10 +1444,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             main_screen::draw(f, app);
             copy_id::draw(f, app);
         }
-        Screen::Proxy { .. } => {
-            main_screen::draw(f, app);
-            proxy_screen::draw(f, app);
-        }
+        Screen::Proxy { .. } => proxy_screen::draw(f, app),
     }
     // Delete confirmation popup renders on top of any screen
     if app.delete_popup.is_some() {

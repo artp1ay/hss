@@ -14,7 +14,7 @@ on:
         type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event.inputs.tag || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -27,6 +27,7 @@ jobs:
     # Advisory only: a failing lint/test must never block publishing a release.
     continue-on-error: true
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -35,41 +36,58 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          key: release-quality
 
       # A tag can be pushed before autofmt lands: format in the checkout so
-      # the release still builds. CI on main keeps enforcing the check.
+      # clippy and tests still run cleanly.
       - name: Normalize formatting
         run: cargo fmt --all
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCK_ARGS=()
+          [[ -f Cargo.lock ]] && LOCK_ARGS=(--locked)
+          cargo clippy --workspace --all-targets --all-features "${LOCK_ARGS[@]}" -- -D warnings
 
       - name: Tests
-        run: RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features --locked -- --nocapture
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCK_ARGS=()
+          [[ -f Cargo.lock ]] && LOCK_ARGS=(--locked)
+          RUST_TEST_THREADS=1 cargo test --workspace --all-targets --all-features "${LOCK_ARGS[@]}" -- --nocapture
 
   # Generate shell completions and man pages
   generate-assets:
     if: github.server_url == 'https://github.com'
     name: generate shell completions & man pages
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2.7.3
+        with:
+          key: release-assets
 
       - name: Generate assets
         run: cargo run --features generate-assets --bin generate-assets -- dist-assets
 
       - name: Package completions & man page
         run: |
+          set -euo pipefail
           tar -czf hss-completions.tar.gz -C dist-assets/completions .
           tar -czf hss-man.tar.gz -C dist-assets/man .
 
       - uses: actions/upload-artifact@v4
         with:
           name: hss-extra-assets
+          if-no-files-found: error
           path: |
             hss-completions.tar.gz
             hss-man.tar.gz
@@ -78,6 +96,7 @@ jobs:
   build:
     if: github.server_url == 'https://github.com'
     name: build ${{ matrix.artifact }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -85,22 +104,26 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: hss-linux-x86_64
-            cross: false
+            linux_musl: true
+            native_smoke_test: true
 
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             artifact: hss-linux-aarch64
-            cross: true
+            linux_musl: true
+            native_smoke_test: true
 
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: hss-macos-x86_64
-            cross: false
+            linux_musl: false
+            native_smoke_test: false
 
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: hss-macos-aarch64
-            cross: false
+            linux_musl: false
+            native_smoke_test: true
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -112,52 +135,90 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.7.3
         with:
-          key: ${{ matrix.target }}
+          key: release-${{ matrix.target }}
 
       - name: Resolve target version
         shell: bash
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          RAW_TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          VERSION="${RAW_TAG#v}"
-          if [[ -n "$VERSION" ]]; then
-            SEMVER=$(echo "$VERSION" | awk -F. '{printf "%d.%d.%d", $1, $2, $3}')
-            sed -i.bak -E "s/^version = \".*\"/version = \"$SEMVER\"/" Cargo.toml
-            rm -f Cargo.toml.bak
-          fi
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
 
-      - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-latest'
+          raw = os.environ.get("RAW_TAG", "").strip()
+          ver = raw.lstrip("v")
+          if not ver:
+              raise SystemExit(0)
+          if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", ver):
+              raise SystemExit(f"Invalid release version derived from tag: {raw!r}")
+
+          cargo_toml = Path("Cargo.toml")
+          lines = cargo_toml.read_text(encoding="utf-8").splitlines(keepends=True)
+          in_pkg = False
+          updated = False
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("["):
+                  in_pkg = stripped == "[package]"
+              elif in_pkg and re.match(r'^version\s*=\s*"[^"]*"', stripped):
+                  lines[i] = f'version = "{ver}"\n'
+                  updated = True
+                  break
+          if not updated:
+              raise SystemExit("Could not locate [package] version in Cargo.toml")
+          cargo_toml.write_text("".join(lines), encoding="utf-8")
+          print(f"Updated Cargo.toml [package] version to {ver}")
+          PY
+
+      - name: Install Linux musl build tools
+        if: matrix.linux_musl == true
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install cross
-        if: matrix.cross == true
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends musl-tools
+          command -v musl-gcc
 
       - name: Build binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+          set -euo pipefail
+          cargo build --release --target "$TARGET"
 
-      - name: Stage binary artifact
-        run: cp target/${{ matrix.target }}/release/hss ${{ matrix.artifact }}
+      - name: Stage and verify binary artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+          NATIVE_SMOKE_TEST: ${{ matrix.native_smoke_test }}
+        run: |
+          set -euo pipefail
+          cp "target/${TARGET}/release/hss" "$ARTIFACT"
+          chmod +x "$ARTIFACT"
+          ls -lh "$ARTIFACT"
+          if [[ "$NATIVE_SMOKE_TEST" == "true" ]]; then
+            "./${ARTIFACT}" --version
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+          if-no-files-found: error
 
   publish:
     if: github.server_url == 'https://github.com'
     name: publish release
     needs: [build, generate-assets]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -166,14 +227,16 @@ jobs:
       - name: Prepare release metadata
         id: meta
         shell: bash
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          INPUT_NOTES: ${{ github.event.inputs.release_notes }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          TAG="v${RAW_TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-          if [[ -n "${{ github.event.inputs.release_notes }}" ]]; then
-            cat << 'EOF' > NOTES.md
-          ${{ github.event.inputs.release_notes }}
-          EOF
+          if [[ -n "$INPUT_NOTES" ]]; then
+            printf '%s\n' "$INPUT_NOTES" > NOTES.md
           else
             git fetch --force origin "+refs/tags/*:refs/tags/*" 2>/dev/null || true
             TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG" 2>/dev/null | sed '/^$/d' || true)
@@ -191,12 +254,20 @@ jobs:
             fi
           fi
 
+          if [[ ! -s NOTES.md ]]; then
+            echo "Release ${TAG}" > NOTES.md
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
 
       - name: Package release archives, assets, and checksums
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
+          set -euo pipefail
           mkdir -p release-assets
 
           # Copy standalone binaries (for direct download and hss --update / install.sh)
@@ -209,28 +280,40 @@ jobs:
           cp dist/hss-extra-assets/hss-completions.tar.gz release-assets/
           cp dist/hss-extra-assets/hss-man.tar.gz release-assets/
 
-          TAG="${{ steps.meta.outputs.tag }}"
-
           # Create distribution tarballs including README, LICENSE, completions, and man page
           for target in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
             pkg_dir="hss-${TAG}-${target}"
             mkdir -p "$pkg_dir"
             cp "release-assets/hss-${target}" "${pkg_dir}/hss"
             cp README.md LICENSE "${pkg_dir}/"
-            if [ -d "dist/hss-extra-assets/dist-assets/completions" ]; then
+            if [[ -d "dist/hss-extra-assets/dist-assets/completions" ]]; then
               cp -r dist/hss-extra-assets/dist-assets/completions "${pkg_dir}/"
             fi
-            if [ -d "dist/hss-extra-assets/dist-assets/man" ]; then
+            if [[ -d "dist/hss-extra-assets/dist-assets/man" ]]; then
               cp -r dist/hss-extra-assets/dist-assets/man "${pkg_dir}/"
             fi
             tar -czf "release-assets/${pkg_dir}.tar.gz" "$pkg_dir"
             rm -rf "$pkg_dir"
           done
 
-          cd release-assets
-          sha256sum * > SHA256SUMS
-          md5sum * > MD5SUMS 2>/dev/null || true
-          cd ..
+          (
+            cd release-assets
+            ARTIFACTS=(
+              hss-linux-x86_64
+              hss-linux-aarch64
+              hss-macos-x86_64
+              hss-macos-aarch64
+              hss-completions.tar.gz
+              hss-man.tar.gz
+              "hss-${TAG}-linux-x86_64.tar.gz"
+              "hss-${TAG}-linux-aarch64.tar.gz"
+              "hss-${TAG}-macos-x86_64.tar.gz"
+              "hss-${TAG}-macos-aarch64.tar.gz"
+            )
+            sha256sum "${ARTIFACTS[@]}" > SHA256SUMS
+            sha256sum --check SHA256SUMS
+            md5sum "${ARTIFACTS[@]}" > MD5SUMS
+          )
 
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2

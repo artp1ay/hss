@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -18,12 +18,13 @@ pub fn draw(f: &mut Frame, app: &App) {
     let Screen::Proxy { host_idx } = &app.screen else {
         return;
     };
-    let Some(host) = app.hosts.get(*host_idx) else {
+    draw_for_host(f, app, *host_idx);
+}
+
+pub fn draw_for_host(f: &mut Frame, app: &App, host_idx: usize) {
+    let Some(host) = app.hosts.get(host_idx) else {
         return;
     };
-
-    let area = crate::tui::adaptive_centered_rect(78, 84, 72, 18, f.area());
-    f.render_widget(Clear, area);
 
     let active_here = app.proxy.as_ref().filter(|p| p.host_id == host.id);
     let starting_here = app
@@ -46,52 +47,64 @@ pub fn draw(f: &mut Frame, app: &App) {
                 .map(|s| s.summary.host_name.as_str())
         });
 
+    let configured = has_proxy_config(host);
+
+    // Prepare hotkeys first so bottom bar height adapts cleanly to terminal width
+    let primary_label = if active_here.is_some() {
+        "stop"
+    } else if starting_here.is_some() {
+        "cancel"
+    } else if active_elsewhere.is_some() {
+        "switch here"
+    } else {
+        "start"
+    };
+    let close_label = if app.proxy.is_some() || app.proxy_starting.is_some() {
+        "back (keeps running)"
+    } else {
+        "back"
+    };
+
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    if configured || active_here.is_some() || starting_here.is_some() {
+        pairs.push(("Enter/Space", primary_label));
+    }
+    if active_here.is_some() {
+        pairs.push(("T", "test tunnel"));
+    }
+    if active_elsewhere.is_some() {
+        pairs.push(("S", "stop active"));
+    }
+    pairs.push(("R", "cred"));
+    pairs.push(("E", "ports (F2)"));
+    pairs.push(("C", "clear"));
+    pairs.push(("Esc/Q", close_label));
+
+    let area = f.area();
+    let hotkey_lines = crate::tui::wrap_hotkey_lines(&pairs, area.width);
+    let hotkey_height = hotkey_lines.len().max(1) as u16;
+
+    // Full-screen MCP-style layout: compact 5-row header + large activity log + hotkeys
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(0),
+            Constraint::Length(hotkey_height),
+        ])
+        .split(area);
+
+    // 1. Compact Status & Endpoints Card
     let border_color = if active_here.is_some() {
         Color::Green
     } else if starting_here.is_some() {
         Color::Yellow
     } else if error_here.is_some() {
         Color::Red
-    } else {
+    } else if configured {
         Color::Blue
-    };
-
-    let block = Block::default()
-        .title(format!(" Proxy & Tunnels — {} ", host.name))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5), // status & connection info
-            Constraint::Length(8), // endpoints & usage
-            Constraint::Min(4),    // SSH / proxy diagnostics log
-            Constraint::Length(1), // hotkeys
-        ])
-        .split(inner);
-
-    // 1. Status & connection metadata
-    let (status_badge, status_color, status_detail) = if let Some(proxy) = active_here {
-        let up = proxy.started_at.elapsed().as_secs();
-        (
-            "● ACTIVE",
-            Color::Green,
-            format!("up {}m{:02}s", up / 60, up % 60),
-        )
-    } else if let Some(starting) = starting_here {
-        let elapsed = starting.started_at.elapsed().as_secs();
-        (
-            "◌ STARTING…",
-            Color::Yellow,
-            format!("connecting ({elapsed}s)"),
-        )
-    } else if let Some(err) = error_here {
-        ("✗ FAILED", Color::Red, err.message.clone())
     } else {
-        ("○ STOPPED", Color::DarkGray, "not running".into())
+        Color::DarkGray
     };
 
     let record = app.record_for(&host.id);
@@ -104,7 +117,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     .ok()
     .flatten()
     .map(|c| format!("{} ({})", c.name, c.username))
-    .unwrap_or_else(|| "none — press [R] on main list".into());
+    .unwrap_or_else(|| "none ([R] to pick)".into());
 
     let jump_text = host
         .jump_host_id
@@ -120,94 +133,115 @@ pub fn draw(f: &mut Frame, app: &App) {
             .ok()
             .flatten()
             .and_then(|ja| ja.cred)
-            .map(|c| format!(" · cred {}", c.name))
+            .map(|c| format!(" ({})", c.name))
             .unwrap_or_default();
-            format!("{} ({}){jc}", jh.name, jh.ip)
+            format!("{}{jc}", jh.name)
         });
 
-    let mut status_lines = vec![
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                status_badge,
-                Style::default()
-                    .fg(status_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {status_detail}"),
-                Style::default().fg(if error_here.is_some() {
-                    Color::Red
-                } else {
-                    Color::Gray
-                }),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Target: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}:{}", host.ip, host.port),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled("   Cred: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(resolved_cred, Style::default().fg(Color::Cyan)),
-        ]),
-    ];
-
-    if let Some(jump_desc) = jump_text {
-        status_lines.push(Line::from(vec![
-            Span::styled("Jump:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(jump_desc, Style::default().fg(Color::Yellow)),
-        ]));
-    } else if let Some(other) = active_elsewhere {
-        status_lines.push(Line::from(vec![
-            Span::styled("Notice: ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!(
-                    "Proxy currently running on '{other}' — [Enter] switches here, [S] stops it"
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-        ]));
-    } else {
-        status_lines.push(Line::from(Span::styled(
-            "Listeners bind 127.0.0.1 only and stay alive while hss is open.",
+    // Row 1: State badge + target + uptime/error + auth + jump
+    let mut row1 = Vec::new();
+    if let Some(proxy) = active_here {
+        let up = proxy.started_at.elapsed().as_secs();
+        row1.push(Span::styled(
+            "● Active  ",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row1.push(Span::styled(
+            format!("{}:{}", host.ip, host.port),
+            Style::default().fg(Color::White),
+        ));
+        row1.push(Span::styled(
+            format!("  up {}m{:02}s", up / 60, up % 60),
             Style::default().fg(Color::DarkGray),
-        )));
+        ));
+        row1.push(Span::styled("   cred ", Style::default().fg(Color::DarkGray)));
+        row1.push(Span::styled(
+            resolved_cred.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+        if let Some(ref jump) = jump_text {
+            row1.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
+            row1.push(Span::styled(jump.clone(), Style::default().fg(Color::Yellow)));
+        }
+    } else if let Some(starting) = starting_here {
+        let elapsed = starting.started_at.elapsed().as_secs();
+        row1.push(Span::styled(
+            "◌ Starting…  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row1.push(Span::styled(
+            format!("{}:{}", host.ip, host.port),
+            Style::default().fg(Color::White),
+        ));
+        row1.push(Span::styled(
+            format!("  connecting ({elapsed}s)"),
+            Style::default().fg(Color::DarkGray),
+        ));
+        row1.push(Span::styled("   cred ", Style::default().fg(Color::DarkGray)));
+        row1.push(Span::styled(
+            resolved_cred.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+        if let Some(ref jump) = jump_text {
+            row1.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
+            row1.push(Span::styled(jump.clone(), Style::default().fg(Color::Yellow)));
+        }
+    } else if let Some(err) = error_here {
+        row1.push(Span::styled(
+            "✗ Failed  ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        row1.push(Span::styled(
+            format!("{}:{}", host.ip, host.port),
+            Style::default().fg(Color::White),
+        ));
+        row1.push(Span::styled(
+            format!("  {}", err.message),
+            Style::default().fg(Color::Red),
+        ));
+    } else {
+        row1.push(Span::styled(
+            "○ Stopped  ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+        row1.push(Span::styled(
+            format!("{}:{}", host.ip, host.port),
+            Style::default().fg(Color::White),
+        ));
+        row1.push(Span::styled("   cred ", Style::default().fg(Color::DarkGray)));
+        row1.push(Span::styled(
+            resolved_cred.clone(),
+            Style::default().fg(Color::Cyan),
+        ));
+        if let Some(ref jump) = jump_text {
+            row1.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
+            row1.push(Span::styled(jump.clone(), Style::default().fg(Color::Yellow)));
+        }
     }
 
-    if let (Some(_), Some(other)) = (host.jump_host_id.as_deref(), active_elsewhere) {
-        status_lines.push(Line::from(vec![
-            Span::styled("Notice: ", Style::default().fg(Color::Yellow)),
+    // Row 2: Live endpoints & HTTP traffic counters on one dense line
+    let ep_style = if active_here.is_some() {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if starting_here.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    let row2 = if !configured {
+        Line::from(vec![
             Span::styled(
-                format!("Active proxy on '{other}' will be stopped if started here"),
+                "No SOCKS5, HTTP proxy, or port forwards configured — press ",
                 Style::default().fg(Color::Yellow),
             ),
-        ]));
-    }
-
-    f.render_widget(
-        Paragraph::new(status_lines)
-            .block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .wrap(Wrap { trim: true }),
-        chunks[0],
-    );
-
-    // 2. Configured & live endpoints
-    let mut ep_lines: Vec<Line> = Vec::new();
-    let configured = has_proxy_config(host);
-    if !configured {
-        ep_lines.push(Line::from(Span::styled(
-            "No SOCKS5, HTTP proxy, or port forwards configured for this host yet.",
-            Style::default().fg(Color::Yellow),
-        )));
-        ep_lines.push(Line::from(""));
-        ep_lines.push(Line::from(vec![
-            Span::styled("Press ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 "[E]",
                 Style::default()
@@ -215,144 +249,157 @@ pub fn draw(f: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " to open [F2] Ports & Proxy and configure ports.",
+                " to open [F2] Ports & Proxy.",
                 Style::default().fg(Color::White),
             ),
-        ]));
+        ])
     } else {
-        let ep_state_label = if active_here.is_some() {
-            ("listening", Color::Green)
-        } else if starting_here.is_some() {
-            ("starting", Color::Yellow)
-        } else {
-            ("stopped", Color::DarkGray)
+        let mut spans: Vec<Span> = Vec::new();
+        let push_sep = |s: &mut Vec<Span>| {
+            if !s.is_empty() {
+                s.push(Span::styled("   ", Style::default().fg(Color::DarkGray)));
+            }
         };
 
         if let Some(socks_port) = host.socks_port {
-            ep_lines.push(Line::from(vec![
-                Span::styled("SOCKS5 Proxy   : ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("socks5h://127.0.0.1:{socks_port}"),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  [{}]", ep_state_label.0),
-                    Style::default().fg(ep_state_label.1),
-                ),
-            ]));
+            push_sep(&mut spans);
+            spans.push(Span::styled("SOCKS5 ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!("socks5h://127.0.0.1:{socks_port}"),
+                ep_style,
+            ));
         } else if let Some(internal) = active_here
             .and_then(|p| p.summary.internal_socks_port)
             .or_else(|| starting_here.and_then(|s| s.summary.internal_socks_port))
         {
-            ep_lines.push(Line::from(vec![
-                Span::styled("SOCKS5 Backend : ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("127.0.0.1:{internal} (auto internal for HTTP)"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
+            push_sep(&mut spans);
+            spans.push(Span::styled(
+                format!("SOCKS5(int) 127.0.0.1:{internal}"),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         if let Some(http_port) = host.http_proxy_port {
             let actual_port = active_here
                 .and_then(crate::tui::ProxySession::http_bound_port)
                 .unwrap_or(http_port);
-            let metrics_suffix = active_here
-                .and_then(crate::tui::ProxySession::http_metrics)
-                .map(|m| format!("  ({} reqs, {} active)", m.total_requests, m.active_conns))
-                .unwrap_or_default();
-            ep_lines.push(Line::from(vec![
-                Span::styled("HTTP / HTTPS   : ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("http://127.0.0.1:{actual_port}"),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  [{}]", ep_state_label.0),
-                    Style::default().fg(ep_state_label.1),
-                ),
-                Span::styled(metrics_suffix, Style::default().fg(Color::Cyan)),
-            ]));
+            push_sep(&mut spans);
+            spans.push(Span::styled("HTTP ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                format!("http://127.0.0.1:{actual_port}"),
+                ep_style,
+            ));
+            if let Some(metrics) = active_here.and_then(crate::tui::ProxySession::http_metrics) {
+                spans.push(Span::styled("  reqs ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    metrics.total_requests.to_string(),
+                    Style::default().fg(Color::White),
+                ));
+                spans.push(Span::styled(
+                    "  active ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                spans.push(Span::styled(
+                    metrics.active_conns.to_string(),
+                    Style::default().fg(if metrics.active_conns > 0 {
+                        Color::Cyan
+                    } else {
+                        Color::White
+                    }),
+                ));
+            }
         }
 
         if !host.port_forwards.is_empty() {
             let formatted: Vec<String> = host
                 .port_forwards
                 .iter()
-                .map(|f| {
-                    f.split_once(':')
-                        .map(|(l, r)| format!("127.0.0.1:{l} -> remote:{r}"))
-                        .unwrap_or_else(|| f.clone())
+                .map(|fwd| {
+                    fwd.split_once(':')
+                        .map(|(l, r)| format!("127.0.0.1:{l}→{r}"))
+                        .unwrap_or_else(|| fwd.clone())
                 })
                 .collect();
-            ep_lines.push(Line::from(vec![
-                Span::styled("Port Forwards  : ", Style::default().fg(Color::DarkGray)),
-                Span::styled(formatted.join(", "), Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("  [{}]", ep_state_label.0),
-                    Style::default().fg(ep_state_label.1),
-                ),
-            ]));
+            push_sep(&mut spans);
+            spans.push(Span::styled("FWD ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(formatted.join(", "), ep_style));
         }
 
-        // Example usage for all configured proxy types
-        let mut examples = Vec::new();
-        if let Some(socks_port) = host.socks_port {
-            examples.push(format!(
-                "SOCKS5 cmd : curl -x socks5h://127.0.0.1:{socks_port} https://ifconfig.me"
-            ));
+        Line::from(spans)
+    };
+
+    // Row 3: Contextual warning / last error / copyable curl test command
+    let http_err = active_here
+        .and_then(crate::tui::ProxySession::http_metrics)
+        .and_then(|m| m.last_error);
+
+    let row3 = if let Some(other) = active_elsewhere {
+        Line::from(Span::styled(
+            format!("! Active proxy on '{other}' — [Enter] switches here, [S] stops it"),
+            Style::default().fg(Color::Yellow),
+        ))
+    } else if let Some(err) = http_err {
+        Line::from(vec![
+            Span::styled("Last HTTP error: ", Style::default().fg(Color::Yellow)),
+            Span::styled(err, Style::default().fg(Color::Red)),
+        ])
+    } else if error_here.is_some() {
+        let mut spans = vec![
+            Span::styled("Cred: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(resolved_cred, Style::default().fg(Color::Cyan)),
+        ];
+        if let Some(jump) = jump_text {
+            spans.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(jump, Style::default().fg(Color::Yellow)));
         }
-        if let Some(http_port) = host.http_proxy_port {
-            examples.push(format!(
-                "HTTP/S cmd : curl -x http://127.0.0.1:{http_port} https://ifconfig.me"
-            ));
-        }
-        if examples.is_empty() {
-            if let Some(first) = host.port_forwards.first() {
-                let local = first.split_once(':').map(|(l, _)| l).unwrap_or(first);
-                examples.push(format!(
-                    "Example: connect local client to 127.0.0.1:{local}"
-                ));
+        spans.push(Span::styled(
+            "   [Enter] retry  [R] switch cred  [E] ports",
+            Style::default().fg(Color::DarkGray),
+        ));
+        Line::from(spans)
+    } else if configured {
+        let try_cmd = match (host.http_proxy_port, host.socks_port) {
+            (Some(hp), Some(sp)) => {
+                let actual_hp = active_here
+                    .and_then(crate::tui::ProxySession::http_bound_port)
+                    .unwrap_or(hp);
+                format!(
+                    "Try:  curl -x http://127.0.0.1:{actual_hp} https://ifconfig.me   |   curl -x socks5h://127.0.0.1:{sp} https://ifconfig.me"
+                )
             }
-        }
-        if !examples.is_empty() {
-            ep_lines.push(Line::from(""));
-            for ex in examples {
-                ep_lines.push(Line::from(Span::styled(
-                    ex,
-                    Style::default().fg(Color::Cyan),
-                )));
+            (Some(hp), None) => {
+                let actual_hp = active_here
+                    .and_then(crate::tui::ProxySession::http_bound_port)
+                    .unwrap_or(hp);
+                format!("Try:  curl -x http://127.0.0.1:{actual_hp} https://ifconfig.me")
             }
-        }
+            (None, Some(sp)) => {
+                format!("Try:  curl -x socks5h://127.0.0.1:{sp} https://ifconfig.me")
+            }
+            (None, None) => {
+                let first = host.port_forwards.first().map(String::as_str).unwrap_or("");
+                let (l, r) = first.split_once(':').unwrap_or((first, ""));
+                format!("Connect local client to 127.0.0.1:{l} -> remote:{r}")
+            }
+        };
+        Line::from(Span::styled(try_cmd, Style::default().fg(Color::DarkGray)))
+    } else {
+        Line::from(Span::styled(
+            "Listeners bind 127.0.0.1 only and stay alive in the background while hss is open.",
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
 
-        if let Some(http_err) = active_here
-            .and_then(crate::tui::ProxySession::http_metrics)
-            .and_then(|m| m.last_error)
-        {
-            ep_lines.push(Line::from(vec![
-                Span::styled("Last HTTP err  : ", Style::default().fg(Color::Yellow)),
-                Span::styled(http_err, Style::default().fg(Color::Red)),
-            ]));
-        }
-    }
-
+    let status_block = Block::default()
+        .title(format!(" Proxy & Tunnels — {} ", host.name))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
     f.render_widget(
-        Paragraph::new(ep_lines)
-            .block(
-                Block::default()
-                    .title(" Endpoints ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .wrap(Wrap { trim: false }),
-        chunks[1],
+        Paragraph::new(vec![Line::from(row1), row2, row3]).block(status_block),
+        chunks[0],
     );
 
-    // 3. SSH stderr / diagnostics log
+    // 2. Full-width Activity & SSH Debug Log (takes ~80% of terminal height)
     let log_lines: Vec<String> = if let Some(proxy) = active_here {
         proxy.log.lock().map(|g| g.snapshot()).unwrap_or_default()
     } else if let Some(starting) = starting_here {
@@ -367,107 +414,159 @@ pub fn draw(f: &mut Frame, app: &App) {
         Vec::new()
     };
 
-    let log_block = Block::default()
-        .title(format!(
-            " Proxy & SSH Debug Log ({} lines · ↑/↓/PgUp/PgDn scroll · [T] test · [C] clear) ",
+    let log_inner_h = chunks[1].height.saturating_sub(2) as usize;
+    let max_scroll = log_lines.len().saturating_sub(log_inner_h);
+    let is_live = app.proxy_log_scroll == usize::MAX || app.proxy_log_scroll >= max_scroll;
+    let scroll = if app.proxy_log_scroll == usize::MAX {
+        max_scroll
+    } else {
+        app.proxy_log_scroll.min(max_scroll)
+    };
+
+    let log_title = if log_lines.is_empty() {
+        " Activity Log ".to_string()
+    } else if is_live {
+        format!(
+            " Activity Log ({} lines · LIVE · ↑/↓/PgUp/PgDn/Home/End) ",
             log_lines.len()
-        ))
+        )
+    } else {
+        format!(
+            " Activity Log ({}/{} · paused · End=LIVE) ",
+            scroll + 1,
+            log_lines.len()
+        )
+    };
+
+    let log_block = Block::default()
+        .title(log_title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
-    let log_inner_h = chunks[2].height.saturating_sub(2) as usize;
+
     let rendered_log: Vec<Line> = if log_lines.is_empty() {
         vec![Line::from(Span::styled(
             if active_here.is_some() {
                 "Tunnel is active — press [T] to run an end-to-end proxy test."
             } else if starting_here.is_some() {
                 "Waiting for SSH handshake and local port binding…"
+            } else if configured {
+                "No activity yet — press [Enter] to start proxy."
             } else {
-                "No proxy log yet. Press [Enter] to start proxy."
+                "No proxy ports configured — press [E] to set up SOCKS5, HTTP proxy, or port forwards."
             },
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        let max_scroll = log_lines.len().saturating_sub(log_inner_h);
-        // Auto-follow bottom when scroll == usize::MAX, otherwise clamp
-        let scroll = if app.proxy_log_scroll == usize::MAX {
-            max_scroll
-        } else {
-            app.proxy_log_scroll.min(max_scroll)
-        };
         log_lines
             .iter()
             .skip(scroll)
             .take(log_inner_h.max(1))
-            .map(|l| {
-                let lower = l.to_lowercase();
-                let color = if lower.contains("failed")
-                    || lower.contains("denied")
-                    || lower.contains("error")
-                    || lower.contains("cannot")
-                    || lower.contains("refused")
-                    || lower.contains("prohibited")
-                {
-                    Color::Red
-                } else if lower.contains("warning") || lower.contains("permanently added") {
-                    Color::Yellow
-                } else if lower.contains("[socks] connected")
-                    || lower.contains("tunnel ready")
-                    || lower.contains("authenticated to")
-                    || lower.contains("[test] ok")
-                {
-                    Color::Green
-                } else if lower.contains("[http]")
-                    || lower.contains("[socks]")
-                    || lower.contains("[proxy]")
-                    || lower.contains("[test]")
-                {
-                    Color::Cyan
-                } else {
-                    Color::Gray
-                };
-                Line::from(Span::styled(l.clone(), Style::default().fg(color)))
-            })
+            .map(|line| format_log_line(line))
             .collect()
     };
-    f.render_widget(Paragraph::new(rendered_log).block(log_block), chunks[2]);
+    f.render_widget(Paragraph::new(rendered_log).block(log_block), chunks[1]);
 
-    // 4. Hotkeys
-    let primary_label = if active_here.is_some() {
-        "stop proxy"
-    } else if starting_here.is_some() {
-        "cancel startup"
-    } else if active_elsewhere.is_some() {
-        "switch proxy here"
+    // 3. Bottom Hotkeys
+    f.render_widget(Paragraph::new(hotkey_lines), chunks[2]);
+}
+
+/// Parses `[HH:MM:SS] [tag] body` emitted by `ProxyStderrLog`, tolerating plain stderr lines.
+fn parse_log_line(raw: &str) -> (Option<&str>, Option<&str>, &str) {
+    let mut rest = raw;
+    let mut ts = None;
+
+    if let Some(after_open) = rest.strip_prefix('[') {
+        if let Some((candidate, after_close)) = after_open.split_once("] ") {
+            let b = candidate.as_bytes();
+            if b.len() == 8 && b[2] == b':' && b[5] == b':' {
+                ts = Some(candidate);
+                rest = after_close;
+            }
+        }
+    }
+
+    let mut tag = None;
+    if let Some(after_open) = rest.strip_prefix('[') {
+        if let Some((candidate, after_close)) = after_open.split_once("] ") {
+            if !candidate.is_empty()
+                && candidate.len() <= 8
+                && candidate.bytes().all(|c| c.is_ascii_alphanumeric())
+            {
+                tag = Some(candidate);
+                rest = after_close;
+            }
+        }
+    }
+
+    (ts, tag, rest)
+}
+
+fn format_log_line(raw: &str) -> Line<'static> {
+    let (ts, tag, body) = parse_log_line(raw);
+    let lower = body.to_lowercase();
+
+    let is_err = lower.contains("failed")
+        || lower.contains("denied")
+        || lower.contains("error")
+        || lower.contains("cannot")
+        || lower.contains("refused")
+        || lower.contains("prohibited")
+        || lower.contains("timed out");
+    let is_ok = !is_err
+        && (lower.starts_with("ok ")
+            || lower.contains("tunnel ready")
+            || lower.contains("authenticated to")
+            || lower.starts_with("connected")
+            || lower.contains("socks5 listening")
+            || lower.contains("http proxy listening"));
+    let is_warn = !is_err
+        && !is_ok
+        && (lower.contains("warning") || lower.contains("permanently added"));
+
+    let (marker, badge_color, body_color) = if is_err {
+        ("✗", Color::Red, Color::Red)
+    } else if is_ok {
+        ("✓", Color::Green, Color::Green)
+    } else if is_warn {
+        ("!", Color::Yellow, Color::Yellow)
     } else {
-        "start proxy"
+        match tag {
+            Some("http" | "socks" | "test") => ("▶", Color::Cyan, Color::White),
+            Some("proxy") => ("ℹ", Color::Blue, Color::White),
+            _ => ("·", Color::DarkGray, Color::Gray),
+        }
     };
-    let close_label = if app.proxy.is_some() || app.proxy_starting.is_some() {
-        "close (keeps running)"
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
+    if let Some(ts) = ts {
+        spans.push(Span::styled(
+            format!("[{ts}] "),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    let tag_label = tag.unwrap_or("log");
+    let badge_style = if tag == Some("ssh") && !is_err && !is_ok && !is_warn {
+        Style::default().fg(badge_color)
     } else {
-        "close"
+        Style::default()
+            .fg(badge_color)
+            .add_modifier(Modifier::BOLD)
     };
+    spans.push(Span::styled(
+        format!("{marker} {tag_label:<5} "),
+        badge_style,
+    ));
+    spans.push(Span::styled(
+        body.to_string(),
+        Style::default().fg(body_color),
+    ));
 
-    let mut pairs: Vec<(&str, &str)> = Vec::new();
-    if configured || active_here.is_some() || starting_here.is_some() {
-        pairs.push(("Enter/Space", primary_label));
-    }
-    if active_here.is_some() {
-        pairs.push(("T", "test tunnel"));
-    }
-    if active_elsewhere.is_some() {
-        pairs.push(("S", "stop active proxy"));
-    }
-    pairs.push(("R", "switch cred"));
-    pairs.push(("C", "clear log"));
-    pairs.push(("E", "configure ports (F2)"));
-    pairs.push(("Esc", close_label));
-
-    let hotkey_lines = crate::tui::wrap_hotkey_lines(&pairs, chunks[3].width);
-    f.render_widget(Paragraph::new(hotkey_lines), chunks[3]);
+    Line::from(spans)
 }
 
 pub fn handle_key(
-    _terminal: &mut Term,
+    terminal: &mut Term,
     app: &mut App,
     key: KeyEvent,
     host_idx: usize,
@@ -539,34 +638,64 @@ pub fn handle_key(
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            let total = current_log_len(app, &host.id);
+            let max_scroll = current_max_scroll(terminal, app, &host.id);
             let cur = if app.proxy_log_scroll == usize::MAX {
-                total.saturating_sub(6)
+                max_scroll
             } else {
-                app.proxy_log_scroll
+                app.proxy_log_scroll.min(max_scroll)
             };
             app.proxy_log_scroll = cur.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if app.proxy_log_scroll != usize::MAX {
-                app.proxy_log_scroll = app.proxy_log_scroll.saturating_add(1);
+                let max_scroll = current_max_scroll(terminal, app, &host.id);
+                let next = app.proxy_log_scroll.saturating_add(1);
+                app.proxy_log_scroll = if next >= max_scroll { usize::MAX } else { next };
             }
         }
         KeyCode::PageUp => {
-            let total = current_log_len(app, &host.id);
+            let visible = log_viewport_rows(terminal);
+            let max_scroll = current_log_len(app, &host.id).saturating_sub(visible);
+            let step = visible.saturating_sub(2).max(1);
             let cur = if app.proxy_log_scroll == usize::MAX {
-                total.saturating_sub(6)
+                max_scroll
             } else {
-                app.proxy_log_scroll
+                app.proxy_log_scroll.min(max_scroll)
             };
-            app.proxy_log_scroll = cur.saturating_sub(8);
+            app.proxy_log_scroll = cur.saturating_sub(step);
         }
         KeyCode::PageDown => {
+            if app.proxy_log_scroll != usize::MAX {
+                let visible = log_viewport_rows(terminal);
+                let max_scroll = current_log_len(app, &host.id).saturating_sub(visible);
+                let step = visible.saturating_sub(2).max(1);
+                let next = app.proxy_log_scroll.saturating_add(step);
+                app.proxy_log_scroll = if next >= max_scroll { usize::MAX } else { next };
+            }
+        }
+        KeyCode::Home => {
+            app.proxy_log_scroll = 0;
+        }
+        KeyCode::End => {
             app.proxy_log_scroll = usize::MAX;
         }
         _ => {}
     }
     Ok(())
+}
+
+fn log_viewport_rows(terminal: &Term) -> usize {
+    // 5 rows status card + 1 row hotkeys + 2 rows log border = 8
+    terminal
+        .size()
+        .map(|s| s.height.saturating_sub(8) as usize)
+        .unwrap_or(16)
+        .max(1)
+}
+
+fn current_max_scroll(terminal: &Term, app: &App, host_id: &str) -> usize {
+    let total = current_log_len(app, host_id);
+    total.saturating_sub(log_viewport_rows(terminal))
 }
 
 fn current_log_len(app: &App, host_id: &str) -> usize {
@@ -598,9 +727,7 @@ fn run_proxy_self_test(proxy: &crate::tui::ProxySession) {
             if let Ok(mut g) = log.lock() {
                 g.push_event(
                     "test",
-                    format!(
-                        "Testing SOCKS5 127.0.0.1:{sp} -> external 1.1.1.1:443 via remote host…"
-                    ),
+                    format!("Testing SOCKS5 127.0.0.1:{sp} -> external 1.1.1.1:443 via remote host…"),
                 );
             }
             let t0 = std::time::Instant::now();
@@ -721,10 +848,13 @@ mod tests {
         app.proxy_last_error = Some(crate::tui::ProxyErrorReport {
             host_id: "h1".into(),
             message: "Permission denied".into(),
-            stderr_lines: vec!["Permission denied (publickey).".into()],
+            stderr_lines: vec![
+                "[12:34:56] [ssh] Permission denied (publickey).".into(),
+                "[12:34:57] [test] OK SOCKS5 -> 1.1.1.1:443 (42 ms)".into(),
+            ],
         });
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text: String = terminal
             .backend()
@@ -734,12 +864,30 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
 
-        assert!(text.contains("Proxy & Tunnels"));
-        assert!(text.contains("FAILED"));
+        assert!(text.contains("Proxy & Tunnels — edge"));
+        assert!(text.contains("Failed"));
         assert!(text.contains("socks5h://127.0.0.1:1080"));
         assert!(text.contains("http://127.0.0.1:8081"));
-        assert!(text.contains("127.0.0.1:15432 -> remote:5432"));
+        assert!(text.contains("127.0.0.1:15432→5432"));
+        assert!(text.contains("Activity Log"));
         assert!(text.contains("Permission denied (publickey)."));
+        assert!(text.contains("OK SOCKS5 -> 1.1.1.1:443 (42 ms)"));
+    }
+
+    #[test]
+    fn parses_timestamp_and_tag_from_log_lines() {
+        assert_eq!(
+            parse_log_line("[12:34:56] [http] CONNECT example.com:443"),
+            (Some("12:34:56"), Some("http"), "CONNECT example.com:443")
+        );
+        assert_eq!(
+            parse_log_line("[08:00:01] plain message"),
+            (Some("08:00:01"), None, "plain message")
+        );
+        assert_eq!(
+            parse_log_line("Permission denied (publickey)."),
+            (None, None, "Permission denied (publickey).")
+        );
     }
 
     #[test]

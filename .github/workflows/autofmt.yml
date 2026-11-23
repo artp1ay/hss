@@ -1,7 +1,6 @@
 name: Auto-format main
 
-# Commits land on GitHub from an agent that often forgets cargo fmt. Apply it
-# here so style alone never breaks CI or a release.
+# Automatically format main if an unformatted commit lands so style never breaks CI.
 on:
   push:
     branches: [main]
@@ -17,6 +16,7 @@ jobs:
   fmt:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,7 +30,9 @@ jobs:
       - run: cargo fmt --all
 
       - name: Commit formatting changes
+        shell: bash
         run: |
+          set -euo pipefail
           if git diff --quiet; then
             echo "Already formatted"
             exit 0
@@ -39,5 +41,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "style: auto-format main"
-          git pull --rebase origin main
+          git fetch origin main
+          if ! git rebase origin/main; then
+            echo "Branch moved with conflicting changes; newer push will re-run autofmt."
+            git rebase --abort || true
+            exit 0
+          fi
           git push origin main

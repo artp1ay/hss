@@ -14,8 +14,8 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 VERSION="${VERSION#v}"
-if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-  echo "Error: version must follow semantic versioning (e.g. 1.0.0)" >&2
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo "Error: version must follow semantic versioning (e.g. 1.0.0 or 1.0.0-rc.1)" >&2
   exit 1
 fi
 
@@ -35,6 +35,15 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo "Error: working directory has uncommitted changes. Please commit or stash them first." >&2
   exit 1
 fi
+
+if command -v cargo >/dev/null 2>&1; then
+  if ! cargo fmt --all -- --check; then
+    echo "Error: code is not formatted. Run 'cargo fmt --all', commit, and re-run release.sh." >&2
+    exit 1
+  fi
+fi
+
+git fetch --tags origin >/dev/null 2>&1 || true
 
 if git rev-parse "$TAG" >/dev/null 2>&1; then
   echo "Error: git tag '$TAG' already exists." >&2
