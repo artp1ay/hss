@@ -1,0 +1,48 @@
+name: Sync GitHub to Gitea
+
+# Gitea mirrors back to GitHub (all branches and tags) but always with --force.
+# GitHub branch protection rejects non-fast-forward pushes, so this job only
+# needs to bring GitHub commits into Gitea - never overwrite either side.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sync-to-gitea
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward Gitea main
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global http.https://git.freakware.ru/.extraHeader "AUTHORIZATION: token ${GITEA_TOKEN}"
+          git remote add gitea https://git.freakware.ru/max/hss.git
+          git fetch gitea main
+
+          GH=$(git rev-parse HEAD)
+          GITEA=$(git rev-parse gitea/main)
+
+          if [ "$GH" = "$GITEA" ]; then
+            echo "Already in sync at $GH"
+          elif git merge-base --is-ancestor "$GITEA" "$GH"; then
+            echo "GitHub is ahead: $GITEA -> $GH"
+            git push gitea "$GH:refs/heads/main"
+          elif git merge-base --is-ancestor "$GH" "$GITEA"; then
+            echo "Gitea is ahead: $GH -> $GITEA, mirror will sync it"
+          else
+            echo "::error::Repos diverged (GitHub $GH, Gitea $GITEA). Refusing to overwrite; resolve manually."
+            exit 1
+          fi
