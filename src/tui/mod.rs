@@ -1197,7 +1197,10 @@ pub fn start_proxy(app: &mut App, host: &Host) -> Result<()> {
             g.push_event("proxy", format!("SOCKS5 target listener: 127.0.0.1:{sp}"));
         }
         if let Some(hp) = host.http_proxy_port {
-            g.push_event("proxy", format!("HTTP/HTTPS target listener: 127.0.0.1:{hp}"));
+            g.push_event(
+                "proxy",
+                format!("HTTP/HTTPS target listener: 127.0.0.1:{hp}"),
+            );
         }
         for fwd in &host.port_forwards {
             g.push_event("proxy", format!("Local forward: 127.0.0.1:{fwd}"));
@@ -1456,14 +1459,7 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
             host_idx,
             after_failure,
             return_to_proxy,
-        } => popup::handle_key(
-            terminal,
-            app,
-            key,
-            host_idx,
-            after_failure,
-            return_to_proxy,
-        ),
+        } => popup::handle_key(terminal, app, key, host_idx, after_failure, return_to_proxy),
         Screen::HostForm => host_form::handle_key(terminal, app, key),
         Screen::ImportHosts => host_form::handle_import_key(terminal, app, key),
         Screen::McpServer => mcp_screen::handle_key(terminal, app, key),

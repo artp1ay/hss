@@ -302,7 +302,14 @@ fn serve(
         if let Ok(mut g) = l.lock() {
             g.push_event(
                 "http",
-                format!("{method} {host}:{port}{} -> SOCKS5 127.0.0.1:{socks_port}", if connect { String::new() } else { format!(" {path}") }),
+                format!(
+                    "{method} {host}:{port}{} -> SOCKS5 127.0.0.1:{socks_port}",
+                    if connect {
+                        String::new()
+                    } else {
+                        format!(" {path}")
+                    }
+                ),
             );
         }
     }
@@ -454,7 +461,9 @@ pub fn test_http_connect(http_port: u16, host: &str, port: u16) -> Result<()> {
         .with_context(|| format!("Cannot reach local HTTP proxy 127.0.0.1:{http_port}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(8)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes())?;
+    stream.write_all(
+        format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes(),
+    )?;
     let mut buf = [0u8; 256];
     let n = stream.read(&mut buf)?;
     let text = String::from_utf8_lossy(&buf[..n]);
@@ -737,7 +746,11 @@ mod tests {
         worker.join().unwrap();
         drop(proxy);
         let lines = log.lock().unwrap().snapshot();
-        assert!(lines.iter().any(|l| l.contains("[http] CONNECT 1.1.1.1:443")));
-        assert!(lines.iter().any(|l| l.contains("[socks] CONNECTED 1.1.1.1:443")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[http] CONNECT 1.1.1.1:443")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[socks] CONNECTED 1.1.1.1:443")));
     }
 }

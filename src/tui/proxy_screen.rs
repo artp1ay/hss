@@ -314,7 +314,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         if examples.is_empty() {
             if let Some(first) = host.port_forwards.first() {
                 let local = first.split_once(':').map(|(l, _)| l).unwrap_or(first);
-                examples.push(format!("Example: connect local client to 127.0.0.1:{local}"));
+                examples.push(format!(
+                    "Example: connect local client to 127.0.0.1:{local}"
+                ));
             }
         }
         if !examples.is_empty() {
@@ -596,7 +598,9 @@ fn run_proxy_self_test(proxy: &crate::tui::ProxySession) {
             if let Ok(mut g) = log.lock() {
                 g.push_event(
                     "test",
-                    format!("Testing SOCKS5 127.0.0.1:{sp} -> external 1.1.1.1:443 via remote host…"),
+                    format!(
+                        "Testing SOCKS5 127.0.0.1:{sp} -> external 1.1.1.1:443 via remote host…"
+                    ),
                 );
             }
             let t0 = std::time::Instant::now();
