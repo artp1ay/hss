@@ -22,10 +22,16 @@ pub fn config_dir() -> PathBuf {
 pub fn ensure_config_dir(dir: &Path) -> Result<()> {
     if let Ok(meta) = std::fs::symlink_metadata(dir) {
         if meta.file_type().is_symlink() {
-            anyhow::bail!("Refusing to use symlinked config directory: {}", dir.display());
+            anyhow::bail!(
+                "Refusing to use symlinked config directory: {}",
+                dir.display()
+            );
         }
         if !meta.is_dir() {
-            anyhow::bail!("Config path exists and is not a directory: {}", dir.display());
+            anyhow::bail!(
+                "Config path exists and is not a directory: {}",
+                dir.display()
+            );
         }
     } else {
         let mut builder = std::fs::DirBuilder::new();

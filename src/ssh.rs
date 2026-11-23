@@ -525,10 +525,12 @@ pub fn spawn_ssh_with_user(
     forwards: &[String],
     socks_port: Option<u16>,
 ) -> Result<std::process::ExitStatus> {
-    Ok(spawn_ssh_with_error_and_user(
-        host, port, host_user, cred, cfg, jump, forwards, socks_port,
-    )?
-    .0)
+    Ok(
+        spawn_ssh_with_error_and_user(
+            host, port, host_user, cred, cfg, jump, forwards, socks_port,
+        )?
+        .0,
+    )
 }
 
 pub fn spawn_ssh_with_error(

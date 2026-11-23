@@ -324,7 +324,10 @@ pub fn parse_inventory(content: &str) -> Vec<Host> {
     for entry in &mut parsed {
         let gv = group_vars.get(&entry.host.group);
         if !entry.has_explicit_port {
-            if let Some(p) = gv.and_then(|v| v.port).or_else(|| all_vars.and_then(|v| v.port)) {
+            if let Some(p) = gv
+                .and_then(|v| v.port)
+                .or_else(|| all_vars.and_then(|v| v.port))
+            {
                 entry.host.port = p;
             }
         }
@@ -451,7 +454,10 @@ pub fn import_from_ini(content: &str, hosts: &mut Vec<Host>) -> usize {
         let host = &mut hosts[*idx];
         let gv = group_vars.get(&host.group);
         if !has_explicit_port {
-            if let Some(p) = gv.and_then(|v| v.port).or_else(|| all_vars.and_then(|v| v.port)) {
+            if let Some(p) = gv
+                .and_then(|v| v.port)
+                .or_else(|| all_vars.and_then(|v| v.port))
+            {
                 host.port = p;
             }
         }
@@ -527,8 +533,7 @@ pub fn export_to_ssh_config(hosts: &[Host]) -> String {
 pub fn export_to_ini(hosts: &[Host]) -> String {
     let mut grouped: BTreeMap<String, Vec<&Host>> = BTreeMap::new();
     for host in hosts {
-        let raw_group = sanitize_single_line(&host.group)
-            .replace(['[', ']'], "_");
+        let raw_group = sanitize_single_line(&host.group).replace(['[', ']'], "_");
         let group = if raw_group.is_empty() {
             "ungrouped".to_string()
         } else {

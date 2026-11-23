@@ -506,7 +506,10 @@ fn test_inventory_merges_tag_group_collision_and_expands_tilde_key() {
 
     let beta_vars = &inv["_meta"]["hostvars"]["beta"];
     let key_file = beta_vars["ansible_ssh_private_key_file"].as_str().unwrap();
-    assert!(!key_file.starts_with("~/"), "tilde should be expanded: {key_file}");
+    assert!(
+        !key_file.starts_with("~/"),
+        "tilde should be expanded: {key_file}"
+    );
     let common_args = beta_vars["ansible_ssh_common_args"].as_str().unwrap();
     assert!(common_args.contains("-o IdentitiesOnly=yes"));
     assert!(
@@ -514,9 +517,11 @@ fn test_inventory_merges_tag_group_collision_and_expands_tilde_key() {
         "invalid strict_host_checking must not be injected: {common_args}"
     );
 
-    let single = hss::inventory::generate_ansible_hostvars("beta", &hosts, &creds, &records, &cfg, false);
+    let single =
+        hss::inventory::generate_ansible_hostvars("beta", &hosts, &creds, &records, &cfg, false);
     assert_eq!(single["ansible_host"], "10.0.0.2");
-    let missing = hss::inventory::generate_ansible_hostvars("unknown", &hosts, &creds, &records, &cfg, false);
+    let missing =
+        hss::inventory::generate_ansible_hostvars("unknown", &hosts, &creds, &records, &cfg, false);
     assert_eq!(missing, serde_json::json!({}));
 }
 
@@ -549,4 +554,3 @@ fn test_exports_sanitize_newlines_and_empty_groups() {
     assert!(!ini.contains("[]\n"));
     assert!(ini.contains("# tags=prod,tier1"));
 }
-

@@ -309,9 +309,7 @@ fn is_loopback_host(host: &str) -> bool {
         host
     };
 
-    host_only == "127.0.0.1"
-        || host_only.eq_ignore_ascii_case("localhost")
-        || host_only == "::1"
+    host_only == "127.0.0.1" || host_only.eq_ignore_ascii_case("localhost") || host_only == "::1"
 }
 
 /// Validate that an Origin header (if present) comes from loopback (blocks cross-origin CSRF).
@@ -471,11 +469,10 @@ fn serve_loop(
         if is_tool_call {
             // Tool calls may run SSH commands that take minutes.
             // Atomically reserve a concurrency slot (released via RAII guard even on panic).
-            let reserved = ACTIVE_TOOL_CALLS.fetch_update(
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-                |cur| (cur < MAX_CONCURRENT_TOOL_CALLS).then_some(cur + 1),
-            );
+            let reserved =
+                ACTIVE_TOOL_CALLS.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                    (cur < MAX_CONCURRENT_TOOL_CALLS).then_some(cur + 1)
+                });
             if reserved.is_err() {
                 let _ = request.respond(make_response(
                     429,
@@ -1657,7 +1654,9 @@ mod tests {
         assert!(is_prohibited_command_in_read_only("docker ps").is_none());
         assert!(is_prohibited_command_in_read_only("ls -la /var/log").is_none());
         assert!(is_prohibited_command_in_read_only("systemctl status nginx 2>&1").is_none());
-        assert!(is_prohibited_command_in_read_only("grep error /var/log/syslog 2>/dev/null").is_none());
+        assert!(
+            is_prohibited_command_in_read_only("grep error /var/log/syslog 2>/dev/null").is_none()
+        );
     }
 
     #[test]

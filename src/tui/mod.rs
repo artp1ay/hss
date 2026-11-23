@@ -254,11 +254,7 @@ impl App {
         let deleted_id = self.hosts[idx].id.clone();
         let deleted_name = self.hosts[idx].name.clone();
 
-        if self
-            .proxy
-            .as_ref()
-            .is_some_and(|p| p.host_id == deleted_id)
-        {
+        if self.proxy.as_ref().is_some_and(|p| p.host_id == deleted_id) {
             self.proxy = None;
         }
         for h in &mut self.hosts {

@@ -251,11 +251,14 @@ fn validate_and_build_config(app: &App) -> Result<crate::config::AppConfig> {
         Some(inputs[FIELD_MCP_LOG_FILE].trim().to_string())
     };
 
-    let audit_timeout: u32 = inputs[FIELD_AUDIT_TIMEOUT]
+    let audit_timeout: u16 = inputs[FIELD_AUDIT_TIMEOUT]
         .trim()
         .parse()
         .map_err(|_| anyhow::anyhow!("Audit Timeout must be a positive integer."))?;
-    anyhow::ensure!(audit_timeout > 0, "Audit Timeout must be at least 1 second.");
+    anyhow::ensure!(
+        audit_timeout > 0,
+        "Audit Timeout must be at least 1 second."
+    );
     cfg.audit_timeout = audit_timeout;
 
     Ok(cfg)

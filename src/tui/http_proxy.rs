@@ -32,7 +32,7 @@ impl HttpProxy {
             while rx.try_recv().is_err() {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let reserved = ACTIVE_PROXY_CONNS.fetch_update(
+                        let reserved = ACTIVE_PROXY_CONNS.try_update(
                             Ordering::SeqCst,
                             Ordering::SeqCst,
                             |cur| (cur < MAX_ACTIVE_CONNS).then_some(cur + 1),

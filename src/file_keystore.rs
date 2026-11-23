@@ -50,12 +50,15 @@ fn entry_path(service: &str, user: &str) -> PathBuf {
 
 fn reject_symlink(path: &std::path::Path) -> keyring::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(Error::PlatformFailure(Box::new(
-            std::io::Error::new(
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(Error::PlatformFailure(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("Refusing to access symlinked keystore entry: {}", path.display()),
-            ),
-        ))),
+                format!(
+                    "Refusing to access symlinked keystore entry: {}",
+                    path.display()
+                ),
+            ))))
+        }
         _ => Ok(()),
     }
 }
