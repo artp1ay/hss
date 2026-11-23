@@ -493,9 +493,7 @@ impl Drop for AskpassGuard {
                 if meta.is_file() {
                     let len = meta.len() as usize;
                     if len > 0 {
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(secret_path)
+                        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(secret_path)
                         {
                             let zeros = vec![0u8; len.min(64 * 1024)];
                             let _ = f.write_all(&zeros);
@@ -684,12 +682,10 @@ pub fn spawn_ssh_with_jump_auth(
     forwards: &[String],
     socks_port: Option<u16>,
 ) -> Result<std::process::ExitStatus> {
-    Ok(
-        spawn_ssh_with_error_and_jump_auth(
-            host, port, host_user, cred, cfg, jump, forwards, socks_port,
-        )?
-        .0,
-    )
+    Ok(spawn_ssh_with_error_and_jump_auth(
+        host, port, host_user, cred, cfg, jump, forwards, socks_port,
+    )?
+    .0)
 }
 
 pub fn spawn_ssh_with_error(

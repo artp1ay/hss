@@ -618,9 +618,7 @@ fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
             .iter()
             .map(|cred| format!("{} ({})", cred.name, cred.username)),
     );
-    let selected = form
-        .credential_selected
-        .min(items.len().saturating_sub(1));
+    let selected = form.credential_selected.min(items.len().saturating_sub(1));
     let visible = rows[1].height as usize;
     let start = selected.saturating_sub(visible.saturating_sub(1));
     for (offset, (index, label)) in items
@@ -845,7 +843,7 @@ fn save_host(app: &mut App) -> Result<()> {
         if let Some(ref mut f) = app.host_form {
             f.error_message = Some(err.clone());
             f.focused = focus;
-            f.page = if matches!(focus, 8 | 9 | 10) { 1 } else { 0 };
+            f.page = if matches!(focus, 8..=10) { 1 } else { 0 };
             f.cursor = crate::tui::input::end_of(active_field(f));
         }
         app.status_message = Some(crate::types::StatusMessage::error(err));
