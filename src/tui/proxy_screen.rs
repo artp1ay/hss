@@ -156,14 +156,23 @@ pub fn draw_for_host(f: &mut Frame, app: &App, host_idx: usize) {
             format!("  up {}m{:02}s", up / 60, up % 60),
             Style::default().fg(Color::DarkGray),
         ));
-        row1.push(Span::styled("   cred ", Style::default().fg(Color::DarkGray)));
+        row1.push(Span::styled(
+            "   cred ",
+            Style::default().fg(Color::DarkGray),
+        ));
         row1.push(Span::styled(
             resolved_cred.clone(),
             Style::default().fg(Color::Cyan),
         ));
         if let Some(ref jump) = jump_text {
-            row1.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
-            row1.push(Span::styled(jump.clone(), Style::default().fg(Color::Yellow)));
+            row1.push(Span::styled(
+                "   via ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            row1.push(Span::styled(
+                jump.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
         }
     } else if let Some(starting) = starting_here {
         let elapsed = starting.started_at.elapsed().as_secs();
@@ -181,14 +190,23 @@ pub fn draw_for_host(f: &mut Frame, app: &App, host_idx: usize) {
             format!("  connecting ({elapsed}s)"),
             Style::default().fg(Color::DarkGray),
         ));
-        row1.push(Span::styled("   cred ", Style::default().fg(Color::DarkGray)));
+        row1.push(Span::styled(
+            "   cred ",
+            Style::default().fg(Color::DarkGray),
+        ));
         row1.push(Span::styled(
             resolved_cred.clone(),
             Style::default().fg(Color::Cyan),
         ));
         if let Some(ref jump) = jump_text {
-            row1.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
-            row1.push(Span::styled(jump.clone(), Style::default().fg(Color::Yellow)));
+            row1.push(Span::styled(
+                "   via ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            row1.push(Span::styled(
+                jump.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
         }
     } else if let Some(err) = error_here {
         row1.push(Span::styled(
@@ -214,14 +232,23 @@ pub fn draw_for_host(f: &mut Frame, app: &App, host_idx: usize) {
             format!("{}:{}", host.ip, host.port),
             Style::default().fg(Color::White),
         ));
-        row1.push(Span::styled("   cred ", Style::default().fg(Color::DarkGray)));
+        row1.push(Span::styled(
+            "   cred ",
+            Style::default().fg(Color::DarkGray),
+        ));
         row1.push(Span::styled(
             resolved_cred.clone(),
             Style::default().fg(Color::Cyan),
         ));
         if let Some(ref jump) = jump_text {
-            row1.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
-            row1.push(Span::styled(jump.clone(), Style::default().fg(Color::Yellow)));
+            row1.push(Span::styled(
+                "   via ",
+                Style::default().fg(Color::DarkGray),
+            ));
+            row1.push(Span::styled(
+                jump.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
         }
     }
 
@@ -263,7 +290,10 @@ pub fn draw_for_host(f: &mut Frame, app: &App, host_idx: usize) {
 
         if let Some(socks_port) = host.socks_port {
             push_sep(&mut spans);
-            spans.push(Span::styled("SOCKS5 ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "SOCKS5 ",
+                Style::default().fg(Color::DarkGray),
+            ));
             spans.push(Span::styled(
                 format!("socks5h://127.0.0.1:{socks_port}"),
                 ep_style,
@@ -290,7 +320,10 @@ pub fn draw_for_host(f: &mut Frame, app: &App, host_idx: usize) {
                 ep_style,
             ));
             if let Some(metrics) = active_here.and_then(crate::tui::ProxySession::http_metrics) {
-                spans.push(Span::styled("  reqs ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    "  reqs ",
+                    Style::default().fg(Color::DarkGray),
+                ));
                 spans.push(Span::styled(
                     metrics.total_requests.to_string(),
                     Style::default().fg(Color::White),
@@ -349,7 +382,10 @@ pub fn draw_for_host(f: &mut Frame, app: &App, host_idx: usize) {
             Span::styled(resolved_cred, Style::default().fg(Color::Cyan)),
         ];
         if let Some(jump) = jump_text {
-            spans.push(Span::styled("   via ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "   via ",
+                Style::default().fg(Color::DarkGray),
+            ));
             spans.push(Span::styled(jump, Style::default().fg(Color::Yellow)));
         }
         spans.push(Span::styled(
@@ -519,9 +555,8 @@ fn format_log_line(raw: &str) -> Line<'static> {
             || lower.starts_with("connected")
             || lower.contains("socks5 listening")
             || lower.contains("http proxy listening"));
-    let is_warn = !is_err
-        && !is_ok
-        && (lower.contains("warning") || lower.contains("permanently added"));
+    let is_warn =
+        !is_err && !is_ok && (lower.contains("warning") || lower.contains("permanently added"));
 
     let (marker, badge_color, body_color) = if is_err {
         ("✗", Color::Red, Color::Red)
@@ -727,7 +762,9 @@ fn run_proxy_self_test(proxy: &crate::tui::ProxySession) {
             if let Ok(mut g) = log.lock() {
                 g.push_event(
                     "test",
-                    format!("Testing SOCKS5 127.0.0.1:{sp} -> external 1.1.1.1:443 via remote host…"),
+                    format!(
+                        "Testing SOCKS5 127.0.0.1:{sp} -> external 1.1.1.1:443 via remote host…"
+                    ),
                 );
             }
             let t0 = std::time::Instant::now();
