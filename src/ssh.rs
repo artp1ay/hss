@@ -580,6 +580,7 @@ fn ssh_command(
     if proxy {
         args.extend([
             "-N".into(),
+            "-v".into(),
             "-o".into(),
             "NumberOfPasswordPrompts=1".into(),
             "-o".into(),
@@ -1374,6 +1375,10 @@ fn configure_jump_and_askpass_with_secret(
                 format!("StrictHostKeyChecking={strict_host_checking}"),
                 "-o".into(),
                 format!("ConnectTimeout={}", connect_timeout.max(1)),
+                "-o".into(),
+                "ControlMaster=no".into(),
+                "-o".into(),
+                "ControlPath=none".into(),
                 "-p".into(),
                 ja.port.to_string(),
             ];
@@ -2053,6 +2058,8 @@ mod tests {
         assert!(script.contains("unset SSH_ASKPASS SSH_ASKPASS_REQUIRE"));
         assert!(script.contains("'/tmp/my key/bastion_id'"));
         assert!(script.contains("'IdentitiesOnly=yes'"));
+        assert!(script.contains("'ControlMaster=no'"));
+        assert!(script.contains("'ControlPath=none'"));
         assert!(script.contains("'-p' '2222'"));
         assert!(script.contains("'-l' 'ops'"));
         assert!(script.contains("'198.51.100.1'"));
@@ -2148,6 +2155,7 @@ mod tests {
             .collect();
         for expected in [
             "-N",
+            "-v",
             "ControlMaster=no",
             "ControlPath=none",
             "ClearAllForwardings=no",

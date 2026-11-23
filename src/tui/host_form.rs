@@ -533,20 +533,49 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
             if form.focused == 11 =>
         {
+            let editing_id = form.editing_id.clone();
+            let cred_changed = form.credential_changed;
+            let form_cred_id = form.credential_id.clone();
+            let current_id = if cred_changed {
+                form_cred_id
+            } else {
+                form_cred_id.or_else(|| {
+                    editing_id
+                        .as_deref()
+                        .and_then(|id| app.record_for(id))
+                        .and_then(|r| {
+                            r.default_credential_id
+                                .clone()
+                                .or_else(|| r.last_credential_id.clone())
+                        })
+                        .or_else(|| app.config.default_credential_id.clone())
+                })
+            };
+            let sel = current_id
+                .and_then(|cid| app.credentials.iter().position(|c| c.id == cid))
+                .unwrap_or(0);
+            let form = app.host_form.as_mut().unwrap();
             form.credential_picker = true;
             form.credential_picker_for_jump = false;
             form.credential_query.clear();
             form.credential_cursor = 0;
-            form.credential_selected = 0;
+            form.credential_selected = sel;
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
             if form.focused == 12 =>
         {
+            let jump_cid = form.jump_credential_id.clone();
+            let sel = jump_cid
+                .as_deref()
+                .and_then(|cid| app.credentials.iter().position(|c| c.id == cid))
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+            let form = app.host_form.as_mut().unwrap();
             form.credential_picker = true;
             form.credential_picker_for_jump = true;
             form.credential_query.clear();
             form.credential_cursor = 0;
-            form.credential_selected = 0;
+            form.credential_selected = sel;
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
             if form.focused == 7 =>

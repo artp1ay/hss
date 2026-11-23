@@ -61,10 +61,27 @@ pub struct HttpProxy {
 }
 
 impl HttpProxy {
+    #[cfg(test)]
     pub fn start(port: u16, socks_port: u16) -> Result<Self> {
+        Self::start_with_log(port, socks_port, None)
+    }
+
+    pub fn start_with_log(
+        port: u16,
+        socks_port: u16,
+        log: Option<Arc<Mutex<crate::tui::ProxyStderrLog>>>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .with_context(|| format!("Cannot bind HTTP proxy to 127.0.0.1:{port}"))?;
         let bound_port = listener.local_addr()?.port();
+        if let Some(ref l) = log {
+            if let Ok(mut g) = l.lock() {
+                g.push_event(
+                    "http",
+                    format!("HTTP/HTTPS proxy listening on 127.0.0.1:{bound_port} -> SOCKS5 127.0.0.1:{socks_port}"),
+                );
+            }
+        }
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_bg = Arc::clone(&stopped);
         let metrics = Arc::new(ProxyMetrics::default());
@@ -72,7 +89,7 @@ impl HttpProxy {
 
         let thread = thread::spawn(move || loop {
             match listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((mut stream, peer_addr)) => {
                     if stopped_bg.load(Ordering::SeqCst) {
                         break;
                     }
@@ -81,6 +98,14 @@ impl HttpProxy {
                             (cur < MAX_ACTIVE_CONNS).then_some(cur + 1)
                         });
                     if reserved.is_err() {
+                        if let Some(ref l) = log {
+                            if let Ok(mut g) = l.lock() {
+                                g.push_event(
+                                    "http",
+                                    format!("503 limit ({MAX_ACTIVE_CONNS} active conns) from {peer_addr}"),
+                                );
+                            }
+                        }
                         let _ = stream.write_all(
                             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                         );
@@ -89,13 +114,19 @@ impl HttpProxy {
                     metrics_bg.active_conns.fetch_add(1, Ordering::Relaxed);
                     metrics_bg.total_requests.fetch_add(1, Ordering::Relaxed);
                     let conn_metrics = Arc::clone(&metrics_bg);
+                    let conn_log = log.clone();
                     let guard = ProxyConnGuard {
                         metrics: Some(Arc::clone(&metrics_bg)),
                     };
                     thread::spawn(move || {
                         let _guard = guard;
-                        if let Err(err) = serve(stream, socks_port) {
+                        if let Err(err) = serve(stream, socks_port, conn_log.as_ref()) {
                             conn_metrics.record_error(&err);
+                            if let Some(ref l) = conn_log {
+                                if let Ok(mut g) = l.lock() {
+                                    g.push_event("http", format!("ERROR: {err:#}"));
+                                }
+                            }
                         }
                     });
                 }
@@ -143,16 +174,38 @@ fn send_error(client: &mut TcpStream, status: &str) {
     let _ = client.flush();
 }
 
-fn serve(mut client: TcpStream, socks_port: u16) -> Result<()> {
+fn serve(
+    mut client: TcpStream,
+    socks_port: u16,
+    log: Option<&Arc<Mutex<crate::tui::ProxyStderrLog>>>,
+) -> Result<()> {
     let _ = client.set_nodelay(true);
     client.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut header = Vec::new();
     let mut byte = [0];
     while header.len() < 16 * 1024 && !header.ends_with(b"\r\n\r\n") {
-        if client.read(&mut byte)? == 0 {
-            return Ok(());
+        match client.read(&mut byte) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                if header.is_empty() && (byte[0] == 4 || byte[0] == 5) {
+                    anyhow::bail!(
+                        "Received SOCKS{} handshake on HTTP proxy port (use http:// for this port, or use the SOCKS5 port for socks5h://)",
+                        byte[0]
+                    );
+                }
+                header.push(byte[0]);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && header.is_empty() =>
+            {
+                // Idle preconnect socket closed without sending an HTTP request.
+                return Ok(());
+            }
+            Err(e) => return Err(e).context("Reading HTTP request header from client"),
         }
-        header.push(byte[0]);
     }
     if !header.ends_with(b"\r\n\r\n") {
         send_error(&mut client, "431 Request Header Fields Too Large");
@@ -244,8 +297,28 @@ fn serve(mut client: TcpStream, socks_port: u16) -> Result<()> {
         }
     };
 
+    let t0 = std::time::Instant::now();
+    if let Some(l) = log {
+        if let Ok(mut g) = l.lock() {
+            g.push_event(
+                "http",
+                format!("{method} {host}:{port}{} -> SOCKS5 127.0.0.1:{socks_port}", if connect { String::new() } else { format!(" {path}") }),
+            );
+        }
+    }
+
     let mut remote = match socks_connect(socks_port, host, port) {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            if let Some(l) = log {
+                if let Ok(mut g) = l.lock() {
+                    g.push_event(
+                        "socks",
+                        format!("CONNECTED {host}:{port} ({} ms)", t0.elapsed().as_millis()),
+                    );
+                }
+            }
+            stream
+        }
         Err(err) => {
             send_error(&mut client, "502 Bad Gateway");
             return Err(err);
@@ -369,23 +442,66 @@ fn socks_reply_message(code: u8) -> &'static str {
     }
 }
 
+pub fn test_socks_connect(socks_port: u16, host: &str, port: u16) -> Result<()> {
+    let stream = socks_connect(socks_port, host, port)?;
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
+pub fn test_http_connect(http_port: u16, host: &str, port: u16) -> Result<()> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], http_port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .with_context(|| format!("Cannot reach local HTTP proxy 127.0.0.1:{http_port}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes())?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let status_line = text.lines().next().unwrap_or("");
+    anyhow::ensure!(
+        status_line.contains(" 200 "),
+        "HTTP proxy returned '{status_line}'"
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    Ok(())
+}
+
 fn socks_connect(socks_port: u16, host: &str, port: u16) -> Result<TcpStream> {
     let addr = SocketAddr::from(([127, 0, 0, 1], socks_port));
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .with_context(|| format!("Cannot reach local SOCKS5 listener 127.0.0.1:{socks_port}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    stream.write_all(&[5, 1, 0])?;
+    stream
+        .write_all(&[5, 1, 0])
+        .context("SOCKS5 greeting write failed")?;
     let mut response = [0; 2];
-    stream.read_exact(&mut response)?;
+    stream
+        .read_exact(&mut response)
+        .context("SOCKS5 greeting read timed out or closed")?;
     anyhow::ensure!(response == [5, 0], "SOCKS authentication failed");
     anyhow::ensure!(host.len() <= 255, "Host name too long");
-    let mut request = vec![5, 1, 0, 3, host.len() as u8];
-    request.extend_from_slice(host.as_bytes());
+    let mut request = vec![5, 1, 0];
+    if let Ok(ip4) = host.parse::<std::net::Ipv4Addr>() {
+        request.push(1);
+        request.extend_from_slice(&ip4.octets());
+    } else if let Ok(ip6) = host.parse::<std::net::Ipv6Addr>() {
+        request.push(4);
+        request.extend_from_slice(&ip6.octets());
+    } else {
+        request.push(3);
+        request.push(host.len() as u8);
+        request.extend_from_slice(host.as_bytes());
+    }
     request.extend_from_slice(&port.to_be_bytes());
-    stream.write_all(&request)?;
+    stream
+        .write_all(&request)
+        .with_context(|| format!("SOCKS5 request write to {host}:{port} failed"))?;
     let mut reply = [0; 4];
-    stream.read_exact(&mut reply)?;
+    stream.read_exact(&mut reply).with_context(|| {
+        format!("SOCKS5 connect to {host}:{port} timed out waiting for remote host")
+    })?;
     anyhow::ensure!(
         reply[0] == 5 && reply[1] == 0,
         "SOCKS connect to {host}:{port} failed ({}): {}",
@@ -438,7 +554,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server =
-            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port).unwrap());
+            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port, None).unwrap());
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client
             .write_all(b"CONNECT example.org:443 HTTP/1.1\r\n\r\n")
@@ -488,7 +604,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server =
-            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port).unwrap());
+            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port, None).unwrap());
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client.write_all(b"GET http://example.org/hello HTTP/1.1\r\nHost: example.org\r\nProxy-Authorization: secret\r\n\r\n").unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
@@ -525,7 +641,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server =
-            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port).unwrap());
+            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port, None).unwrap());
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -561,7 +677,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server =
-            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port).unwrap());
+            thread::spawn(move || serve(listener.accept().unwrap().0, socks_port, None).unwrap());
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -598,5 +714,30 @@ mod tests {
         assert_eq!(parse_authority("[::1]:8443", 443).unwrap(), ("::1", 8443));
         assert!(parse_authority("user@example.org", 80).is_err());
         assert!(parse_authority("example.org:0", 80).is_err());
+    }
+
+    #[test]
+    fn ipv4_target_uses_socks_atyp_ipv4_and_logs_events() {
+        let socks = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_port = socks.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let (mut peer, _) = socks.accept().unwrap();
+            let mut greeting = [0; 3];
+            peer.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            peer.write_all(&[5, 0]).unwrap();
+            let mut request = [0; 10];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(request, [5, 1, 0, 1, 1, 1, 1, 1, 1, 0xbb]);
+            peer.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        });
+        let log = Arc::new(Mutex::new(crate::tui::ProxyStderrLog::default()));
+        let proxy = HttpProxy::start_with_log(0, socks_port, Some(Arc::clone(&log))).unwrap();
+        test_http_connect(proxy.port(), "1.1.1.1", 443).unwrap();
+        worker.join().unwrap();
+        drop(proxy);
+        let lines = log.lock().unwrap().snapshot();
+        assert!(lines.iter().any(|l| l.contains("[http] CONNECT 1.1.1.1:443")));
+        assert!(lines.iter().any(|l| l.contains("[socks] CONNECTED 1.1.1.1:443")));
     }
 }

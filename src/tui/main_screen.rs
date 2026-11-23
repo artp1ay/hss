@@ -539,6 +539,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                 app.screen = Screen::CredentialPicker {
                     host_idx: idx,
                     after_failure: false,
+                    return_to_proxy: false,
                 };
             }
         }
@@ -547,7 +548,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
         }
         KeyCode::Char('x') | KeyCode::Char('X') if !app.search_focused && hosts_len > 0 => {
             if let Some(idx) = get_host_idx_in_all(app) {
-                app.proxy_log_scroll = 0;
+                app.proxy_log_scroll = usize::MAX;
                 app.screen = Screen::Proxy { host_idx: idx };
             }
         }
@@ -676,6 +677,7 @@ fn connect_selected(terminal: &mut Term, app: &mut App) -> Result<()> {
             app.screen = Screen::CredentialPicker {
                 host_idx: idx,
                 after_failure: false,
+                return_to_proxy: false,
             };
         }
     }

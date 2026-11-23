@@ -67,7 +67,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // status & connection info
-            Constraint::Length(7), // endpoints & usage
+            Constraint::Length(8), // endpoints & usage
             Constraint::Min(4),    // SSH / proxy diagnostics log
             Constraint::Length(1), // hotkeys
         ])
@@ -299,23 +299,32 @@ pub fn draw(f: &mut Frame, app: &App) {
             ]));
         }
 
-        // Concrete usage example
-        let example = if let Some(http_port) = host.http_proxy_port {
-            format!("Example: curl -x http://127.0.0.1:{http_port} https://ifconfig.me")
-        } else if let Some(socks_port) = host.socks_port {
-            format!("Example: curl --proxy socks5h://127.0.0.1:{socks_port} https://ifconfig.me")
-        } else if let Some(first) = host.port_forwards.first() {
-            let local = first.split_once(':').map(|(l, _)| l).unwrap_or(first);
-            format!("Example: connect local client to 127.0.0.1:{local}")
-        } else {
-            String::new()
-        };
-        if !example.is_empty() {
+        // Example usage for all configured proxy types
+        let mut examples = Vec::new();
+        if let Some(socks_port) = host.socks_port {
+            examples.push(format!(
+                "SOCKS5 cmd : curl -x socks5h://127.0.0.1:{socks_port} https://ifconfig.me"
+            ));
+        }
+        if let Some(http_port) = host.http_proxy_port {
+            examples.push(format!(
+                "HTTP/S cmd : curl -x http://127.0.0.1:{http_port} https://ifconfig.me"
+            ));
+        }
+        if examples.is_empty() {
+            if let Some(first) = host.port_forwards.first() {
+                let local = first.split_once(':').map(|(l, _)| l).unwrap_or(first);
+                examples.push(format!("Example: connect local client to 127.0.0.1:{local}"));
+            }
+        }
+        if !examples.is_empty() {
             ep_lines.push(Line::from(""));
-            ep_lines.push(Line::from(Span::styled(
-                example,
-                Style::default().fg(Color::Cyan),
-            )));
+            for ex in examples {
+                ep_lines.push(Line::from(Span::styled(
+                    ex,
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
         }
 
         if let Some(http_err) = active_here
@@ -357,24 +366,32 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
 
     let log_block = Block::default()
-        .title(" SSH Tunnel Log (↑/↓ scroll) ")
+        .title(format!(
+            " Proxy & SSH Debug Log ({} lines · ↑/↓/PgUp/PgDn scroll · [T] test · [C] clear) ",
+            log_lines.len()
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
     let log_inner_h = chunks[2].height.saturating_sub(2) as usize;
     let rendered_log: Vec<Line> = if log_lines.is_empty() {
         vec![Line::from(Span::styled(
             if active_here.is_some() {
-                "Tunnel is healthy — no SSH warnings or errors."
+                "Tunnel is active — press [T] to run an end-to-end proxy test."
             } else if starting_here.is_some() {
                 "Waiting for SSH handshake and local port binding…"
             } else {
-                "No SSH output yet. Press [Enter] to start proxy."
+                "No proxy log yet. Press [Enter] to start proxy."
             },
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
         let max_scroll = log_lines.len().saturating_sub(log_inner_h);
-        let scroll = app.proxy_log_scroll.min(max_scroll);
+        // Auto-follow bottom when scroll == usize::MAX, otherwise clamp
+        let scroll = if app.proxy_log_scroll == usize::MAX {
+            max_scroll
+        } else {
+            app.proxy_log_scroll.min(max_scroll)
+        };
         log_lines
             .iter()
             .skip(scroll)
@@ -386,10 +403,23 @@ pub fn draw(f: &mut Frame, app: &App) {
                     || lower.contains("error")
                     || lower.contains("cannot")
                     || lower.contains("refused")
+                    || lower.contains("prohibited")
                 {
                     Color::Red
                 } else if lower.contains("warning") || lower.contains("permanently added") {
                     Color::Yellow
+                } else if lower.contains("[socks] connected")
+                    || lower.contains("tunnel ready")
+                    || lower.contains("authenticated to")
+                    || lower.contains("[test] ok")
+                {
+                    Color::Green
+                } else if lower.contains("[http]")
+                    || lower.contains("[socks]")
+                    || lower.contains("[proxy]")
+                    || lower.contains("[test]")
+                {
+                    Color::Cyan
                 } else {
                     Color::Gray
                 };
@@ -419,9 +449,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     if configured || active_here.is_some() || starting_here.is_some() {
         pairs.push(("Enter/Space", primary_label));
     }
+    if active_here.is_some() {
+        pairs.push(("T", "test tunnel"));
+    }
     if active_elsewhere.is_some() {
         pairs.push(("S", "stop active proxy"));
     }
+    pairs.push(("R", "switch cred"));
+    pairs.push(("C", "clear log"));
     pairs.push(("E", "configure ports (F2)"));
     pairs.push(("Esc", close_label));
 
@@ -471,15 +506,173 @@ pub fn handle_key(
         KeyCode::Char('e') | KeyCode::Char('E') => {
             open_proxy_config_editor(app, host_idx, &host);
         }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            app.popup_selected = app.picker_selection(&host.id);
+            app.screen = Screen::CredentialPicker {
+                host_idx,
+                after_failure: false,
+                return_to_proxy: true,
+            };
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if let Some(ref p) = app.proxy {
+                if let Ok(mut g) = p.log.lock() {
+                    g.clear();
+                }
+            } else if let Some(ref s) = app.proxy_starting {
+                if let Ok(mut g) = s.log.lock() {
+                    g.clear();
+                }
+            } else if let Some(ref mut e) = app.proxy_last_error {
+                e.stderr_lines.clear();
+            }
+            app.proxy_log_scroll = usize::MAX;
+        }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            if let Some(ref proxy) = app.proxy {
+                if proxy.host_id == host.id {
+                    run_proxy_self_test(proxy);
+                    app.proxy_log_scroll = usize::MAX;
+                }
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
-            app.proxy_log_scroll = app.proxy_log_scroll.saturating_sub(1);
+            let total = current_log_len(app, &host.id);
+            let cur = if app.proxy_log_scroll == usize::MAX {
+                total.saturating_sub(6)
+            } else {
+                app.proxy_log_scroll
+            };
+            app.proxy_log_scroll = cur.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.proxy_log_scroll = app.proxy_log_scroll.saturating_add(1);
+            if app.proxy_log_scroll != usize::MAX {
+                app.proxy_log_scroll = app.proxy_log_scroll.saturating_add(1);
+            }
+        }
+        KeyCode::PageUp => {
+            let total = current_log_len(app, &host.id);
+            let cur = if app.proxy_log_scroll == usize::MAX {
+                total.saturating_sub(6)
+            } else {
+                app.proxy_log_scroll
+            };
+            app.proxy_log_scroll = cur.saturating_sub(8);
+        }
+        KeyCode::PageDown => {
+            app.proxy_log_scroll = usize::MAX;
         }
         _ => {}
     }
     Ok(())
+}
+
+fn current_log_len(app: &App, host_id: &str) -> usize {
+    if let Some(ref p) = app.proxy {
+        if p.host_id == host_id {
+            return p.log.lock().map(|g| g.snapshot().len()).unwrap_or(0);
+        }
+    }
+    if let Some(ref s) = app.proxy_starting {
+        if s.summary.host_id == host_id {
+            return s.log.lock().map(|g| g.snapshot().len()).unwrap_or(0);
+        }
+    }
+    if let Some(ref e) = app.proxy_last_error {
+        if e.host_id == host_id {
+            return e.stderr_lines.len();
+        }
+    }
+    0
+}
+
+fn run_proxy_self_test(proxy: &crate::tui::ProxySession) {
+    let log = std::sync::Arc::clone(&proxy.log);
+    let socks_port = proxy.summary.effective_socks_port();
+    let http_port = proxy.http_bound_port().or(proxy.summary.http_proxy_port);
+    let forwards = proxy.summary.port_forwards.clone();
+    std::thread::spawn(move || {
+        if let Some(sp) = socks_port {
+            if let Ok(mut g) = log.lock() {
+                g.push_event(
+                    "test",
+                    format!("Testing SOCKS5 127.0.0.1:{sp} -> external 1.1.1.1:443 via remote host…"),
+                );
+            }
+            let t0 = std::time::Instant::now();
+            match crate::tui::http_proxy::test_socks_connect(sp, "1.1.1.1", 443) {
+                Ok(()) => {
+                    if let Ok(mut g) = log.lock() {
+                        g.push_event(
+                            "test",
+                            format!("OK SOCKS5 -> 1.1.1.1:443 ({} ms)", t0.elapsed().as_millis()),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut g) = log.lock() {
+                        g.push_event("test", format!("FAILED SOCKS5 -> 1.1.1.1:443: {e:#}"));
+                    }
+                }
+            }
+        }
+        if let Some(hp) = http_port {
+            let t0 = std::time::Instant::now();
+            match crate::tui::http_proxy::test_http_connect(hp, "1.1.1.1", 443) {
+                Ok(()) => {
+                    if let Ok(mut g) = log.lock() {
+                        g.push_event(
+                            "test",
+                            format!(
+                                "OK HTTP CONNECT 127.0.0.1:{hp} -> 1.1.1.1:443 ({} ms)",
+                                t0.elapsed().as_millis()
+                            ),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut g) = log.lock() {
+                        g.push_event(
+                            "test",
+                            format!("FAILED HTTP CONNECT 127.0.0.1:{hp} -> 1.1.1.1:443: {e:#}"),
+                        );
+                    }
+                }
+            }
+        }
+        for fwd in &forwards {
+            if let Some((l, r)) = fwd.split_once(':') {
+                if let Ok(lp) = l.parse::<u16>() {
+                    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], lp));
+                    let t0 = std::time::Instant::now();
+                    match std::net::TcpStream::connect_timeout(
+                        &addr,
+                        std::time::Duration::from_secs(3),
+                    ) {
+                        Ok(_) => {
+                            if let Ok(mut g) = log.lock() {
+                                g.push_event(
+                                    "test",
+                                    format!(
+                                        "OK local forward 127.0.0.1:{lp} -> remote:{r} ({} ms)",
+                                        t0.elapsed().as_millis()
+                                    ),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(mut g) = log.lock() {
+                                g.push_event(
+                                    "test",
+                                    format!("FAILED local forward 127.0.0.1:{lp}: {e}"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn open_proxy_config_editor(app: &mut App, host_idx: usize, host: &Host) {

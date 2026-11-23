@@ -38,6 +38,7 @@ pub enum Screen {
     CredentialPicker {
         host_idx: usize,
         after_failure: bool,
+        return_to_proxy: bool,
     },
     HostForm,    // overlay for add/edit host
     ImportHosts, // overlay for importing from INI file path
@@ -55,8 +56,18 @@ pub enum CopyIdEvent {
     Failure(String),
 }
 
-const MAX_PROXY_LOG_LINES: usize = 80;
-const MAX_PROXY_LOG_BYTES: usize = 16 * 1024;
+const MAX_PROXY_LOG_LINES: usize = 300;
+const MAX_PROXY_LOG_BYTES: usize = 64 * 1024;
+
+fn now_hms() -> String {
+    unsafe {
+        let mut t: libc::time_t = 0;
+        libc::time(&mut t);
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
 
 #[derive(Default)]
 pub struct ProxyStderrLog {
@@ -65,7 +76,7 @@ pub struct ProxyStderrLog {
 }
 
 impl ProxyStderrLog {
-    fn push_line(&mut self, raw: String) {
+    pub fn push_line(&mut self, raw: String) {
         let line = raw.trim_end_matches('\r').to_string();
         if line.is_empty() {
             return;
@@ -81,6 +92,16 @@ impl ProxyStderrLog {
         }
     }
 
+    pub fn push_event(&mut self, tag: &str, msg: impl AsRef<str>) {
+        let ts = now_hms();
+        self.push_line(format!("[{ts}] [{tag}] {}", msg.as_ref()));
+    }
+
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.total_bytes = 0;
+    }
+
     pub fn snapshot(&self) -> Vec<String> {
         self.lines.iter().cloned().collect()
     }
@@ -89,7 +110,17 @@ impl ProxyStderrLog {
         self.lines
             .iter()
             .rev()
-            .find(|l| !l.trim().is_empty())
+            .find(|l| {
+                let t = l.trim();
+                !t.is_empty()
+                    && !t.contains("debug1:")
+                    && !t.contains("debug2:")
+                    && !t.contains("debug3:")
+                    && !t.contains("[proxy]")
+                    && !t.contains("[http]")
+                    && !t.contains("[socks]")
+            })
+            .or_else(|| self.lines.iter().rev().find(|l| !l.trim().is_empty()))
             .cloned()
     }
 }
@@ -103,8 +134,12 @@ fn spawn_stderr_drain(stderr: Option<std::process::ChildStderr>) -> Arc<Mutex<Pr
             for line in reader.lines() {
                 match line {
                     Ok(text) => {
+                        if is_noisy_ssh_debug(&text) {
+                            continue;
+                        }
+                        let ts = now_hms();
                         if let Ok(mut guard) = log_bg.lock() {
-                            guard.push_line(text);
+                            guard.push_line(format!("[{ts}] [ssh] {text}"));
                         }
                     }
                     Err(_) => break,
@@ -113,6 +148,43 @@ fn spawn_stderr_drain(stderr: Option<std::process::ChildStderr>) -> Arc<Mutex<Pr
         });
     }
     log
+}
+
+fn is_noisy_ssh_debug(line: &str) -> bool {
+    let t = line.trim();
+    let Some(rest) = t.strip_prefix("debug1:") else {
+        return false;
+    };
+    let rest = rest.trim();
+    for noisy_prefix in [
+        "kex:",
+        "kex_ext_info",
+        "SSH2_MSG_",
+        "expecting SSH2_MSG_",
+        "load_hostkeys:",
+        "Reading configuration data",
+        "/etc/ssh/ssh_config",
+        "Applying options for",
+        "Authenticator provider",
+        "compat_banner:",
+        "Local version string",
+        "Remote protocol version",
+        "ssh_packet_",
+        "rekey ",
+        "pledge:",
+        "client_input_global_request:",
+        "Requesting no-more-sessions",
+        "Entering interactive session",
+        "get_agent_identities:",
+        "identity file ",
+        "no identity pubkey",
+        "loaded pubkey from",
+    ] {
+        if rest.starts_with(noisy_prefix) || rest.contains("Applying options for") {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +261,7 @@ pub struct ProxySession {
     pub host_id: String,
     pub summary: ProxyConfigSummary,
     child: std::process::Child,
+    _askpass: Option<crate::ssh::AskpassGuard>,
     http: Option<http_proxy::HttpProxy>,
     pub started_at: Instant,
     pub log: Arc<Mutex<ProxyStderrLog>>,
@@ -546,7 +619,25 @@ impl App {
             }
 
             let ready = if starting.check_is_socks {
-                probe_socks5_ready(starting.check_port)
+                match probe_socks5_ready(starting.check_port) {
+                    Ok(r) => r,
+                    Err(err_msg) => {
+                        if let Ok(mut g) = starting.log.lock() {
+                            g.push_event("proxy", format!("ERROR: {err_msg}"));
+                        }
+                        let (lines, _) = read_stderr_summary(&starting.log);
+                        self.proxy_last_error = Some(ProxyErrorReport {
+                            host_id: starting.summary.host_id.clone(),
+                            message: err_msg.clone(),
+                            stderr_lines: lines,
+                        });
+                        self.status_message = Some(crate::types::StatusMessage::error(format!(
+                            "Proxy failed ({}): {err_msg}",
+                            starting.summary.host_name
+                        )));
+                        return;
+                    }
+                }
             } else {
                 probe_local_forward_ready(starting.check_port)
             };
@@ -574,15 +665,27 @@ impl App {
                     }
                 }
 
-                // Authentication succeeded and tunnel is listening; wipe askpass secrets immediately.
-                starting._askpass = None;
+                if let Ok(mut g) = starting.log.lock() {
+                    g.push_event(
+                        "proxy",
+                        format!(
+                            "Tunnel ready on 127.0.0.1:{} ({} ms)",
+                            starting.check_port,
+                            starting.started_at.elapsed().as_millis()
+                        ),
+                    );
+                }
 
                 let http = match (
                     starting.summary.http_proxy_port,
                     starting.summary.effective_socks_port(),
                 ) {
                     (Some(http_port), Some(socks_port)) => {
-                        match http_proxy::HttpProxy::start(http_port, socks_port) {
+                        match http_proxy::HttpProxy::start_with_log(
+                            http_port,
+                            socks_port,
+                            Some(Arc::clone(&starting.log)),
+                        ) {
                             Ok(http) => Some(http),
                             Err(err) => {
                                 let (lines, _) = read_stderr_summary(&starting.log);
@@ -613,6 +716,7 @@ impl App {
                         host_id,
                         summary: starting.summary.clone(),
                         child,
+                        _askpass: starting._askpass.take(),
                         http,
                         started_at: Instant::now(),
                         log: Arc::clone(&starting.log),
@@ -731,18 +835,18 @@ fn read_stderr_summary(log: &Arc<Mutex<ProxyStderrLog>>) -> (Vec<String>, Option
     }
 }
 
-fn probe_socks5_ready(port: u16) -> bool {
+fn probe_socks5_ready(port: u16) -> Result<bool, String> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {
-        return false;
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) else {
+        return Ok(false);
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
     if stream.write_all(&[5, 1, 0]).is_err() {
-        return false;
+        return Ok(false);
     }
     let mut resp = [0u8; 2];
-    stream.read_exact(&mut resp).is_ok() && resp == [5, 0]
+    Ok(stream.read_exact(&mut resp).is_ok() && resp == [5, 0])
 }
 
 fn probe_local_forward_ready(port: u16) -> bool {
@@ -1039,7 +1143,7 @@ pub fn start_proxy(app: &mut App, host: &Host) -> Result<()> {
     app.proxy = None;
     app.proxy_starting = None;
     app.proxy_last_error = None;
-    app.proxy_log_scroll = 0;
+    app.proxy_log_scroll = usize::MAX;
 
     // Verify all ports (including any previously owned by our old proxy) are now free.
     for &port in &local_ports {
@@ -1076,6 +1180,29 @@ pub fn start_proxy(app: &mut App, host: &Host) -> Result<()> {
             format!("{} ({})", jh.name, jh.ip)
         });
     let cred_label = format!("{} ({})", cred.name, cred.username);
+
+    if let Ok(mut g) = log.lock() {
+        g.push_event(
+            "proxy",
+            format!(
+                "Starting tunnel to {}:{} (user: {}, cred: {}, jump: {})",
+                host.ip,
+                host.port,
+                crate::ssh::effective_username(host.user.as_deref(), &cred),
+                cred_label,
+                jump_label.as_deref().unwrap_or("none"),
+            ),
+        );
+        if let Some(sp) = effective_socks {
+            g.push_event("proxy", format!("SOCKS5 target listener: 127.0.0.1:{sp}"));
+        }
+        if let Some(hp) = host.http_proxy_port {
+            g.push_event("proxy", format!("HTTP/HTTPS target listener: 127.0.0.1:{hp}"));
+        }
+        for fwd in &host.port_forwards {
+            g.push_event("proxy", format!("Local forward: 127.0.0.1:{fwd}"));
+        }
+    }
 
     let summary = ProxyConfigSummary {
         host_id: host.id.clone(),
@@ -1195,6 +1322,7 @@ pub fn do_connect(
                 app.screen = Screen::CredentialPicker {
                     host_idx: idx,
                     after_failure: true,
+                    return_to_proxy: false,
                 };
             }
         }
@@ -1327,7 +1455,15 @@ fn handle_key(terminal: &mut Term, app: &mut App, key: crossterm::event::KeyEven
         Screen::CredentialPicker {
             host_idx,
             after_failure,
-        } => popup::handle_key(terminal, app, key, host_idx, after_failure),
+            return_to_proxy,
+        } => popup::handle_key(
+            terminal,
+            app,
+            key,
+            host_idx,
+            after_failure,
+            return_to_proxy,
+        ),
         Screen::HostForm => host_form::handle_key(terminal, app, key),
         Screen::ImportHosts => host_form::handle_import_key(terminal, app, key),
         Screen::McpServer => mcp_screen::handle_key(terminal, app, key),

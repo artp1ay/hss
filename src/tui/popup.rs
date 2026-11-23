@@ -13,6 +13,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let Screen::CredentialPicker {
         host_idx,
         after_failure,
+        return_to_proxy,
     } = &app.screen
     else {
         return;
@@ -124,12 +125,16 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else {
         hotkey_spans.push(Span::styled("[Enter]", Style::default().fg(Color::Blue)));
         hotkey_spans.push(Span::styled(
-            " connect  ",
+            if *return_to_proxy {
+                " save & return  "
+            } else {
+                " connect  "
+            },
             Style::default().fg(Color::DarkGray),
         ));
         hotkey_spans.push(Span::styled("[*]", Style::default().fg(Color::Blue)));
         hotkey_spans.push(Span::styled(
-            " default  ",
+            " pin default  ",
             Style::default().fg(Color::DarkGray),
         ));
         hotkey_spans.push(Span::styled("[A]", Style::default().fg(Color::Blue)));
@@ -150,12 +155,17 @@ pub fn handle_key(
     key: KeyEvent,
     host_idx: usize,
     _after_failure: bool,
+    return_to_proxy: bool,
 ) -> Result<()> {
     let creds_len = app.credentials.len();
 
     match key.code {
         KeyCode::Esc => {
-            app.screen = Screen::Main;
+            app.screen = if return_to_proxy {
+                Screen::Proxy { host_idx }
+            } else {
+                Screen::Main
+            };
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if creds_len > 0 {
@@ -181,6 +191,9 @@ pub fn handle_key(
             app.status_message = Some(crate::types::StatusMessage::info(
                 "Default credential saved for server.",
             ));
+            if return_to_proxy {
+                app.screen = Screen::Proxy { host_idx };
+            }
         }
         KeyCode::Enter if creds_len > 0 => {
             let Some(host) = app.hosts.get(host_idx) else {
@@ -189,9 +202,19 @@ pub fn handle_key(
             };
             let cred = app.credentials[app.popup_selected.min(creds_len - 1)].clone();
             let host_id = host.id.clone();
-            app.select_credential(&host_id, &cred.id, false)?;
-            app.screen = Screen::Main;
-            crate::tui::do_connect(terminal, app, &host_id, &cred)?;
+            let host_name = host.name.clone();
+            if return_to_proxy {
+                app.select_credential(&host_id, &cred.id, true)?;
+                app.status_message = Some(crate::types::StatusMessage::success(format!(
+                    "Pinned credential '{}' for {host_name}",
+                    cred.name
+                )));
+                app.screen = Screen::Proxy { host_idx };
+            } else {
+                app.select_credential(&host_id, &cred.id, false)?;
+                app.screen = Screen::Main;
+                crate::tui::do_connect(terminal, app, &host_id, &cred)?;
+            }
         }
         _ => {}
     }

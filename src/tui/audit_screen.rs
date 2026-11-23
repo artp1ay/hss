@@ -358,6 +358,7 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
                         app.screen = Screen::CredentialPicker {
                             host_idx: idx,
                             after_failure: false,
+                            return_to_proxy: false,
                         };
                     }
                 }
