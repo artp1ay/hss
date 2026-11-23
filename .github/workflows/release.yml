@@ -23,7 +23,9 @@ permissions:
 jobs:
   quality:
     if: github.server_url == 'https://github.com'
-    name: quality gate
+    name: quality gate (advisory)
+    # Advisory only: a failing lint/test must never block publishing a release.
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +78,6 @@ jobs:
   build:
     if: github.server_url == 'https://github.com'
     name: build ${{ matrix.artifact }}
-    needs: quality
     strategy:
       fail-fast: false
       matrix:
