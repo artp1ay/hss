@@ -208,7 +208,23 @@ pub fn check_single_host(
     cfg: &AppConfig,
 ) -> HostAuditResult {
     let timeout = Duration::from_secs(cfg.audit_timeout.max(1) as u64);
-    let jump = crate::ssh::jump_spec(hosts, host);
+    let jump = match crate::ssh::resolve_jump_spec(hosts, host) {
+        Ok(j) => j,
+        Err(e) => {
+            let detail = format!("Invalid jump host: {e:#}");
+            return HostAuditResult {
+                host_id: host.id.clone(),
+                host_name: host.name.clone(),
+                ip: host.ip.clone(),
+                port: host.port,
+                group: host.group.clone(),
+                status: HostStatus::Error(detail.clone()),
+                latency_ms: None,
+                credential_name: None,
+                detail,
+            };
+        }
+    };
     let has_jump = jump.is_some();
 
     let record = records.iter().find(|r| r.host_id == host.id);
@@ -304,33 +320,46 @@ pub fn check_single_host(
 
 fn ping_tcp(host: &str, port: u16, timeout: Duration) -> (Result<(), String>, Option<u64>) {
     let start = Instant::now();
-    let addr_str = format!("{}:{}", host, port);
-    let addrs = match addr_str.to_socket_addrs() {
-        Ok(mut iter) => match iter.next() {
-            Some(a) => a,
-            None => return (Err("DNS resolution failed".into()), None),
-        },
+    let unbracketed = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    let addrs: Vec<std::net::SocketAddr> = match (unbracketed, port).to_socket_addrs() {
+        Ok(iter) => iter.collect(),
         Err(e) => return (Err(format!("DNS error: {e}")), None),
     };
+    if addrs.is_empty() {
+        return (Err("DNS resolution failed".into()), None);
+    }
 
-    match TcpStream::connect_timeout(&addrs, timeout) {
-        Ok(_) => {
-            let rtt = start.elapsed().as_millis() as u64;
-            (Ok(()), Some(rtt))
+    let mut last_err = None;
+    let deadline = start + timeout;
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        Err(e) => {
-            let msg = match e.kind() {
-                std::io::ErrorKind::TimedOut => "Connection timed out".to_string(),
-                std::io::ErrorKind::ConnectionRefused => {
-                    "Connection refused (port closed)".to_string()
-                }
-                std::io::ErrorKind::HostUnreachable => "Host unreachable".to_string(),
-                std::io::ErrorKind::NetworkUnreachable => "Network unreachable".to_string(),
-                _ => format!("{e}"),
-            };
-            (Err(msg), None)
+        match TcpStream::connect_timeout(&addr, remaining) {
+            Ok(_) => {
+                let rtt = start.elapsed().as_millis() as u64;
+                return (Ok(()), Some(rtt));
+            }
+            Err(e) => last_err = Some(e),
         }
     }
+
+    let msg = match last_err {
+        Some(e) => match e.kind() {
+            std::io::ErrorKind::TimedOut => "Connection timed out".to_string(),
+            std::io::ErrorKind::ConnectionRefused => "Connection refused (port closed)".to_string(),
+            std::io::ErrorKind::HostUnreachable => "Host unreachable".to_string(),
+            std::io::ErrorKind::NetworkUnreachable => "Network unreachable".to_string(),
+            _ => format!("{e}"),
+        },
+        None => "Connection timed out".to_string(),
+    };
+    (Err(msg), None)
 }
 
 fn check_ssh_auth(
@@ -363,13 +392,22 @@ fn check_ssh_auth(
             None,
         );
     }
-    if let Err(e) = crate::ssh::validate_username(&cred.username) {
+    let username = crate::ssh::effective_username(host.user.as_deref(), cred);
+    if let Err(e) = crate::ssh::validate_username(username) {
         return (
             HostStatus::AuthFailed(format!("Invalid username: {e}")),
             format!("Invalid username: {e}"),
             None,
         );
     }
+    let strict_host_checking =
+        match crate::config::validate_strict_host_checking(&cfg.strict_host_checking) {
+            Ok(v) => v,
+            Err(e) => {
+                let detail = format!("{e}");
+                return (HostStatus::Error(detail.clone()), detail, None);
+            }
+        };
     if let Some(j) = jump {
         if let Err(e) = crate::ssh::validate_jump_spec(j) {
             return (
@@ -383,7 +421,7 @@ fn check_ssh_auth(
     let timeout_secs = timeout.as_secs().max(1).to_string();
     let mut args: Vec<String> = vec![
         "-o".into(),
-        format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        format!("StrictHostKeyChecking={strict_host_checking}"),
         "-o".into(),
         format!("ConnectTimeout={timeout_secs}"),
         "-o".into(),
@@ -391,7 +429,7 @@ fn check_ssh_auth(
         "-p".into(),
         host.port.to_string(),
         "-l".into(),
-        cred.username.clone(),
+        username.to_string(),
     ];
 
     crate::ssh::append_auth_args(&mut args, cred, secret.is_some(), false);
@@ -406,12 +444,11 @@ fn check_ssh_auth(
     let mut cmd = Command::new("ssh");
     cmd.args(&args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    let askpass_path = match crate::ssh::configure_askpass(&mut cmd, &cred.kind, secret.as_deref())
-    {
-        Ok(path) => path,
+    let _askpass = match crate::ssh::configure_askpass(&mut cmd, &cred.kind, secret.as_deref()) {
+        Ok(guard) => guard,
         Err(e) => {
             let detail = format!("Failed to prepare SSH askpass: {e}");
             return (HostStatus::Error(detail.clone()), detail, None);
@@ -420,16 +457,22 @@ fn check_ssh_auth(
 
     let result = match cmd.spawn() {
         Ok(mut child) => {
+            const MAX_AUDIT_STDERR_BYTES: u64 = 64 * 1024;
+            let stderr_pipe = child.stderr.take();
+            let stderr_handle = thread::spawn(move || {
+                let mut buf = Vec::new();
+                if let Some(r) = stderr_pipe {
+                    let _ = std::io::Read::read_to_end(
+                        &mut std::io::Read::take(r, MAX_AUDIT_STDERR_BYTES),
+                        &mut buf,
+                    );
+                }
+                buf
+            });
             let deadline = Instant::now() + timeout + Duration::from_secs(1);
-            loop {
+            let status_res = loop {
                 match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let mut stderr_buf = Vec::new();
-                        if let Some(mut err_pipe) = child.stderr.take() {
-                            let _ = std::io::Read::read_to_end(&mut err_pipe, &mut stderr_buf);
-                        }
-                        break Ok((status, String::from_utf8_lossy(&stderr_buf).to_string()));
-                    }
+                    Ok(Some(status)) => break Ok(status),
                     Ok(None) => {
                         if Instant::now() >= deadline {
                             let _ = child.kill();
@@ -440,14 +483,12 @@ fn check_ssh_auth(
                     }
                     Err(e) => break Err(format!("{e}")),
                 }
-            }
+            };
+            let stderr_buf = stderr_handle.join().unwrap_or_default();
+            status_res.map(|status| (status, String::from_utf8_lossy(&stderr_buf).to_string()))
         }
         Err(e) => Err(format!("Failed to spawn ssh: {e}")),
     };
-
-    if let Some(ref p) = askpass_path {
-        let _ = std::fs::remove_file(p);
-    }
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
 

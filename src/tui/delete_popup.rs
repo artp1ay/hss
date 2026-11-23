@@ -107,20 +107,9 @@ pub fn handle_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<
 fn do_delete(app: &mut App, popup: &crate::types::DeletePopup) -> Result<()> {
     match popup.kind {
         DeleteKind::Host => {
-            if popup.idx < app.hosts.len() {
-                let deleted_id = app.hosts[popup.idx].id.clone();
-                // Clear any jump references pointing to this deleted host so configs stay valid
-                for h in &mut app.hosts {
-                    if h.jump_host_id.as_deref() == Some(&deleted_id) {
-                        h.jump_host_id = None;
-                    }
-                }
-                app.hosts.remove(popup.idx);
-                app.save_hosts()?;
-                app.selected_row = app.selected_row.min(app.hosts.len().saturating_sub(1));
+            if let Some(deleted_name) = app.delete_host(popup.idx)? {
                 app.status_message = Some(crate::types::StatusMessage::info(format!(
-                    "Host '{}' deleted.",
-                    popup.name
+                    "Host '{deleted_name}' deleted."
                 )));
             }
         }

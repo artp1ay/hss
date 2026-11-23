@@ -50,7 +50,6 @@ pub enum CopyIdEvent {
 pub struct ProxySession {
     pub host_id: String,
     child: std::process::Child,
-    askpass_path: Option<std::path::PathBuf>,
     http: Option<http_proxy::HttpProxy>,
 }
 
@@ -59,9 +58,6 @@ impl Drop for ProxySession {
         self.http.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
-        if let Some(ref path) = self.askpass_path {
-            let _ = std::fs::remove_file(path);
-        }
     }
 }
 
@@ -231,6 +227,56 @@ impl App {
         crate::config::save_server_records(&records)?;
         self.server_records = records;
         Ok(())
+    }
+
+    pub fn clear_pinned_credential(&mut self, host_id: &str) -> Result<()> {
+        let mut changed = false;
+        let mut records = self.server_records.clone();
+        for record in &mut records {
+            if record.host_id == host_id && record.default_credential_id.is_some() {
+                record.default_credential_id = None;
+                changed = true;
+            }
+        }
+        if changed {
+            crate::config::save_server_records(&records)?;
+            self.server_records = records;
+        }
+        Ok(())
+    }
+
+    /// Delete a host by index, clearing dangling jump references, orphaned server records,
+    /// and any active proxy bound to the deleted host.
+    pub fn delete_host(&mut self, idx: usize) -> Result<Option<String>> {
+        if idx >= self.hosts.len() {
+            return Ok(None);
+        }
+        let deleted_id = self.hosts[idx].id.clone();
+        let deleted_name = self.hosts[idx].name.clone();
+
+        if self
+            .proxy
+            .as_ref()
+            .is_some_and(|p| p.host_id == deleted_id)
+        {
+            self.proxy = None;
+        }
+        for h in &mut self.hosts {
+            if h.jump_host_id.as_deref() == Some(deleted_id.as_str()) {
+                h.jump_host_id = None;
+            }
+        }
+        self.hosts.remove(idx);
+        self.save_hosts()?;
+
+        let before = self.server_records.len();
+        self.server_records.retain(|r| r.host_id != deleted_id);
+        if self.server_records.len() != before {
+            crate::config::save_server_records(&self.server_records)?;
+        }
+
+        self.selected_row = self.selected_row.min(self.hosts.len().saturating_sub(1));
+        Ok(Some(deleted_name))
     }
 
     pub fn save_hosts(&self) -> Result<()> {
@@ -520,7 +566,7 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
         std::net::TcpListener::bind(("127.0.0.1", port))
             .map_err(|e| anyhow::anyhow!("Local proxy port {port} is unavailable: {e}"))?;
     }
-    let (mut child, path) = crate::ssh::spawn_proxy(host, cred, &app.config, jump.as_deref())?;
+    let (mut child, askpass) = crate::ssh::spawn_proxy(host, cred, &app.config, jump.as_deref())?;
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(app.config.connect_timeout as u64 + 10);
     loop {
@@ -530,9 +576,7 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
             if let Some(ref mut stderr) = child.stderr {
                 let _ = stderr.read_to_string(&mut error);
             }
-            if let Some(ref path) = path {
-                let _ = std::fs::remove_file(path);
-            }
+            drop(askpass);
             anyhow::bail!("SSH proxy exited with {status}: {}", error.trim());
         }
         if std::net::TcpStream::connect(("127.0.0.1", check_port)).is_ok() {
@@ -541,22 +585,19 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            if let Some(ref path) = path {
-                let _ = std::fs::remove_file(path);
-            }
+            drop(askpass);
             anyhow::bail!("Timed out waiting for SSH proxy on port {check_port}");
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // Authentication succeeded and tunnel is listening; wipe askpass secret immediately.
+    drop(askpass);
     let http = match host.http_proxy_port {
         Some(port) => match http_proxy::HttpProxy::start(port, host.socks_port.unwrap()) {
             Ok(http) => Some(http),
             Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(ref path) = path {
-                    let _ = std::fs::remove_file(path);
-                }
                 return Err(err);
             }
         },
@@ -565,7 +606,6 @@ pub fn toggle_proxy(app: &mut App, host: &Host) -> Result<()> {
     app.proxy = Some(ProxySession {
         host_id: host.id.clone(),
         child,
-        askpass_path: path,
         http,
     });
     app.status_message = Some(crate::types::StatusMessage::success(format!(
@@ -605,9 +645,10 @@ pub fn do_connect(
         .as_ref()
         .filter(|_| !proxy_active)
         .and_then(|h| h.socks_port);
-    let (status, stderr) = match crate::ssh::spawn_ssh_with_error(
+    let (status, stderr) = match crate::ssh::spawn_ssh_with_error_and_user(
         &ip,
         port,
+        host.as_ref().and_then(|h| h.user.as_deref()),
         cred,
         &app.config,
         jump.as_deref(),

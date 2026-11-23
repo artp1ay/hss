@@ -6,14 +6,6 @@
 
 Terminal SSH server manager. Browse servers, manage credentials, and connect — all from the keyboard.
 
-## Repository sync
-
-Gitea (`git.freakware.ru/max/hss`) is mirrored to GitHub (`github.com/artp1ay/hss`) for all branches and tags. Both are writable; GitHub `main` is protected from force pushes and history rewrites, and `.github/workflows/sync-to-gitea.yml` brings GitHub commits back into Gitea.
-
-- Do not force-push or rewrite `main` — the protection will reject it, which is intentional.
-- If the two sides diverge, merge manually; the sync job refuses to overwrite either side.
-- Pushes to Gitea appear on GitHub immediately; pushes to GitHub appear in Gitea within seconds.
-
 ## Features
 
 - **TUI** — searchable server list, keyboard-driven

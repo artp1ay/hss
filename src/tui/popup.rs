@@ -17,7 +17,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     else {
         return;
     };
-    let host = &app.hosts[*host_idx];
+    let Some(host) = app.hosts.get(*host_idx) else {
+        return;
+    };
 
     let area = crate::tui::adaptive_centered_rect(60, 50, 60, 14, f.area());
     f.render_widget(Clear, area);
@@ -162,8 +164,12 @@ pub fn handle_key(
             app.screen = Screen::Credentials;
         }
         KeyCode::Char('*') if creds_len > 0 => {
+            let Some(host) = app.hosts.get(host_idx) else {
+                app.screen = Screen::Main;
+                return Ok(());
+            };
             let cred = &app.credentials[app.popup_selected.min(creds_len - 1)];
-            let host_id = app.hosts[host_idx].id.clone();
+            let host_id = host.id.clone();
             let cred_id = cred.id.clone();
             app.select_credential(&host_id, &cred_id, true)?;
             app.status_message = Some(crate::types::StatusMessage::info(
@@ -171,8 +177,12 @@ pub fn handle_key(
             ));
         }
         KeyCode::Enter if creds_len > 0 => {
+            let Some(host) = app.hosts.get(host_idx) else {
+                app.screen = Screen::Main;
+                return Ok(());
+            };
             let cred = app.credentials[app.popup_selected.min(creds_len - 1)].clone();
-            let host_id = app.hosts[host_idx].id.clone();
+            let host_id = host.id.clone();
             app.select_credential(&host_id, &cred.id, false)?;
             app.screen = Screen::Main;
             crate::tui::do_connect(terminal, app, &host_id, &cred)?;

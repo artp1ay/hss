@@ -18,6 +18,9 @@ pub struct Cli {
     /// Ansible inventory host query (accepted for compatibility with Ansible inventory scripts)
     #[arg(long)]
     pub host: Option<String>,
+    /// Omit plaintext passwords from Ansible inventory output (can also set HSS_INVENTORY_NO_SECRETS=1)
+    #[arg(long)]
+    pub no_secrets: bool,
     /// Connect directly to host by name or IP
     pub direct_host: Option<String>,
     /// Run headless MCP server directly in terminal without TUI

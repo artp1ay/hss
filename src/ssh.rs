@@ -2,9 +2,8 @@ use crate::config::{self, AppConfig};
 use crate::credentials;
 use crate::types::{Credential, CredentialKind, Host};
 use anyhow::Result;
-use libc;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::process::Command;
 
 /// Build the ssh -J destination ("user@ip:port") for a host's jump host, if any.
@@ -369,37 +368,93 @@ pub fn port_forward_args(forwards: &[String], socks_port: Option<u16>) -> Result
     Ok(args)
 }
 
+/// Resolve the effective SSH username for a host + credential pair.
+/// For Key credentials, an explicit `host.user` overrides `cred.username` so one key can be
+/// reused across hosts with different accounts. For Password credentials, the password belongs
+/// to `cred.username`, so `cred.username` is always authoritative.
+pub fn effective_username<'a>(host_user: Option<&'a str>, cred: &'a Credential) -> &'a str {
+    if cred.kind == CredentialKind::Key {
+        if let Some(u) = host_user.map(str::trim).filter(|u| !u.is_empty()) {
+            return u;
+        }
+    }
+    cred.username.trim()
+}
+
+/// RAII guard for a private temporary askpass helper and secret file.
+/// Overwrites and deletes the secret file, helper script, and private directory on drop.
+#[derive(Debug)]
+pub struct AskpassGuard {
+    dir: std::path::PathBuf,
+    script_path: std::path::PathBuf,
+    secret_path: std::path::PathBuf,
+}
+
+impl AskpassGuard {
+    pub fn script_path(&self) -> &std::path::Path {
+        &self.script_path
+    }
+}
+
+impl Drop for AskpassGuard {
+    fn drop(&mut self) {
+        if let Ok(meta) = std::fs::symlink_metadata(&self.secret_path) {
+            if meta.is_file() {
+                let len = meta.len() as usize;
+                if len > 0 {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&self.secret_path)
+                    {
+                        let zeros = vec![0u8; len.min(64 * 1024)];
+                        let _ = f.write_all(&zeros);
+                        let _ = f.sync_all();
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&self.secret_path);
+        let _ = std::fs::remove_file(&self.script_path);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ssh_command(
     host: &str,
     port: u16,
+    host_user: Option<&str>,
     cred: &Credential,
     cfg: &AppConfig,
     jump: Option<&str>,
-    forwarding: (&[String], Option<u16>),
+    forwards: &[String],
+    socks_port: Option<u16>,
     proxy: bool,
 ) -> Result<(Command, Option<String>)> {
     validate_host(host)?;
     validate_port(port)?;
-    validate_username(&cred.username)?;
+    let username = effective_username(host_user, cred);
+    validate_username(username)?;
+    let strict_host_checking = config::validate_strict_host_checking(&cfg.strict_host_checking)?;
     if let Some(j) = jump {
         validate_jump_spec(j)?;
     }
     let secret = credentials::get_secret(cred)?;
     let mut args = vec![
         "-o".into(),
-        format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        format!("StrictHostKeyChecking={strict_host_checking}"),
         "-o".into(),
         format!("ConnectTimeout={}", cfg.connect_timeout),
         "-p".into(),
         port.to_string(),
         "-l".into(),
-        cred.username.clone(),
+        username.to_string(),
     ];
     append_auth_args(&mut args, cred, secret.is_some(), !proxy);
     if let Some(j) = jump {
         args.extend(["-J".into(), j.to_string()]);
     }
-    args.extend(port_forward_args(forwarding.0, forwarding.1)?);
+    args.extend(port_forward_args(forwards, socks_port)?);
     if proxy {
         args.extend([
             "-N".into(),
@@ -423,7 +478,7 @@ pub fn spawn_proxy(
     cred: &Credential,
     cfg: &AppConfig,
     jump: Option<&str>,
-) -> Result<(std::process::Child, Option<std::path::PathBuf>)> {
+) -> Result<(std::process::Child, Option<AskpassGuard>)> {
     anyhow::ensure!(
         !host.port_forwards.is_empty() || host.socks_port.is_some(),
         "Configure forwards or a SOCKS port in the host card first"
@@ -431,23 +486,20 @@ pub fn spawn_proxy(
     let (mut cmd, secret) = ssh_command(
         &host.ip,
         host.port,
+        host.user.as_deref(),
         cred,
         cfg,
         jump,
-        (&host.port_forwards, host.socks_port),
+        &host.port_forwards,
+        host.socks_port,
         true,
     )?;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    let path = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
-    let result = cmd.spawn();
-    if result.is_err() {
-        if let Some(ref path) = path {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-    Ok((result?, path))
+    let askpass = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
+    let child = cmd.spawn()?;
+    Ok((child, askpass))
 }
 
 pub fn spawn_ssh(
@@ -459,7 +511,24 @@ pub fn spawn_ssh(
     forwards: &[String],
     socks_port: Option<u16>,
 ) -> Result<std::process::ExitStatus> {
-    Ok(spawn_ssh_with_error(host, port, cred, cfg, jump, forwards, socks_port)?.0)
+    spawn_ssh_with_user(host, port, None, cred, cfg, jump, forwards, socks_port)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ssh_with_user(
+    host: &str,
+    port: u16,
+    host_user: Option<&str>,
+    cred: &Credential,
+    cfg: &AppConfig,
+    jump: Option<&str>,
+    forwards: &[String],
+    socks_port: Option<u16>,
+) -> Result<std::process::ExitStatus> {
+    Ok(spawn_ssh_with_error_and_user(
+        host, port, host_user, cred, cfg, jump, forwards, socks_port,
+    )?
+    .0)
 }
 
 pub fn spawn_ssh_with_error(
@@ -471,13 +540,28 @@ pub fn spawn_ssh_with_error(
     forwards: &[String],
     socks_port: Option<u16>,
 ) -> Result<(std::process::ExitStatus, String)> {
+    spawn_ssh_with_error_and_user(host, port, None, cred, cfg, jump, forwards, socks_port)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ssh_with_error_and_user(
+    host: &str,
+    port: u16,
+    host_user: Option<&str>,
+    cred: &Credential,
+    cfg: &AppConfig,
+    jump: Option<&str>,
+    forwards: &[String],
+    socks_port: Option<u16>,
+) -> Result<(std::process::ExitStatus, String)> {
     use std::io::{Read, Write};
-    let (mut cmd, secret) =
-        ssh_command(host, port, cred, cfg, jump, (forwards, socks_port), false)?;
+    let (mut cmd, secret) = ssh_command(
+        host, port, host_user, cred, cfg, jump, forwards, socks_port, false,
+    )?;
     cmd.stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::piped());
-    let askpass_path = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
+    let _askpass = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
     let old_sigint = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
     let result = (|| -> std::io::Result<_> {
         let mut child = cmd.spawn()?;
@@ -500,9 +584,6 @@ pub fn spawn_ssh_with_error(
     })();
     unsafe {
         libc::signal(libc::SIGINT, old_sigint);
-    }
-    if let Some(ref path) = askpass_path {
-        let _ = std::fs::remove_file(path);
     }
     Ok(result?)
 }
@@ -532,7 +613,9 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
 
     validate_host(&h.ip)?;
     validate_port(h.port)?;
-    validate_username(&cred.username)?;
+    let username = effective_username(h.user.as_deref(), cred);
+    validate_username(username)?;
+    let strict_host_checking = config::validate_strict_host_checking(&cfg.strict_host_checking)?;
     let jump = resolve_jump_spec(&hosts, h)?;
     if let Some(ref j) = jump {
         validate_jump_spec(j)?;
@@ -542,7 +625,7 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
 
     let mut ssh_args: Vec<String> = vec![
         "-o".into(),
-        format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        format!("StrictHostKeyChecking={strict_host_checking}"),
         "-o".into(),
         format!("ConnectTimeout={}", cfg.connect_timeout),
         // Detect dead connections: probe every 15s, give up after 3 missed replies.
@@ -553,7 +636,7 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
         "-p".into(),
         h.port.to_string(),
         "-l".into(),
-        cred.username.clone(),
+        username.to_string(),
     ];
     append_auth_args(&mut ssh_args, cred, secret.is_some(), false);
     if let Some(ref j) = jump {
@@ -567,7 +650,7 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
     let mut cmd = Command::new("ssh");
     cmd.args(&ssh_args).stdin(std::process::Stdio::null());
 
-    let askpass_path = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
+    let _askpass = configure_askpass(&mut cmd, &cred.kind, secret.as_deref())?;
 
     let timeout = cfg.exec_timeout;
     let out = if timeout == 0 {
@@ -633,9 +716,6 @@ pub fn exec_command(host_query: &str, command: &str) -> Result<std::process::Out
         }
     };
 
-    if let Some(ref path) = askpass_path {
-        let _ = std::fs::remove_file(path);
-    }
     Ok(out?)
 }
 
@@ -659,7 +739,7 @@ pub fn find_public_keys_in(creds: &[Credential], home: Option<&std::path::Path>)
     }
     for c in creds {
         if let Some(ref kp) = c.key_path {
-            let kp = expand_tilde(kp);
+            let kp = config::expand_tilde(kp);
             let pubp = format!("{kp}.pub");
             if std::path::Path::new(&pubp).exists() && !keys.contains(&pubp) {
                 keys.push(pubp);
@@ -668,15 +748,6 @@ pub fn find_public_keys_in(creds: &[Credential], home: Option<&std::path::Path>)
     }
     keys.sort();
     keys
-}
-
-fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}{}", home.display(), &path[1..]);
-        }
-    }
-    path.to_string()
 }
 
 /// Run ssh-copy-id for one public key, non-interactively.
@@ -690,20 +761,46 @@ pub fn copy_id(
     password: Option<&str>,
     cfg: &AppConfig,
 ) -> Result<std::process::Output> {
+    copy_id_with_jump(ip, port, user, pub_key_path, password, None, cfg)
+}
+
+/// Run ssh-copy-id with optional jump host and bounded execution timeout.
+pub fn copy_id_with_jump(
+    ip: &str,
+    port: u16,
+    user: &str,
+    pub_key_path: &str,
+    password: Option<&str>,
+    jump: Option<&str>,
+    cfg: &AppConfig,
+) -> Result<std::process::Output> {
     validate_host(ip)?;
     validate_port(port)?;
     validate_username(user)?;
+    let strict_host_checking = config::validate_strict_host_checking(&cfg.strict_host_checking)?;
+    let key_path = config::expand_tilde(pub_key_path.trim());
+    anyhow::ensure!(!key_path.is_empty(), "Public key path cannot be empty");
+    anyhow::ensure!(
+        !key_path.chars().any(|c| c.is_ascii_control()),
+        "Public key path contains invalid control characters"
+    );
+    if let Some(j) = jump {
+        validate_jump_spec(j)?;
+    }
 
     let mut args: Vec<String> = vec![
         "-i".into(),
-        pub_key_path.into(),
+        key_path,
         "-p".into(),
         port.to_string(),
         "-o".into(),
-        format!("StrictHostKeyChecking={}", cfg.strict_host_checking),
+        format!("StrictHostKeyChecking={strict_host_checking}"),
         "-o".into(),
         format!("ConnectTimeout={}", cfg.connect_timeout),
     ];
+    if let Some(j) = jump {
+        args.extend(["-o".into(), format!("ProxyJump={j}")]);
+    }
     if password.is_some() {
         for option in [
             "PreferredAuthentications=password,keyboard-interactive",
@@ -711,24 +808,75 @@ pub fn copy_id(
             "PasswordAuthentication=yes",
             "KbdInteractiveAuthentication=yes",
             "BatchMode=no",
+            "NumberOfPasswordPrompts=1",
         ] {
             args.extend(["-o".into(), option.into()]);
         }
     } else {
         args.extend_from_slice(&["-o".into(), "BatchMode=yes".into()]);
     }
+    args.push("--".into());
     args.push(format!("{user}@{ip}"));
 
     let mut cmd = Command::new("ssh-copy-id");
-    cmd.args(&args).stdin(std::process::Stdio::null());
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    let askpass_path = configure_askpass(&mut cmd, &CredentialKind::Password, password)?;
+    let _askpass = configure_askpass(&mut cmd, &CredentialKind::Password, password)?;
 
-    let out = cmd.output();
-    if let Some(ref path) = askpass_path {
-        let _ = std::fs::remove_file(path);
-    }
-    Ok(out?)
+    let mut child = cmd.spawn()?;
+    const MAX_COPY_ID_OUTPUT: u64 = 256 * 1024;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(r) = stdout_pipe {
+            let _ = std::io::Read::read_to_end(
+                &mut std::io::Read::take(r, MAX_COPY_ID_OUTPUT),
+                &mut buf,
+            );
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(r) = stderr_pipe {
+            let _ = std::io::Read::read_to_end(
+                &mut std::io::Read::take(r, MAX_COPY_ID_OUTPUT),
+                &mut buf,
+            );
+        }
+        buf
+    });
+
+    let timeout_secs = (cfg.connect_timeout.max(10) as u64).saturating_add(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Ok(s),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("ssh-copy-id timed out after {timeout_secs}s"),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+    Ok(status.map(|s| std::process::Output {
+        status: s,
+        stdout,
+        stderr,
+    })?)
 }
 
 pub(crate) fn append_auth_args(
@@ -755,10 +903,15 @@ pub(crate) fn append_auth_args(
         args.extend(["-o".into(), option.into()]);
     }
     if cred.kind == CredentialKind::Key {
-        if let Some(key) = &cred.key_path {
+        if let Some(key) = cred
+            .key_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
             args.extend([
                 "-i".into(),
-                key.clone(),
+                config::expand_tilde(key),
                 "-o".into(),
                 "IdentitiesOnly=yes".into(),
             ]);
@@ -779,18 +932,51 @@ pub(crate) fn configure_askpass(
     cmd: &mut Command,
     kind: &CredentialKind,
     secret: Option<&str>,
-) -> Result<Option<std::path::PathBuf>> {
+) -> Result<Option<AskpassGuard>> {
     let Some(secret) = secret else {
         return Ok(None);
     };
-    let path = write_askpass_helper()?;
-    cmd.env("SSH_ASKPASS", &path)
+    let dir = std::env::temp_dir().join(format!("hss-askpass-{}", uuid::Uuid::new_v4()));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(&dir)?;
+
+    let script_path = dir.join("helper");
+    let secret_path = dir.join("secret");
+    let guard = AskpassGuard {
+        dir,
+        script_path: script_path.clone(),
+        secret_path: secret_path.clone(),
+    };
+
+    {
+        let mut secret_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&secret_path)?;
+        secret_file.write_all(secret.as_bytes())?;
+        secret_file.sync_all()?;
+    }
+
+    {
+        let mut script_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&script_path)?;
+        let script = b"#!/bin/sh\ncase \"$HSS_SECRET_KIND:$1\" in\n  key:*[Pp]assphrase*) ;;\n  password:*[Pp]assphrase*) exit 1 ;;\n  password:*[Pp]assword*) ;;\n  *) exit 1 ;;\nesac\ncat -- \"$HSS_SECRET_FILE\"\nprintf '\\n'\n";
+        script_file.write_all(script)?;
+        script_file.sync_all()?;
+    }
+
+    cmd.env("SSH_ASKPASS", &script_path)
         .env("SSH_ASKPASS_REQUIRE", "force")
         .env(
             "DISPLAY",
             std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
         )
-        .env("HSS_SECRET", secret)
+        .env("HSS_SECRET_FILE", &secret_path)
         .env(
             "HSS_SECRET_KIND",
             match kind {
@@ -798,7 +984,7 @@ pub(crate) fn configure_askpass(
                 CredentialKind::Key => "key",
             },
         );
-    Ok(Some(path))
+    Ok(Some(guard))
 }
 
 pub fn write_askpass_helper() -> Result<std::path::PathBuf> {
@@ -808,7 +994,7 @@ pub fn write_askpass_helper() -> Result<std::path::PathBuf> {
         .create_new(true)
         .mode(0o700)
         .open(&path)?;
-    let script = b"#!/bin/sh\ncase \"$HSS_SECRET_KIND:$1\" in\n  key:*[Pp]assphrase*) ;;\n  password:*[Pp]assphrase*) exit 1 ;;\n  password:*[Pp]assword*) ;;\n  *) exit 1 ;;\nesac\nprintf '%s\\n' \"$HSS_SECRET\"\n";
+    let script = b"#!/bin/sh\ncase \"$HSS_SECRET_KIND:$1\" in\n  key:*[Pp]assphrase*) ;;\n  password:*[Pp]assphrase*) exit 1 ;;\n  password:*[Pp]assword*) ;;\n  *) exit 1 ;;\nesac\ncat -- \"$HSS_SECRET_FILE\"\nprintf '\\n'\n";
     if let Err(err) = file.write_all(script) {
         let _ = std::fs::remove_file(&path);
         return Err(err.into());
@@ -824,18 +1010,25 @@ pub fn connect_direct(host: &str) -> Result<()> {
 
     let records = config::migrate_server_records(records, &hosts);
     let saved_host = hosts.iter().find(|h| h.name == host || h.ip == host);
-    let (ssh_host, port, record, jump, forwards, socks_port) = if let Some(h) = saved_host {
-        (
-            h.ip.as_str(),
-            h.port,
-            records.iter().find(|r| r.host_id == h.id),
-            resolve_jump_spec(&hosts, h)?,
-            h.port_forwards.as_slice(),
-            h.socks_port,
-        )
+    let default_port = if cfg.default_port != 0 {
+        cfg.default_port
     } else {
-        (host, 22, None, None, &[][..], None)
+        22
     };
+    let (ssh_host, port, host_user, record, jump, forwards, socks_port) =
+        if let Some(h) = saved_host {
+            (
+                h.ip.as_str(),
+                h.port,
+                h.user.as_deref(),
+                records.iter().find(|r| r.host_id == h.id),
+                resolve_jump_spec(&hosts, h)?,
+                h.port_forwards.as_slice(),
+                h.socks_port,
+            )
+        } else {
+            (host, default_port, None, None, None, &[][..], None)
+        };
 
     let cred = resolve_credential(
         &creds,
@@ -847,9 +1040,10 @@ pub fn connect_direct(host: &str) -> Result<()> {
         anyhow::anyhow!("No credentials configured. Run `hss` to set up credentials.")
     })?;
 
-    spawn_ssh(
+    spawn_ssh_with_user(
         ssh_host,
         port,
+        host_user,
         cred,
         &cfg,
         jump.as_deref(),
@@ -1068,16 +1262,20 @@ mod tests {
             ),
         ] {
             let mut cmd = Command::new("sh");
-            let path = configure_askpass(&mut cmd, &kind, Some(secret))
+            let guard = configure_askpass(&mut cmd, &kind, Some(secret))
                 .unwrap()
                 .unwrap();
+            let path = guard.script_path().to_path_buf();
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o700
             );
             assert!(!std::fs::read_to_string(&path).unwrap().contains(secret));
+            // Secret must never be placed into child process environment variables.
+            assert!(!cmd.get_envs().any(|(k, _)| k == "HSS_SECRET"));
             let output = cmd.arg(&path).arg(prompt).output().unwrap();
-            std::fs::remove_file(path).unwrap();
+            drop(guard);
+            assert!(!path.exists());
             assert_eq!(output.status.success(), allowed);
             assert_eq!(
                 output.stdout,
@@ -1093,6 +1291,18 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(cmd.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn effective_username_respects_host_user_for_keys_only() {
+        let key = key_cred("k");
+        assert_eq!(effective_username(Some("deploy"), &key), "deploy");
+        assert_eq!(effective_username(None, &key), "u");
+        assert_eq!(effective_username(Some("   "), &key), "u");
+
+        let mut pw = key_cred("p");
+        pw.kind = CredentialKind::Password;
+        assert_eq!(effective_username(Some("deploy"), &pw), "u");
     }
 
     #[test]

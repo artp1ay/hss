@@ -404,3 +404,149 @@ fn test_generate_ansible_inventory_structure() {
     assert!(all_children.contains(&serde_json::json!("tag_k8s")));
     assert!(all_children.contains(&serde_json::json!("tag_edge")));
 }
+
+#[test]
+fn test_parse_ini_tabs_quotes_group_vars_and_host_port() {
+    let ini = r#"
+[webservers] # primary web tier
+web1	ansible_host="10.0.1.1" ansible_user='deploy' ; inline comment
+web2.internal:2222
+[2001:db8::1]:2200
+
+[webservers:vars]
+ansible_user=ops
+ansible_port=2202
+"#;
+    let hosts = hss::inventory::parse_inventory(ini);
+    assert_eq!(hosts.len(), 3);
+
+    let web1 = hosts.iter().find(|h| h.name == "web1").unwrap();
+    assert_eq!(web1.ip, "10.0.1.1");
+    assert_eq!(web1.user.as_deref(), Some("deploy"));
+    assert_eq!(web1.port, 2202); // inherited from [webservers:vars]
+
+    let web2 = hosts.iter().find(|h| h.name == "web2.internal").unwrap();
+    assert_eq!(web2.port, 2222); // explicit host:port wins over group vars
+    assert_eq!(web2.user.as_deref(), Some("ops")); // inherited from [webservers:vars]
+
+    let v6 = hosts.iter().find(|h| h.name == "2001:db8::1").unwrap();
+    assert_eq!(v6.ip, "2001:db8::1");
+    assert_eq!(v6.port, 2200);
+}
+
+#[test]
+fn test_import_rejects_ssh_option_injection_hosts() {
+    let ini = "[evil]\n-oProxyCommand=id ansible_host=10.0.0.1\nlegit ansible_host=-oProxyCommand=id\ngood ansible_host=10.0.0.2 ansible_user=-oBad\n";
+    let mut hosts = vec![];
+    let added = hss::inventory::import_from_ini(ini, &mut hosts);
+    assert_eq!(added, 1);
+    assert_eq!(hosts[0].name, "good");
+    assert_eq!(hosts[0].ip, "10.0.0.2");
+    assert_eq!(hosts[0].user, None); // invalid username dropped
+}
+
+#[test]
+fn test_inventory_merges_tag_group_collision_and_expands_tilde_key() {
+    use hss::config::AppConfig;
+    use hss::types::{Credential, CredentialKind, Host, ServerRecord};
+
+    let hosts = vec![
+        Host {
+            id: "h1".into(),
+            name: "alpha".into(),
+            ip: "10.0.0.1".into(),
+            group: "tag_prod".into(),
+            port: 22,
+            user: None,
+            tags: vec![],
+            description: None,
+            jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
+        },
+        Host {
+            id: "h2".into(),
+            name: "beta".into(),
+            ip: "10.0.0.2".into(),
+            group: "web".into(),
+            port: 22,
+            user: None,
+            tags: vec!["prod".into()],
+            description: None,
+            jump_host_id: None,
+            port_forwards: vec![],
+            socks_port: None,
+            http_proxy_port: None,
+        },
+    ];
+    let creds = vec![Credential {
+        id: "k1".into(),
+        name: "Key".into(),
+        username: "ubuntu".into(),
+        kind: CredentialKind::Key,
+        key_path: Some("~/.ssh/id_ed25519".into()),
+    }];
+    let records = vec![ServerRecord {
+        host_id: "h2".into(),
+        last_credential_id: Some("k1".into()),
+        default_credential_id: None,
+    }];
+    let cfg = AppConfig {
+        strict_host_checking: "no -o ProxyCommand=evil".into(),
+        ..Default::default()
+    };
+
+    let inv = hss::inventory::generate_ansible_inventory_with_options(
+        &hosts, &creds, &records, &cfg, false,
+    );
+    let tag_prod = inv["tag_prod"]["hosts"].as_array().unwrap();
+    assert!(tag_prod.contains(&serde_json::json!("alpha")));
+    assert!(tag_prod.contains(&serde_json::json!("beta")));
+
+    let beta_vars = &inv["_meta"]["hostvars"]["beta"];
+    let key_file = beta_vars["ansible_ssh_private_key_file"].as_str().unwrap();
+    assert!(!key_file.starts_with("~/"), "tilde should be expanded: {key_file}");
+    let common_args = beta_vars["ansible_ssh_common_args"].as_str().unwrap();
+    assert!(common_args.contains("-o IdentitiesOnly=yes"));
+    assert!(
+        !common_args.contains("ProxyCommand"),
+        "invalid strict_host_checking must not be injected: {common_args}"
+    );
+
+    let single = hss::inventory::generate_ansible_hostvars("beta", &hosts, &creds, &records, &cfg, false);
+    assert_eq!(single["ansible_host"], "10.0.0.2");
+    let missing = hss::inventory::generate_ansible_hostvars("unknown", &hosts, &creds, &records, &cfg, false);
+    assert_eq!(missing, serde_json::json!({}));
+}
+
+#[test]
+fn test_exports_sanitize_newlines_and_empty_groups() {
+    use hss::types::Host;
+
+    let hosts = vec![Host {
+        id: "1".into(),
+        name: "web1\nProxyCommand evil".into(),
+        ip: "10.0.0.1\nLocalCommand bad".into(),
+        group: "".into(),
+        port: 22,
+        user: Some("ops\nPermitLocalCommand yes".into()),
+        tags: vec!["prod".into(), "tier1".into()],
+        description: Some("line1\nline2".into()),
+        jump_host_id: None,
+        port_forwards: vec![],
+        socks_port: None,
+        http_proxy_port: None,
+    }];
+
+    let ssh_cfg = hss::inventory::export_to_ssh_config(&hosts);
+    assert!(!ssh_cfg.contains("\nProxyCommand"));
+    assert!(!ssh_cfg.contains("\nLocalCommand"));
+    assert!(!ssh_cfg.contains("\nPermitLocalCommand"));
+
+    let ini = hss::inventory::export_to_ini(&hosts);
+    assert!(ini.contains("[ungrouped]\n"));
+    assert!(!ini.contains("[]\n"));
+    assert!(ini.contains("# tags=prod,tier1"));
+}
+

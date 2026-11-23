@@ -1,22 +1,51 @@
 use crate::types::{Credential, Host, ServerRecord};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub fn config_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("HSS_CONFIG_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     dirs::config_dir()
+        .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()))
         .join("hss")
 }
 
 /// Ensures the config directory exists with secure 0700 permissions on Unix.
+/// Rejects symlinked leaf directories and tightens permissions on existing directories.
 pub fn ensure_config_dir(dir: &Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.mode(0o700);
-    builder.create(dir)?;
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("Refusing to use symlinked config directory: {}", dir.display());
+        }
+        if !meta.is_dir() {
+            anyhow::bail!("Config path exists and is not a directory: {}", dir.display());
+        }
+    } else {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        builder.mode(0o700);
+        builder.create(dir)?;
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+/// Validates `StrictHostKeyChecking` against OpenSSH's allowed values.
+pub fn validate_strict_host_checking(value: &str) -> Result<&str> {
+    let trimmed = value.trim();
+    match trimmed {
+        "accept-new" | "yes" | "no" | "ask" | "off" => Ok(trimmed),
+        _ => anyhow::bail!(
+            "Invalid strict_host_checking '{trimmed}': expected one of accept-new, yes, no, ask, off"
+        ),
+    }
 }
 
 /// Atomically writes content to `path` with 0600 permissions using a unique temporary file
@@ -56,21 +85,9 @@ pub fn write_secure_atomic_file(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Legacy helper: writes directly to the given path securely.
+/// Legacy helper: delegates to atomic 0600 secure write so pre-existing loose files are tightened.
 pub fn write_secure_file(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_config_dir(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    use std::io::Write;
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    Ok(())
+    write_secure_atomic_file(path, content)
 }
 
 fn default_port() -> u16 {

@@ -397,12 +397,11 @@ pub fn handle_key(terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<(
             if let Some(idx) = get_host_idx_in_all(app) {
                 let name = app.hosts[idx].name.clone();
                 if app.skip_delete_confirm {
-                    app.hosts.remove(idx);
-                    app.save_hosts()?;
-                    app.selected_row = app.selected_row.min(app.hosts.len().saturating_sub(1));
-                    app.status_message = Some(crate::types::StatusMessage::info(format!(
-                        "Host '{name}' deleted."
-                    )));
+                    if let Some(deleted_name) = app.delete_host(idx)? {
+                        app.status_message = Some(crate::types::StatusMessage::info(format!(
+                            "Host '{deleted_name}' deleted."
+                        )));
+                    }
                 } else {
                     app.delete_popup = Some(crate::types::DeletePopup {
                         kind: crate::types::DeleteKind::Host,

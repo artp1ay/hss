@@ -222,13 +222,18 @@ pub fn draw(f: &mut Frame, app: &App) {
         };
         let focused = form.focused == 11;
         let record = form.editing_id.as_deref().and_then(|id| app.record_for(id));
+        let pinned = if form.credential_changed {
+            form.credential_id.as_deref()
+        } else {
+            form.credential_id
+                .as_deref()
+                .or_else(|| record.and_then(|r| r.default_credential_id.as_deref()))
+        };
         let value = crate::ssh::resolve_credential(
             &app.credentials,
             &app.config,
             record.and_then(|r| r.last_credential_id.as_deref()),
-            form.credential_id
-                .as_deref()
-                .or_else(|| record.and_then(|r| r.default_credential_id.as_deref())),
+            pinned,
         )
         .ok()
         .flatten()
@@ -471,6 +476,10 @@ fn handle_form_key(app: &mut App, key: KeyEvent) -> Result<()> {
             form.jump_selected = 0;
         }
         KeyCode::Backspace | KeyCode::Delete if form.focused == 7 => form.jump_host_id = None,
+        KeyCode::Backspace | KeyCode::Delete if form.focused == 11 => {
+            form.credential_id = None;
+            form.credential_changed = true;
+        }
         KeyCode::Enter => save_host(app)?,
         _ => {}
     }
@@ -515,7 +524,8 @@ fn draw_credential_picker(f: &mut Frame, app: &App, form: &HostForm) {
         .min(matches.len().saturating_sub(1));
     let visible = rows[1].height as usize;
     let start = selected.saturating_sub(visible.saturating_sub(1));
-    for (index, cred) in matches.iter().enumerate().skip(start).take(visible) {
+    for index in start..(start + visible).min(matches.len()) {
+        let cred = matches[index];
         let style = if index == selected {
             Style::default()
                 .fg(Color::Blue)
@@ -682,340 +692,6 @@ fn handle_jump_picker(app: &mut App, key: KeyEvent) {
             }
         }
     }
-}
-
-fn active_field(form: &mut HostForm) -> &mut String {
-    match form.focused {
-        0 => &mut form.name,
-        1 => &mut form.ip,
-        2 => &mut form.group,
-        3 => &mut form.port,
-        4 => &mut form.user,
-        5 => &mut form.tags,
-        8 => &mut form.port_forwards,
-        9 => &mut form.socks_port,
-        10 => &mut form.http_proxy_port,
-        _ => &mut form.description,
-    }
-}
-
-fn save_host(app: &mut App) -> Result<()> {
-    let form = match &app.host_form {
-        Some(f) => f.clone(),
-        None => return Ok(()),
-    };
-
-    let set_error = |app: &mut App, err: String, focus: usize| {
-        if let Some(ref mut f) = app.host_form {
-            f.error_message = Some(err.clone());
-            f.focused = focus;
-            f.page = if focus >= 8 { 1 } else { 0 };
-            f.cursor = crate::tui::input::end_of(active_field(f));
-        }
-        app.status_message = Some(crate::types::StatusMessage::error(err));
-    };
-
-    if form.name.trim().is_empty() {
-        set_error(app, "Name is required.".into(), 0);
-        return Ok(());
-    }
-
-    // Host name uniqueness validation
-    let trimmed_name = form.name.trim();
-    let name_conflict = app
-        .hosts
-        .iter()
-        .any(|h| h.name == trimmed_name && Some(&h.id) != form.editing_id.as_ref());
-    if name_conflict {
-        set_error(
-            app,
-            format!("Host name '{trimmed_name}' already exists."),
-            0,
-        );
-        return Ok(());
-    }
-
-    // Reserved group name validation
-    let trimmed_group = form.group.trim().to_lowercase();
-    if trimmed_group == "all" || trimmed_group == "_meta" {
-        set_error(
-            app,
-            format!(
-                "Group name '{}' is reserved by Ansible inventory and cannot be used.",
-                form.group.trim()
-            ),
-            2,
-        );
-        return Ok(());
-    }
-    if form.ip.trim().is_empty() {
-        set_error(app, "IP / Hostname is required.".into(), 1);
-        return Ok(());
-    }
-    if let Err(e) = crate::ssh::validate_host(form.ip.trim()) {
-        set_error(app, format!("Invalid IP / Hostname: {e}"), 1);
-        return Ok(());
-    }
-    if !form.user.trim().is_empty() {
-        if let Err(e) = crate::ssh::validate_username(form.user.trim()) {
-            set_error(app, format!("Invalid Username: {e}"), 4);
-            return Ok(());
-        }
-    }
-    let port: u16 = match form.port.trim().parse() {
-        Ok(p) if p > 0 => p,
-        _ => {
-            set_error(app, "Port must be a number between 1 and 65535.".into(), 3);
-            return Ok(());
-        }
-    };
-    let port_forwards: Vec<String> = form
-        .port_forwards
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    let socks_port = if form.socks_port.trim().is_empty() {
-        None
-    } else {
-        match form.socks_port.trim().parse::<u16>() {
-            Ok(port) => Some(port),
-            Err(_) => {
-                set_error(app, "SOCKS port must be between 1 and 65535.".into(), 9);
-                return Ok(());
-            }
-        }
-    };
-    if let Err(e) = crate::ssh::port_forward_args(&port_forwards, socks_port) {
-        set_error(app, format!("Invalid forwarding: {e}"), 8);
-        return Ok(());
-    }
-    let http_proxy_port = if form.http_proxy_port.trim().is_empty() {
-        None
-    } else {
-        match form.http_proxy_port.trim().parse::<u16>() {
-            Ok(port) if port > 0 => Some(port),
-            _ => {
-                set_error(
-                    app,
-                    "HTTP proxy port must be between 1 and 65535.".into(),
-                    10,
-                );
-                return Ok(());
-            }
-        }
-    };
-    if let Some(port) = http_proxy_port {
-        if socks_port.is_none()
-            || socks_port == Some(port)
-            || port_forwards
-                .iter()
-                .any(|f| f.split_once(':').and_then(|(p, _)| p.parse::<u16>().ok()) == Some(port))
-        {
-            set_error(
-                app,
-                "HTTP proxy requires a different SOCKS port and no conflicting forward.".into(),
-                10,
-            );
-            return Ok(());
-        }
-    }
-    let tags: Vec<String> = form
-        .tags
-        .split(',')
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    if let Some(ref edit_id) = form.editing_id {
-        // Update existing host
-        if let Some(h) = app.hosts.iter_mut().find(|h| &h.id == edit_id) {
-            h.name = form.name.trim().to_string();
-            h.ip = form.ip.trim().to_string();
-            h.group = form.group.trim().to_string();
-            h.port = port;
-            h.user = if form.user.trim().is_empty() {
-                None
-            } else {
-                Some(form.user.trim().to_string())
-            };
-            h.tags = tags;
-            h.description = if form.description.trim().is_empty() {
-                None
-            } else {
-                Some(form.description.trim().to_string())
-            };
-            h.jump_host_id = form.jump_host_id.clone();
-            h.port_forwards = port_forwards.clone();
-            h.socks_port = socks_port;
-            h.http_proxy_port = http_proxy_port;
-        }
-        app.status_message = Some(crate::types::StatusMessage::success(format!(
-            "Host '{}' updated.",
-            form.name.trim()
-        )));
-    } else {
-        // Add new host
-        app.hosts.push(Host {
-            id: Uuid::new_v4().to_string(),
-            name: form.name.trim().to_string(),
-            ip: form.ip.trim().to_string(),
-            group: form.group.trim().to_string(),
-            port,
-            user: if form.user.trim().is_empty() {
-                None
-            } else {
-                Some(form.user.trim().to_string())
-            },
-            tags,
-            description: if form.description.trim().is_empty() {
-                None
-            } else {
-                Some(form.description.trim().to_string())
-            },
-            jump_host_id: form.jump_host_id.clone(),
-            port_forwards,
-            socks_port,
-            http_proxy_port,
-        });
-        app.status_message = Some(crate::types::StatusMessage::success(format!(
-            "Host '{}' added.",
-            form.name.trim()
-        )));
-    }
-
-    app.save_hosts()?;
-    if form.credential_changed {
-        if let Some(ref credential_id) = form.credential_id {
-            let host_id = form
-                .editing_id
-                .as_deref()
-                .unwrap_or(&app.hosts.last().unwrap().id)
-                .to_string();
-            app.select_credential(&host_id, credential_id, true)?;
-        }
-    }
-    if app.host_form_from_audit {
-        if let Some(ref edit_id) = form.editing_id {
-            if let Some(ref mut state) = app.audit_state {
-                if let Some(idx) = state.results.iter().position(|r| &r.host_id == edit_id) {
-                    if state.is_running {
-                        app.start_audit();
-                        if let Some(ref mut state) = app.audit_state {
-                            state.selected = idx;
-                        }
-                    } else {
-                        if let Some(host) = app.hosts.iter().find(|h| &h.id == edit_id) {
-                            let result = &mut state.results[idx];
-                            result.host_name = host.name.clone();
-                            result.ip = host.ip.clone();
-                            result.port = host.port;
-                            result.group = host.group.clone();
-                            result.latency_ms = None;
-                            result.credential_name = None;
-                        }
-                        state.start_single(
-                            idx,
-                            app.hosts.clone(),
-                            app.credentials.clone(),
-                            app.server_records.clone(),
-                            app.config.clone(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    app.host_form = None;
-    app.screen = if app.host_form_from_audit {
-        Screen::Audit
-    } else {
-        Screen::Main
-    };
-    app.host_form_from_audit = false;
-    Ok(())
-}
-
-pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
-    if !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Enter) {
-        let (mut buf, mut cursor) = (
-            std::mem::take(&mut app.import_path_input),
-            app.import_cursor,
-        );
-        let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
-        app.import_path_input = buf;
-        app.import_cursor = cursor;
-        if consumed {
-            return Ok(());
-        }
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            app.screen = Screen::Main;
-        }
-        KeyCode::Tab => {
-            app.import_export_mode = (app.import_export_mode + 1) % 3;
-        }
-        KeyCode::Enter => {
-            let raw = app.import_path_input.trim().to_string();
-            if raw.is_empty() {
-                app.screen = Screen::Main;
-                return Ok(());
-            }
-            let path = expand_tilde(&raw);
-            if app.import_export_mode > 0 {
-                let content = if app.import_export_mode == 1 {
-                    crate::inventory::export_to_ini(&app.hosts)
-                } else {
-                    crate::inventory::export_to_ssh_config(&app.hosts)
-                };
-                match std::fs::write(&path, &content) {
-                    Ok(()) => {
-                        app.status_message = Some(crate::types::StatusMessage::success(format!(
-                            "Exported {} hosts to {path}.",
-                            app.hosts.len()
-                        )));
-                        app.screen = Screen::Main;
-                    }
-                    Err(e) => {
-                        app.status_message = Some(crate::types::StatusMessage::error(format!(
-                            "Export error: {e}"
-                        )));
-                    }
-                }
-            } else {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        let count = crate::inventory::import_from_ini(&content, &mut app.hosts);
-                        let updated = app.hosts.len();
-                        app.save_hosts()?;
-                        app.status_message = Some(crate::types::StatusMessage::success(format!(
-                            "Import complete: {count} new hosts added ({updated} total)."
-                        )));
-                        app.screen = Screen::Main;
-                    }
-                    Err(e) => {
-                        app.status_message = Some(crate::types::StatusMessage::error(format!(
-                            "Error reading file: {e}"
-                        )));
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}{}", home.display(), &path[1..]);
-        }
-    }
-    path.to_string()
 }
 
 #[cfg(test)]
@@ -1254,4 +930,334 @@ mod tests {
             );
         }
     }
+}
+
+fn active_field(form: &mut HostForm) -> &mut String {
+    match form.focused {
+        0 => &mut form.name,
+        1 => &mut form.ip,
+        2 => &mut form.group,
+        3 => &mut form.port,
+        4 => &mut form.user,
+        5 => &mut form.tags,
+        8 => &mut form.port_forwards,
+        9 => &mut form.socks_port,
+        10 => &mut form.http_proxy_port,
+        _ => &mut form.description,
+    }
+}
+
+fn save_host(app: &mut App) -> Result<()> {
+    let form = match &app.host_form {
+        Some(f) => f.clone(),
+        None => return Ok(()),
+    };
+
+    let set_error = |app: &mut App, err: String, focus: usize| {
+        if let Some(ref mut f) = app.host_form {
+            f.error_message = Some(err.clone());
+            f.focused = focus;
+            f.page = if focus >= 8 { 1 } else { 0 };
+            f.cursor = crate::tui::input::end_of(active_field(f));
+        }
+        app.status_message = Some(crate::types::StatusMessage::error(err));
+    };
+
+    if form.name.trim().is_empty() {
+        set_error(app, "Name is required.".into(), 0);
+        return Ok(());
+    }
+
+    // Host name uniqueness validation
+    let trimmed_name = form.name.trim();
+    let name_conflict = app
+        .hosts
+        .iter()
+        .any(|h| h.name == trimmed_name && Some(&h.id) != form.editing_id.as_ref());
+    if name_conflict {
+        set_error(
+            app,
+            format!("Host name '{trimmed_name}' already exists."),
+            0,
+        );
+        return Ok(());
+    }
+
+    // Reserved group name validation
+    let trimmed_group = form.group.trim().to_lowercase();
+    if trimmed_group == "all" || trimmed_group == "_meta" {
+        set_error(
+            app,
+            format!(
+                "Group name '{}' is reserved by Ansible inventory and cannot be used.",
+                form.group.trim()
+            ),
+            2,
+        );
+        return Ok(());
+    }
+    if form.ip.trim().is_empty() {
+        set_error(app, "IP / Hostname is required.".into(), 1);
+        return Ok(());
+    }
+    if let Err(e) = crate::ssh::validate_host(form.ip.trim()) {
+        set_error(app, format!("Invalid IP / Hostname: {e}"), 1);
+        return Ok(());
+    }
+    if !form.user.trim().is_empty() {
+        if let Err(e) = crate::ssh::validate_username(form.user.trim()) {
+            set_error(app, format!("Invalid Username: {e}"), 4);
+            return Ok(());
+        }
+    }
+    let port: u16 = match form.port.trim().parse() {
+        Ok(p) if p > 0 => p,
+        _ => {
+            set_error(app, "Port must be a number between 1 and 65535.".into(), 3);
+            return Ok(());
+        }
+    };
+    let port_forwards: Vec<String> = form
+        .port_forwards
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let socks_port = if form.socks_port.trim().is_empty() {
+        None
+    } else {
+        match form.socks_port.trim().parse::<u16>() {
+            Ok(port) => Some(port),
+            Err(_) => {
+                set_error(app, "SOCKS port must be between 1 and 65535.".into(), 9);
+                return Ok(());
+            }
+        }
+    };
+    if let Err(e) = crate::ssh::port_forward_args(&port_forwards, socks_port) {
+        set_error(app, format!("Invalid forwarding: {e}"), 8);
+        return Ok(());
+    }
+    let http_proxy_port = if form.http_proxy_port.trim().is_empty() {
+        None
+    } else {
+        match form.http_proxy_port.trim().parse::<u16>() {
+            Ok(port) if port > 0 => Some(port),
+            _ => {
+                set_error(
+                    app,
+                    "HTTP proxy port must be between 1 and 65535.".into(),
+                    10,
+                );
+                return Ok(());
+            }
+        }
+    };
+    if let Some(port) = http_proxy_port {
+        if socks_port.is_none()
+            || socks_port == Some(port)
+            || port_forwards
+                .iter()
+                .any(|f| f.split_once(':').and_then(|(p, _)| p.parse::<u16>().ok()) == Some(port))
+        {
+            set_error(
+                app,
+                "HTTP proxy requires a different SOCKS port and no conflicting forward.".into(),
+                10,
+            );
+            return Ok(());
+        }
+    }
+    let tags: Vec<String> = form
+        .tags
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if let Some(ref edit_id) = form.editing_id {
+        // Update existing host
+        if let Some(h) = app.hosts.iter_mut().find(|h| &h.id == edit_id) {
+            h.name = form.name.trim().to_string();
+            h.ip = form.ip.trim().to_string();
+            h.group = form.group.trim().to_string();
+            h.port = port;
+            h.user = if form.user.trim().is_empty() {
+                None
+            } else {
+                Some(form.user.trim().to_string())
+            };
+            h.tags = tags;
+            h.description = if form.description.trim().is_empty() {
+                None
+            } else {
+                Some(form.description.trim().to_string())
+            };
+            h.jump_host_id = form.jump_host_id.clone();
+            h.port_forwards = port_forwards.clone();
+            h.socks_port = socks_port;
+            h.http_proxy_port = http_proxy_port;
+        }
+        app.status_message = Some(crate::types::StatusMessage::success(format!(
+            "Host '{}' updated.",
+            form.name.trim()
+        )));
+    } else {
+        // Add new host
+        app.hosts.push(Host {
+            id: Uuid::new_v4().to_string(),
+            name: form.name.trim().to_string(),
+            ip: form.ip.trim().to_string(),
+            group: form.group.trim().to_string(),
+            port,
+            user: if form.user.trim().is_empty() {
+                None
+            } else {
+                Some(form.user.trim().to_string())
+            },
+            tags,
+            description: if form.description.trim().is_empty() {
+                None
+            } else {
+                Some(form.description.trim().to_string())
+            },
+            jump_host_id: form.jump_host_id.clone(),
+            port_forwards,
+            socks_port,
+            http_proxy_port,
+        });
+        app.status_message = Some(crate::types::StatusMessage::success(format!(
+            "Host '{}' added.",
+            form.name.trim()
+        )));
+    }
+
+    app.save_hosts()?;
+    if form.credential_changed {
+        let host_id = form
+            .editing_id
+            .as_deref()
+            .unwrap_or(&app.hosts.last().unwrap().id)
+            .to_string();
+        if let Some(ref credential_id) = form.credential_id {
+            app.select_credential(&host_id, credential_id, true)?;
+        } else {
+            app.clear_pinned_credential(&host_id)?;
+        }
+    }
+    if app.host_form_from_audit {
+        if let Some(ref edit_id) = form.editing_id {
+            if let Some(ref mut state) = app.audit_state {
+                if let Some(idx) = state.results.iter().position(|r| &r.host_id == edit_id) {
+                    if state.is_running {
+                        app.start_audit();
+                        if let Some(ref mut state) = app.audit_state {
+                            state.selected = idx;
+                        }
+                    } else {
+                        if let Some(host) = app.hosts.iter().find(|h| &h.id == edit_id) {
+                            let result = &mut state.results[idx];
+                            result.host_name = host.name.clone();
+                            result.ip = host.ip.clone();
+                            result.port = host.port;
+                            result.group = host.group.clone();
+                            result.latency_ms = None;
+                            result.credential_name = None;
+                        }
+                        state.start_single(
+                            idx,
+                            app.hosts.clone(),
+                            app.credentials.clone(),
+                            app.server_records.clone(),
+                            app.config.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    app.host_form = None;
+    app.screen = if app.host_form_from_audit {
+        Screen::Audit
+    } else {
+        Screen::Main
+    };
+    app.host_form_from_audit = false;
+    Ok(())
+}
+
+pub fn handle_import_key(_terminal: &mut Term, app: &mut App, key: KeyEvent) -> Result<()> {
+    if !matches!(key.code, KeyCode::Esc | KeyCode::Tab | KeyCode::Enter) {
+        let (mut buf, mut cursor) = (
+            std::mem::take(&mut app.import_path_input),
+            app.import_cursor,
+        );
+        let consumed = crate::tui::input::handle(&mut buf, &mut cursor, key);
+        app.import_path_input = buf;
+        app.import_cursor = cursor;
+        if consumed {
+            return Ok(());
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = Screen::Main;
+        }
+        KeyCode::Tab => {
+            app.import_export_mode = (app.import_export_mode + 1) % 3;
+        }
+        KeyCode::Enter => {
+            let raw = app.import_path_input.trim().to_string();
+            if raw.is_empty() {
+                app.screen = Screen::Main;
+                return Ok(());
+            }
+            let path = crate::config::expand_tilde(&raw);
+            if app.import_export_mode > 0 {
+                let content = if app.import_export_mode == 1 {
+                    crate::inventory::export_to_ini(&app.hosts)
+                } else {
+                    crate::inventory::export_to_ssh_config(&app.hosts)
+                };
+                match crate::config::write_secure_atomic_file(
+                    std::path::Path::new(&path),
+                    &content,
+                ) {
+                    Ok(()) => {
+                        app.status_message = Some(crate::types::StatusMessage::success(format!(
+                            "Exported {} hosts to {path}.",
+                            app.hosts.len()
+                        )));
+                        app.screen = Screen::Main;
+                    }
+                    Err(e) => {
+                        app.status_message = Some(crate::types::StatusMessage::error(format!(
+                            "Export error: {e}"
+                        )));
+                    }
+                }
+            } else {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let count = crate::inventory::import_from_ini(&content, &mut app.hosts);
+                        let updated = app.hosts.len();
+                        app.save_hosts()?;
+                        app.status_message = Some(crate::types::StatusMessage::success(format!(
+                            "Import complete: {count} new hosts added ({updated} total)."
+                        )));
+                        app.screen = Screen::Main;
+                    }
+                    Err(e) => {
+                        app.status_message = Some(crate::types::StatusMessage::error(format!(
+                            "Error reading file: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }

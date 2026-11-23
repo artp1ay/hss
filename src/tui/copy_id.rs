@@ -283,6 +283,19 @@ fn run_copy(app: &mut App) -> Result<()> {
         Some(form.password.clone())
     };
 
+    let jump = match crate::ssh::resolve_jump_spec(&app.hosts, &host) {
+        Ok(j) => j,
+        Err(e) => {
+            if let Some(ref mut f) = app.copy_id_form {
+                f.error_message = Some(format!("Invalid jump host: {e}"));
+            }
+            app.status_message = Some(crate::types::StatusMessage::error(format!(
+                "Invalid jump host: {e}"
+            )));
+            return Ok(());
+        }
+    };
+
     let selected_keys: Vec<String> = selected.into_iter().cloned().collect();
     let total = selected_keys.len();
 
@@ -304,7 +317,15 @@ fn run_copy(app: &mut App) -> Result<()> {
                 idx + 1,
                 total
             )));
-            match crate::ssh::copy_id(&host.ip, host.port, &user, key, password.as_deref(), &cfg) {
+            match crate::ssh::copy_id_with_jump(
+                &host.ip,
+                host.port,
+                &user,
+                key,
+                password.as_deref(),
+                jump.as_deref(),
+                &cfg,
+            ) {
                 Ok(out) if out.status.success() => copied += 1,
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);

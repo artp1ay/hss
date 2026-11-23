@@ -8,7 +8,28 @@ const KEYCHAIN_SERVICE: &str = "hss";
 fn validate_fields(name: &str, username: &str) -> Result<()> {
     anyhow::ensure!(!name.trim().is_empty(), "credential name cannot be empty");
     anyhow::ensure!(!username.trim().is_empty(), "username cannot be empty");
+    crate::ssh::validate_username(username.trim())?;
     Ok(())
+}
+
+fn normalize_key_path(kind: &CredentialKind, key_path: Option<String>) -> Result<Option<String>> {
+    if *kind != CredentialKind::Key {
+        return Ok(None);
+    }
+    match key_path {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            anyhow::ensure!(
+                !trimmed.chars().any(|c| c.is_ascii_control()),
+                "key path contains invalid control characters"
+            );
+            Ok(Some(trimmed.to_string()))
+        }
+        None => Ok(None),
+    }
 }
 
 fn secret_store_context(operation: &str) -> String {
@@ -57,7 +78,7 @@ fn next_secret<'a>(
 ) -> Result<Option<&'a str>> {
     let secret = supplied.filter(|s| !s.is_empty()).or_else(|| {
         if old_kind == Some(kind) {
-            old_secret
+            old_secret.filter(|s| !s.is_empty())
         } else {
             None
         }
@@ -97,6 +118,7 @@ pub fn add_credential(
     password: Option<&str>,
 ) -> Result<Credential> {
     validate_fields(name, username)?;
+    let key_path = normalize_key_path(&kind, key_path)?;
     let secret = next_secret(&kind, None, None, password)?;
     let mut creds = config::load_credentials()?;
     let cred = Credential {
@@ -122,6 +144,7 @@ pub fn update_credential(
     password: Option<&str>,
 ) -> Result<()> {
     validate_fields(name, username)?;
+    let key_path = normalize_key_path(&kind, key_path)?;
     let mut creds = config::load_credentials()?;
     let idx = creds
         .iter()
@@ -157,7 +180,7 @@ pub fn delete_credential(id: &str) -> Result<()> {
 pub fn get_secret(cred: &Credential) -> Result<Option<String>> {
     let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &cred.id)
         .with_context(|| secret_store_context("initialize"))?;
-    let secret = read_secret(&entry)?;
+    let secret = read_secret(&entry)?.filter(|s| !s.is_empty());
     next_secret(&cred.kind, Some(&cred.kind), secret.as_deref(), None)
         .with_context(|| format!("Credential '{}' has no saved password", cred.name))?;
     Ok(secret)
@@ -168,6 +191,7 @@ pub fn get_password(id: &str) -> Result<String> {
         &keyring::Entry::new(KEYCHAIN_SERVICE, id)
             .with_context(|| secret_store_context("initialize"))?,
     )?
+    .filter(|s| !s.is_empty())
     .ok_or_else(|| anyhow::anyhow!("No saved password; save it in Credentials"))
 }
 

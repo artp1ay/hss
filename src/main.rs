@@ -17,30 +17,41 @@ fn main() -> anyhow::Result<()> {
             }
         );
     }
+    let include_inventory_secrets = !cli.no_secrets
+        && !std::env::var("HSS_INVENTORY_NO_SECRETS")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
     if cli.ansible_inventory {
         let hosts = hss::config::load_hosts()?;
         let creds = hss::config::load_credentials()?;
-        let records = hss::config::load_server_records()?;
+        let records =
+            hss::config::migrate_server_records(hss::config::load_server_records()?, &hosts);
         let cfg = hss::config::load_config()?;
-        let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
+        let inv = hss::inventory::generate_ansible_inventory_with_options(
+            &hosts,
+            &creds,
+            &records,
+            &cfg,
+            include_inventory_secrets,
+        );
         println!("{}", serde_json::to_string_pretty(&inv)?);
         return Ok(());
     }
     if let Some(ref target) = cli.host {
         let hosts = hss::config::load_hosts()?;
         let creds = hss::config::load_credentials()?;
-        let records = hss::config::load_server_records()?;
+        let records =
+            hss::config::migrate_server_records(hss::config::load_server_records()?, &hosts);
         let cfg = hss::config::load_config()?;
-        let inv = hss::inventory::generate_ansible_inventory(&hosts, &creds, &records, &cfg);
-        if let Some(hostvars) = inv
-            .get("_meta")
-            .and_then(|m| m.get("hostvars"))
-            .and_then(|hv| hv.get(target))
-        {
-            println!("{}", serde_json::to_string_pretty(hostvars)?);
-        } else {
-            println!("{{}}");
-        }
+        let hostvars = hss::inventory::generate_ansible_hostvars(
+            target,
+            &hosts,
+            &creds,
+            &records,
+            &cfg,
+            include_inventory_secrets,
+        );
+        println!("{}", serde_json::to_string_pretty(&hostvars)?);
         return Ok(());
     }
 

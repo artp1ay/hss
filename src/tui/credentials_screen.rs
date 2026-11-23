@@ -32,6 +32,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(area);
 
+    let (backend_label, backend_style) = if crate::file_keystore::is_file_keystore() {
+        (
+            " · ⚠ file keystore (unencrypted)",
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        (" · system keychain", Style::default().fg(Color::Green))
+    };
+
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -41,6 +50,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" · credentials", Style::default().fg(Color::DarkGray)),
+            Span::styled(backend_label, backend_style),
         ])),
         chunks[0],
     );

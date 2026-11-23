@@ -50,7 +50,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),                // fields
+            Constraint::Min(0), // fields
+            Constraint::Length(if app.status_message.is_some() { 1 } else { 0 }),
             Constraint::Length(hotkey_height), // hotkeys
         ])
         .split(inner);
@@ -156,49 +157,108 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     f.render_stateful_widget(table, chunks[0], &mut state);
 
-    f.render_widget(Paragraph::new(hotkey_lines), chunks[1]);
+    if let Some(ref msg) = app.status_message {
+        let color = match msg.kind {
+            crate::types::StatusKind::Success => Color::Green,
+            crate::types::StatusKind::Info => Color::Cyan,
+            crate::types::StatusKind::Warning => Color::Yellow,
+            crate::types::StatusKind::Error => Color::Red,
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(&msg.text, Style::default().fg(color))),
+            chunks[1],
+        );
+    }
+
+    f.render_widget(Paragraph::new(hotkey_lines), chunks[2]);
 }
 
-fn apply_inputs_to_config(app: &mut App) {
+fn validate_and_build_config(app: &App) -> Result<crate::config::AppConfig> {
     let inputs = &app.settings_inputs;
     if inputs.len() != FIELD_COUNT {
-        return;
+        anyhow::bail!("Settings state is incomplete.");
     }
-    app.config.default_user = if inputs[FIELD_DEFAULT_USER].trim().is_empty() {
+
+    let mut cfg = app.config.clone();
+
+    let default_user = inputs[FIELD_DEFAULT_USER].trim();
+    cfg.default_user = if default_user.is_empty() {
         None
     } else {
-        Some(inputs[FIELD_DEFAULT_USER].trim().to_string())
+        crate::ssh::validate_username(default_user)?;
+        Some(default_user.to_string())
     };
-    app.config.default_port = inputs[FIELD_DEFAULT_PORT].trim().parse().unwrap_or(22);
-    app.config.default_group = if inputs[FIELD_DEFAULT_GROUP].trim().is_empty() {
+
+    let default_port: u16 = inputs[FIELD_DEFAULT_PORT]
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Default Port must be a number between 1 and 65535."))?;
+    anyhow::ensure!(
+        default_port > 0,
+        "Default Port must be between 1 and 65535."
+    );
+    cfg.default_port = default_port;
+
+    let default_group = inputs[FIELD_DEFAULT_GROUP].trim();
+    if default_group.eq_ignore_ascii_case("all") || default_group.eq_ignore_ascii_case("_meta") {
+        anyhow::bail!("Default Group '{default_group}' is reserved by Ansible inventory.");
+    }
+    cfg.default_group = if default_group.is_empty() {
         "ungrouped".to_string()
     } else {
-        inputs[FIELD_DEFAULT_GROUP].trim().to_string()
+        default_group.to_string()
     };
-    app.config.connect_timeout = inputs[FIELD_CONNECT_TIMEOUT].trim().parse().unwrap_or(10);
-    app.config.strict_host_checking = inputs[FIELD_STRICT_HOST].trim().to_string();
-    app.config.ssh_extra_args = inputs[FIELD_SSH_EXTRA_ARGS].trim().to_string();
-    app.config.auto_save_credential = inputs[FIELD_AUTO_SAVE] == "yes";
-    app.config.exec_timeout = inputs[FIELD_EXEC_TIMEOUT].trim().parse().unwrap_or(300);
-    app.config.mcp_port = inputs[FIELD_MCP_PORT].trim().parse().unwrap_or(8822);
-    app.config.mcp_token = if inputs[FIELD_MCP_TOKEN].trim().is_empty() {
+
+    cfg.connect_timeout = inputs[FIELD_CONNECT_TIMEOUT]
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Connect Timeout must be a non-negative integer."))?;
+
+    let strict_host = inputs[FIELD_STRICT_HOST].trim();
+    if !strict_host.is_empty() {
+        crate::config::validate_strict_host_checking(strict_host)?;
+    }
+    cfg.strict_host_checking = strict_host.to_string();
+
+    cfg.ssh_extra_args = inputs[FIELD_SSH_EXTRA_ARGS].trim().to_string();
+    cfg.auto_save_credential = inputs[FIELD_AUTO_SAVE] == "yes";
+
+    cfg.exec_timeout = inputs[FIELD_EXEC_TIMEOUT]
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Exec Timeout must be a non-negative integer."))?;
+
+    cfg.mcp_port = inputs[FIELD_MCP_PORT]
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("MCP Port must be a number between 0 and 65535."))?;
+
+    cfg.mcp_token = if inputs[FIELD_MCP_TOKEN].trim().is_empty() {
         None
     } else {
         Some(inputs[FIELD_MCP_TOKEN].trim().to_string())
     };
-    app.config.mcp_read_only = inputs[FIELD_MCP_READ_ONLY] == "yes";
-    app.config.mcp_allowed_hosts = if inputs[FIELD_MCP_ALLOWED_HOSTS].trim().is_empty() {
+    cfg.mcp_read_only = inputs[FIELD_MCP_READ_ONLY] == "yes";
+    cfg.mcp_allowed_hosts = if inputs[FIELD_MCP_ALLOWED_HOSTS].trim().is_empty() {
         "*".to_string()
     } else {
         inputs[FIELD_MCP_ALLOWED_HOSTS].trim().to_string()
     };
-    app.config.mcp_dlp_filter = inputs[FIELD_MCP_DLP_FILTER] == "yes";
-    app.config.mcp_log_file = if inputs[FIELD_MCP_LOG_FILE].trim().is_empty() {
+    cfg.mcp_dlp_filter = inputs[FIELD_MCP_DLP_FILTER] == "yes";
+    cfg.mcp_log_file = if inputs[FIELD_MCP_LOG_FILE].trim().is_empty() {
         None
     } else {
         Some(inputs[FIELD_MCP_LOG_FILE].trim().to_string())
     };
-    app.config.audit_timeout = inputs[FIELD_AUDIT_TIMEOUT].trim().parse().unwrap_or(3);
+
+    let audit_timeout: u32 = inputs[FIELD_AUDIT_TIMEOUT]
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Audit Timeout must be a positive integer."))?;
+    anyhow::ensure!(audit_timeout > 0, "Audit Timeout must be at least 1 second.");
+    cfg.audit_timeout = audit_timeout;
+
+    Ok(cfg)
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
@@ -229,14 +289,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 
     match key.code {
-        KeyCode::Enter => {
-            apply_inputs_to_config(app);
-            crate::config::save_config(&app.config)?;
-            app.settings_inputs.clear();
-            app.settings_focused_field = 0;
-            app.status_message = Some(crate::types::StatusMessage::success("Settings saved."));
-            app.screen = Screen::Main;
-        }
+        KeyCode::Enter => match validate_and_build_config(app) {
+            Ok(new_cfg) => {
+                crate::config::save_config(&new_cfg)?;
+                app.config = new_cfg;
+                app.settings_inputs.clear();
+                app.settings_focused_field = 0;
+                app.status_message = Some(crate::types::StatusMessage::success("Settings saved."));
+                app.screen = Screen::Main;
+            }
+            Err(e) => {
+                app.status_message = Some(crate::types::StatusMessage::error(format!("{e}")));
+            }
+        },
         KeyCode::Esc => {
             // Discard changes without saving
             app.settings_inputs.clear();

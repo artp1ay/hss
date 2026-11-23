@@ -1,8 +1,23 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const GITHUB_REPO: &str = "artp1ay/hss";
+const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
+fn validate_update_url(url: &str) -> Result<()> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = authority.split(':').next().unwrap_or("");
+        if host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") {
+            return Ok(());
+        }
+    }
+    bail!("Refusing insecure non-HTTPS update URL: {url}")
+}
 
 #[derive(serde::Deserialize)]
 struct Release {
@@ -104,6 +119,7 @@ pub fn run() -> Result<()> {
 }
 
 fn fetch_release(url: &str, current: &str) -> Result<Release> {
+    validate_update_url(url)?;
     ureq::get(url)
         .set("User-Agent", &format!("hss/{current}"))
         .call()
@@ -118,6 +134,9 @@ fn download_and_verify(
     tmp_path: &std::path::Path,
     current: &str,
 ) -> Result<()> {
+    validate_update_url(&sums_asset.browser_download_url)?;
+    validate_update_url(&asset.browser_download_url)?;
+
     let sums_text = ureq::get(&sums_asset.browser_download_url)
         .set("User-Agent", &format!("hss/{current}"))
         .call()
@@ -139,12 +158,17 @@ fn download_and_verify(
 
     let bytes = {
         let mut reader = response.into_reader();
-        let mut tmp = std::fs::File::create(tmp_path).map_err(|e| {
-            anyhow!(
-                "Cannot write to {}: {e}\nHint: try 'sudo hss --update'",
-                tmp_path.display()
-            )
-        })?;
+        let mut tmp = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(tmp_path)
+            .map_err(|e| {
+                anyhow!(
+                    "Cannot write to {}: {e}\nHint: try 'sudo hss --update'",
+                    tmp_path.display()
+                )
+            })?;
         let mut buf = [0u8; 65536];
         let mut total = 0u64;
         loop {
@@ -152,12 +176,19 @@ fn download_and_verify(
             if n == 0 {
                 break;
             }
+            total = total.saturating_add(n as u64);
+            if total > MAX_DOWNLOAD_BYTES {
+                bail!(
+                    "Update binary exceeds maximum allowed size ({} MiB) — update aborted",
+                    MAX_DOWNLOAD_BYTES / (1024 * 1024)
+                );
+            }
             tmp.write_all(&buf[..n])?;
-            total += n as u64;
             eprint!("\r  {:.1} MB", total as f64 / 1_048_576.0);
         }
         eprintln!();
         tmp.flush()?;
+        tmp.sync_all()?;
         total
     };
 
@@ -243,7 +274,11 @@ fn parse_checksum_for_asset(sums_text: &str, asset_name: &str) -> Option<String>
 
 fn compute_file_sha256(path: &std::path::Path) -> Result<String> {
     // Try system utilities first (sha256sum on Linux, shasum on macOS)
-    if let Ok(output) = std::process::Command::new("sha256sum").arg(path).output() {
+    if let Ok(output) = std::process::Command::new("sha256sum")
+        .arg("--")
+        .arg(path)
+        .output()
+    {
         if output.status.success() {
             if let Some(hash) = String::from_utf8_lossy(&output.stdout)
                 .split_whitespace()
@@ -254,7 +289,7 @@ fn compute_file_sha256(path: &std::path::Path) -> Result<String> {
         }
     }
     if let Ok(output) = std::process::Command::new("shasum")
-        .args(["-a", "256"])
+        .args(["-a", "256", "--"])
         .arg(path)
         .output()
     {
