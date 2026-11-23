@@ -2125,6 +2125,9 @@ mod tests {
 
     #[test]
     fn ssh_command_proxy_mode_disables_control_master_and_keeps_forwards() {
+        // Linux CI has no Secret Service; fall back to the file keystore so the
+        // secret lookup returns None instead of failing before arg assertions.
+        crate::file_keystore::init_keystore_fallback();
         let cred = key_cred("k");
         let cfg = AppConfig::default();
         let (cmd, _guard) = ssh_command(
